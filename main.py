@@ -11,7 +11,7 @@ LOCK_FILE = "/tmp/stock_ai_agent.lock"
 from engine.scanner import fetch_market
 from engine.ai import analyze
 from engine.news import get_news, get_macro, refresh_macro
-from engine.strategy import score_stock
+from engine.strategy import score_stock, pre_score
 from engine.regime import adjust
 from engine.exits import check_exits
 from engine.positions import open_positions
@@ -100,7 +100,13 @@ def run():
 
         for s in candidates:
 
-            log(f"Analyzing {s['symbol']} | Price: ${s['price']:.2f} | Change: {s['change']:.2f}% | Vol: {s['volume']:,}")
+            # Rule-based pre-score — skip Groq if no chance of reaching 75
+            ps = pre_score(s)
+            if ps < 10:
+                log(f"  Pre-score {ps} too low, skipping AI")
+                continue
+
+            log(f"Analyzing {s['symbol']} | Price: ${s['price']:.2f} | Change: {s['change']:.2f}% | Vol: {s['volume']:,} | Pre-score: {ps}")
 
             news = get_news(s["symbol"])
             ai = analyze(s, news, macro)
