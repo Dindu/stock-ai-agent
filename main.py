@@ -116,7 +116,7 @@ def run():
 
             log(f"  Score: {score:.1f} | Reasons: {reasons}")
 
-            if score >= 75 and s["symbol"] not in held_symbols:
+            if score >= 80 and s["symbol"] not in held_symbols:
 
                 log(f"  *** BUY SIGNAL: {s['symbol']} at ${s['price']:.2f} (score={score:.1f}) ***")
                 buy(s["symbol"], 10)
