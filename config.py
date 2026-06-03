@@ -10,6 +10,7 @@ ALPACA_DATA_URL = "https://data.alpaca.markets"
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # Set this on Render for cloud LLM
+OLLAMA_URL = "http://localhost:11434/api/generate"  # Used locally if GROQ_API_KEY not set
 
 SCAN_INTERVAL = 300
