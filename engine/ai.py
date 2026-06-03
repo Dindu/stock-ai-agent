@@ -6,24 +6,43 @@ from config import OLLAMA_URL, GROQ_API_KEY
 
 def analyze(stock, news, macro):
 
-    prompt = f"""
-You are a professional swing trader.
-
-Stock: {stock}
-News: {news}
-Macro: {macro}
-
-Return JSON:
-{{
- "confidence": 0-100,
- "bias": "bullish|bearish|neutral",
- "trade_type": "breakout|momentum|avoid",
- "risk_level": "low|medium|high",
- "reasons": ["r1","r2","r3"]
-}}
-"""
-
     symbol = stock.get('symbol', '?')
+    price  = stock.get('price', 0)
+    change = stock.get('change', 0)
+    volume = stock.get('volume', 0)
+
+    prompt = f"""You are a professional swing trader evaluating stocks for 1-4 week holds.
+
+Symbol: {symbol}
+Price: ${price:.2f} | Change today: {change:+.2f}% | Volume: {volume:,}
+
+Recent News:
+{news or 'No recent news'}
+
+Market Context:
+{macro}
+
+Score this stock across 5 categories. Be strict — only genuinely high-conviction setups deserve high scores.
+
+SCORING GUIDE:
+- catalyst (0-30): Is there a clear reason driving this move? (earnings beat=25-30, analyst upgrade=15-20, no catalyst=0-5)
+- market (0-20): Is the macro environment supportive? (SPY up + sector strong + rates favorable=18-20, bearish macro=0-8)
+- fundamentals (0-20): Does the company have strong revenue growth, analyst upgrades, price target upside? (strong=16-20, weak=0-8)
+- technicals (0-20): Is the chart setup good? (breakout from resistance + volume confirmation=16-20, no setup=0-8)
+- sentiment (0-10): Positive analyst consensus, institutional interest, news tone? (very positive=8-10, mixed=4-6, negative=0-3)
+
+Return JSON only:
+{{
+  "catalyst": <int 0-30>,
+  "market": <int 0-20>,
+  "fundamentals": <int 0-20>,
+  "technicals": <int 0-20>,
+  "sentiment": <int 0-10>,
+  "trade_type": "breakout|momentum|avoid",
+  "risk_level": "low|medium|high",
+  "catalyst_summary": "<one sentence: main catalyst or why there is none>",
+  "reasons": ["<specific reason 1>", "<specific reason 2>", "<specific reason 3>"]
+}}"""
 
     if GROQ_API_KEY:
         return _analyze_groq(symbol, prompt)

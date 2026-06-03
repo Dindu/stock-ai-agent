@@ -111,25 +111,38 @@ def run():
 
             news = get_news(s["symbol"])
             ai = analyze(s, news, macro)
-            score, reasons = score_stock(s, ai)
+            score, reasons, breakdown, catalyst_summary = score_stock(s, ai)
             score = adjust(score, {})
 
-            log(f"  Score: {score:.1f} | Reasons: {reasons}")
+            # Dynamic target based on conviction score
+            target_pct = 1.12 if score >= 85 else 1.10 if score >= 80 else 1.08
+            stop   = s["price"] * 0.97
+            target = s["price"] * target_pct
+            risk   = s["price"] - stop
+            reward = target - s["price"]
+            rr     = reward / risk if risk > 0 else 0
+
+            log(f"  Score: {score:.0f}/100 | Catalyst:{breakdown['catalyst']}/30 Market:{breakdown['market']}/20 Fundamentals:{breakdown['fundamentals']}/20 Technicals:{breakdown['technicals']}/20 Sentiment:{breakdown['sentiment']}/10")
+            log(f"  Catalyst: {catalyst_summary}")
+            log(f"  R:R {rr:.1f}:1 | Entry: ${s['price']:.2f} | Stop: ${stop:.2f} | Target: ${target:.2f}")
 
             if score >= 80 and s["symbol"] not in held_symbols:
 
-                log(f"  *** BUY SIGNAL: {s['symbol']} at ${s['price']:.2f} (score={score:.1f}) ***")
+                log(f"  *** BUY SIGNAL: {s['symbol']} at ${s['price']:.2f} (score={score:.0f}) ***")
                 buy(s["symbol"], 10)
 
-                log(f"  Stop: ${s['price'] * 0.97:.2f} | Target: ${s['price'] * 1.08:.2f}")
+                log(f"  Stop: ${stop:.2f} | Target: ${target:.2f}")
 
                 send({
                     **s,
                     "score": score,
                     "reasons": reasons,
+                    "breakdown": breakdown,
+                    "catalyst_summary": catalyst_summary,
                     "qty": 10,
-                    "stop": s["price"] * 0.97,
-                    "target": s["price"] * 1.08
+                    "stop": stop,
+                    "target": target,
+                    "rr": rr,
                 })
                 log(f"  Discord alert sent for {s['symbol']}")
 

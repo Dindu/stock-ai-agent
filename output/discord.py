@@ -3,24 +3,37 @@ from datetime import datetime
 from config import DISCORD_WEBHOOK
 
 def send(stock):
-    symbol  = stock['symbol']
-    price   = stock['price']
-    qty     = stock.get('qty', 10)
-    score   = stock['score']
-    change  = stock['change']
-    stop    = stock.get('stop', price * 0.97)
-    target  = stock.get('target', price * 1.08)
-    cost    = price * qty
-    reasons = "\n".join(f"• {r}" for r in stock.get('reasons', []))
-    now     = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    symbol   = stock['symbol']
+    price    = stock['price']
+    qty      = stock.get('qty', 10)
+    score    = stock['score']
+    change   = stock['change']
+    stop     = stock.get('stop', price * 0.97)
+    target   = stock.get('target', price * 1.08)
+    rr       = stock.get('rr', 0)
+    cost     = price * qty
+    catalyst = stock.get('catalyst_summary', '')
+    reasons  = "\n".join(f"• {r}" for r in stock.get('reasons', []))
+    bd       = stock.get('breakdown', {})
+    now      = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    score_bar = (
+        f"`Catalyst     {bd.get('catalyst', 0):>2}/30`\n"
+        f"`Market       {bd.get('market', 0):>2}/20`\n"
+        f"`Fundamentals {bd.get('fundamentals', 0):>2}/20`\n"
+        f"`Technicals   {bd.get('technicals', 0):>2}/20`\n"
+        f"`Sentiment    {bd.get('sentiment', 0):>2}/10`\n"
+        f"`─────────────────`\n"
+        f"`TOTAL        {score:>2}/100`"
+    )
 
     msg = (
         f"🟢 **BUY SIGNAL — {symbol}**\n"
         f"🕐 {now}\n\n"
-        f"**Entry:** ${price:.2f} × {qty} shares = ${cost:,.2f}\n"
-        f"**AI Score:** {score:.0f}/100  |  Change today: {change:+.2f}%\n\n"
-        f"📈 **Take Profit:** ${target:.2f}  (+8%)\n"
-        f"🛑 **Stop Loss:**   ${stop:.2f}  (-3%)\n\n"
+        f"**Catalyst:** {catalyst}\n\n"
+        f"**Score Breakdown:**\n{score_bar}\n\n"
+        f"**Entry:** ${price:.2f} × {qty} shares = ${cost:,.2f}  |  Change: {change:+.2f}%\n"
+        f"📈 **Target:** ${target:.2f}  |  🛑 **Stop:** ${stop:.2f}  |  ⚖️ **R:R {rr:.1f}:1**\n\n"
         f"**Reasons:**\n{reasons}"
     )
 
