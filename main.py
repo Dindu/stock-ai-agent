@@ -95,11 +95,11 @@ def run():
             if score >= 70 and s["symbol"] not in open_positions:
 
                 log(f"  *** BUY SIGNAL: {s['symbol']} at ${s['price']:.2f} (score={score:.1f}) ***")
-                buy(s["symbol"], 1)
+                buy(s["symbol"], 10)
 
                 open_positions[s["symbol"]] = {
                     "entry": s["price"],
-                    "qty": 1,
+                    "qty": 10,
                     "time": time.time(),
                     "stop": s["price"] * 0.97,
                     "target": s["price"] * 1.08
@@ -110,7 +110,10 @@ def run():
                 send({
                     **s,
                     "score": score,
-                    "reasons": reasons
+                    "reasons": reasons,
+                    "qty": 10,
+                    "stop": s["price"] * 0.97,
+                    "target": s["price"] * 1.08
                 })
                 log(f"  Discord alert sent for {s['symbol']}")
 
