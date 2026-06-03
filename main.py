@@ -1,8 +1,11 @@
+import os
 import time
 import shutil
 import subprocess
 import requests
 from datetime import datetime
+
+LOCK_FILE = "/tmp/stock_ai_agent.lock"
 
 from engine.scanner import fetch_market
 from engine.ai import analyze
@@ -74,9 +77,9 @@ def run():
         if macro:
             log(f"Macro: SPY {macro.get('spy_change_pct', '?')}% | VIX {macro.get('vix', '?')} ({macro.get('fear_level', '?')} fear)")
 
-        # Pre-filter: skip low-activity stocks to save Groq API quota
-        candidates = [s for s in stocks if abs(s["change"]) >= 1.0 or s["volume"] >= 100000]
-        log(f"Pre-filtered to {len(candidates)} active stocks (change ≥1% or volume ≥100k)")
+        # Pre-filter: only analyze stocks with meaningful movement or high volume
+        candidates = [s for s in stocks if abs(s["change"]) >= 1.5 or s["volume"] >= 200000]
+        log(f"Pre-filtered to {len(candidates)} active stocks (change ≥1.5% or volume ≥200k)")
 
         for s in candidates:
 
@@ -120,7 +123,14 @@ def run():
         time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
+    if os.path.exists(LOCK_FILE):
+        print("[LOCK] Another instance is already running. Exiting.", flush=True)
+        exit(0)
     try:
+        open(LOCK_FILE, 'w').close()
         run()
     except KeyboardInterrupt:
         log("Shutting down...")
+    finally:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
