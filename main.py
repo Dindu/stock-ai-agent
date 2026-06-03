@@ -78,6 +78,11 @@ def run():
 
     while True:
 
+        now = datetime.now()
+        if now.hour >= 18:
+            log(f"Market closed (after 6:00 PM). Exiting.")
+            break
+
         log("--- New Scan Cycle ---")
         positions = get_positions()
         held_symbols = {p["symbol"] for p in positions}
