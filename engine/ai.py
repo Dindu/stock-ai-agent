@@ -33,6 +33,7 @@ Return JSON:
 
 def _analyze_groq(symbol, prompt):
     print(f"[AI] Sending prompt for {symbol} to Groq...", flush=True)
+    time.sleep(4)  # proactive throttle: ~15 calls/min stays under 6000 TPM
     for attempt in range(5):
         try:
             r = requests.post(
