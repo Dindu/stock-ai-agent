@@ -10,6 +10,8 @@ HEADERS = {
     "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY
 }
 
+_fetch_failures = {}  # tracks consecutive price fetch failures per symbol
+
 def get_price(symbol):
     url = f"{ALPACA_DATA_URL}/v2/stocks/trades/latest?symbols={symbol}"
     r = requests.get(url, headers=HEADERS)
@@ -28,8 +30,16 @@ def check_exits():
         price = get_price(sym)
 
         if not price:
-            print(f"[EXITS] Could not fetch price for {sym}, skipping", flush=True)
+            _fetch_failures[sym] = _fetch_failures.get(sym, 0) + 1
+            if _fetch_failures[sym] >= 3:
+                print(f"[EXITS] Removing ghost position {sym} — price unavailable after 3 attempts", flush=True)
+                del open_positions[sym]
+                _fetch_failures.pop(sym, None)
+            else:
+                print(f"[EXITS] Could not fetch price for {sym} (attempt {_fetch_failures[sym]}/3)", flush=True)
             continue
+
+        _fetch_failures.pop(sym, None)  # reset on success
 
         pnl = ((price - pos["entry"]) / pos["entry"]) * 100
         print(f"[EXITS] {sym} | Current: ${price:.2f} | Entry: ${pos['entry']:.2f} | PnL: {pnl:.2f}%", flush=True)
