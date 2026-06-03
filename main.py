@@ -6,6 +6,7 @@ from datetime import datetime
 
 from engine.scanner import fetch_market
 from engine.ai import analyze
+from engine.news import get_news, get_macro, refresh_macro
 from engine.strategy import score_stock
 from engine.regime import adjust
 from engine.exits import check_exits
@@ -68,11 +69,17 @@ def run():
         stocks = fetch_market()
         log(f"Fetched {len(stocks)} stocks")
 
+        refresh_macro()
+        macro = get_macro()
+        if macro:
+            log(f"Macro: SPY {macro.get('spy_change_pct', '?')}% | VIX {macro.get('vix', '?')} ({macro.get('fear_level', '?')} fear)")
+
         for s in stocks:
 
             log(f"Analyzing {s['symbol']} | Price: ${s['price']:.2f} | Change: {s['change']:.2f}% | Vol: {s['volume']:,}")
 
-            ai = analyze(s, [], {})
+            news = get_news(s["symbol"])
+            ai = analyze(s, news, macro)
             score, reasons = score_stock(s, ai)
             score = adjust(score, {})
 
