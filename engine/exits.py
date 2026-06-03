@@ -1,63 +1,30 @@
-import time
-import requests
-from engine.positions import open_positions
-from execution.alpaca import sell
+from execution.alpaca import get_positions, sell
 from output.discord import send_exit
-from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_DATA_URL
-
-HEADERS = {
-    "APCA-API-KEY-ID": ALPACA_API_KEY,
-    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY
-}
-
-_fetch_failures = {}  # tracks consecutive price fetch failures per symbol
-
-def get_price(symbol):
-    url = f"{ALPACA_DATA_URL}/v2/stocks/trades/latest?symbols={symbol}"
-    r = requests.get(url, headers=HEADERS)
-
-    try:
-        return r.json()["trades"][symbol]["p"]
-    except:
-        return None
 
 
 def check_exits():
+    positions = get_positions()
+    if not positions:
+        print("[EXITS] No open positions on Alpaca", flush=True)
+        return
 
-    for sym in list(open_positions.keys()):
+    for pos in positions:
+        sym = pos["symbol"]
+        price = pos["price"]
+        entry = pos["entry"]
+        qty = pos["qty"]
+        stop = pos["stop"]
+        target = pos["target"]
+        pnl = ((price - entry) / entry) * 100
 
-        pos = open_positions[sym]
-        price = get_price(sym)
+        print(f"[EXITS] {sym} | Current: ${price:.2f} | Entry: ${entry:.2f} | Stop: ${stop:.2f} | Target: ${target:.2f} | PnL: {pnl:.2f}%", flush=True)
 
-        if not price:
-            _fetch_failures[sym] = _fetch_failures.get(sym, 0) + 1
-            if _fetch_failures[sym] >= 3:
-                print(f"[EXITS] Removing ghost position {sym} — price unavailable after 3 attempts", flush=True)
-                del open_positions[sym]
-                _fetch_failures.pop(sym, None)
-            else:
-                print(f"[EXITS] Could not fetch price for {sym} (attempt {_fetch_failures[sym]}/3)", flush=True)
-            continue
-
-        _fetch_failures.pop(sym, None)  # reset on success
-
-        pnl = ((price - pos["entry"]) / pos["entry"]) * 100
-        print(f"[EXITS] {sym} | Current: ${price:.2f} | Entry: ${pos['entry']:.2f} | PnL: {pnl:.2f}%", flush=True)
-
-        if price <= pos["stop"]:
+        if price <= stop:
             print(f"[EXITS] STOP HIT on {sym} — selling at ${price:.2f} (PnL: {pnl:.2f}%)", flush=True)
-            sell(sym, pos["qty"])
-            send_exit(sym, "🛑 Stop Loss Hit", pos["entry"], price, pos["qty"], pnl)
-            del open_positions[sym]
+            sell(sym, qty)
+            send_exit(sym, "🛑 Stop Loss Hit", entry, price, qty, pnl)
 
-        elif price >= pos["target"]:
+        elif price >= target:
             print(f"[EXITS] TARGET HIT on {sym} — selling at ${price:.2f} (PnL: {pnl:.2f}%)", flush=True)
-            sell(sym, pos["qty"])
-            send_exit(sym, "🎯 Take Profit Hit", pos["entry"], price, pos["qty"], pnl)
-            del open_positions[sym]
-
-        elif (time.time() - pos["time"]) > 86400:
-            print(f"[EXITS] TIME EXIT on {sym} — held >24h, selling at ${price:.2f} (PnL: {pnl:.2f}%)", flush=True)
-            sell(sym, pos["qty"])
-            send_exit(sym, "⏰ Time Exit (>24h)", pos["entry"], price, pos["qty"], pnl)
-            del open_positions[sym]
+            sell(sym, qty)
+            send_exit(sym, "🎯 Take Profit Hit", entry, price, qty, pnl)

@@ -14,8 +14,7 @@ from engine.news import get_news, get_macro, refresh_macro
 from engine.strategy import score_stock, pre_score
 from engine.regime import adjust
 from engine.exits import check_exits
-from engine.positions import open_positions
-from execution.alpaca import buy
+from execution.alpaca import buy, get_positions
 from output.discord import send
 from config import SCAN_INTERVAL, OLLAMA_URL
 
@@ -59,8 +58,9 @@ def exit_monitor():
     """Runs in background, checks open positions for stop/target every 5 min."""
     while True:
         time.sleep(300)
-        if open_positions:
-            log(f"[EXIT MONITOR] Checking {len(open_positions)} open position(s)...")
+        positions = get_positions()
+        if positions:
+            log(f"[EXIT MONITOR] Checking {len(positions)} open position(s)...")
             check_exits()
         else:
             log("[EXIT MONITOR] No open positions to check.")
@@ -79,7 +79,9 @@ def run():
     while True:
 
         log("--- New Scan Cycle ---")
-        log(f"Open positions: {list(open_positions.keys()) or 'none'}")
+        positions = get_positions()
+        held_symbols = {p["symbol"] for p in positions}
+        log(f"Open positions: {list(held_symbols) or 'none'}")
 
         log("Fetching market data...")
         stocks = fetch_market()
@@ -114,18 +116,10 @@ def run():
 
             log(f"  Score: {score:.1f} | Reasons: {reasons}")
 
-            if score >= 75 and s["symbol"] not in open_positions:
+            if score >= 75 and s["symbol"] not in held_symbols:
 
                 log(f"  *** BUY SIGNAL: {s['symbol']} at ${s['price']:.2f} (score={score:.1f}) ***")
                 buy(s["symbol"], 10)
-
-                open_positions[s["symbol"]] = {
-                    "entry": s["price"],
-                    "qty": 10,
-                    "time": time.time(),
-                    "stop": s["price"] * 0.97,
-                    "target": s["price"] * 1.08
-                }
 
                 log(f"  Stop: ${s['price'] * 0.97:.2f} | Target: ${s['price'] * 1.08:.2f}")
 
@@ -139,7 +133,7 @@ def run():
                 })
                 log(f"  Discord alert sent for {s['symbol']}")
 
-            elif s["symbol"] in open_positions:
+            elif s["symbol"] in held_symbols:
                 log(f"  Skipping {s['symbol']} — already in position")
             else:
                 log(f"  No signal (score below 75)")
