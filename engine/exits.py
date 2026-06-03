@@ -1,5 +1,5 @@
+import time
 import requests
-from datetime import datetime
 from engine.positions import open_positions
 from execution.alpaca import sell
 from output.discord import send_exit
@@ -56,7 +56,7 @@ def check_exits():
             send_exit(sym, "🎯 Take Profit Hit", pos["entry"], price, pos["qty"], pnl)
             del open_positions[sym]
 
-        elif (datetime.now() - pos["time"]).seconds > 86400:
+        elif (time.time() - pos["time"]) > 86400:
             print(f"[EXITS] TIME EXIT on {sym} — held >24h, selling at ${price:.2f} (PnL: {pnl:.2f}%)", flush=True)
             sell(sym, pos["qty"])
             send_exit(sym, "⏰ Time Exit (>24h)", pos["entry"], price, pos["qty"], pnl)
