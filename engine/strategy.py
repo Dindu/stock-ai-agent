@@ -8,6 +8,10 @@ def pre_score(stock):
     change = stock.get("change", 0)
     volume = stock.get("volume", 0)
 
+    # Long-only: never score negative stocks
+    if change <= 0:
+        return 0
+
     # Price momentum
     if change >= 5:
         score += 30

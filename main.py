@@ -90,13 +90,12 @@ def run():
         if macro:
             log(f"Macro: SPY {macro.get('spy_change_pct', '?')}% | VIX {macro.get('vix', '?')} ({macro.get('fear_level', '?')} fear)")
 
-        # Pre-filter: only send to AI stocks with real bullish potential
-        # Must be moving UP and have either strong % move or very high volume
+        # Pre-filter: only bullish candidates — must be moving UP with momentum or high volume
         candidates = [
             s for s in stocks
-            if s["change"] >= 1.5 or s["volume"] >= 500000
+            if s["change"] > 0 and (s["change"] >= 1.5 or s["volume"] >= 500000)
         ]
-        log(f"Pre-filtered to {len(candidates)} candidates (change ≥1.5% or volume ≥500k)")
+        log(f"Pre-filtered to {len(candidates)} bullish candidates")
 
         for s in candidates:
 
