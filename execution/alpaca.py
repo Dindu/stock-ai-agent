@@ -8,7 +8,16 @@ HEADERS = {
 
 BASE = ALPACA_BASE_URL
 
+def has_open_position(symbol):
+    """Check Alpaca directly for an existing position in this symbol."""
+    r = requests.get(f"{BASE}/v2/positions/{symbol}", headers=HEADERS)
+    return r.status_code == 200
+
+
 def buy(symbol, qty):
+    if has_open_position(symbol):
+        print(f"[ALPACA] Skipping buy {symbol} — position already open on Alpaca", flush=True)
+        return None
     return requests.post(f"{BASE}/v2/orders", json={
         "symbol": symbol,
         "qty": qty,
