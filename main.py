@@ -74,7 +74,11 @@ def run():
         if macro:
             log(f"Macro: SPY {macro.get('spy_change_pct', '?')}% | VIX {macro.get('vix', '?')} ({macro.get('fear_level', '?')} fear)")
 
-        for s in stocks:
+        # Pre-filter: skip low-activity stocks to save Groq API quota
+        candidates = [s for s in stocks if abs(s["change"]) >= 1.0 or s["volume"] >= 100000]
+        log(f"Pre-filtered to {len(candidates)} active stocks (change ≥1% or volume ≥100k)")
+
+        for s in candidates:
 
             log(f"Analyzing {s['symbol']} | Price: ${s['price']:.2f} | Change: {s['change']:.2f}% | Vol: {s['volume']:,}")
 
