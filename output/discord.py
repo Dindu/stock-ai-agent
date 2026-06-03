@@ -3,19 +3,23 @@ from datetime import datetime
 from config import DISCORD_WEBHOOK
 
 def send(stock):
-    symbol   = stock['symbol']
-    price    = stock['price']
-    qty      = stock.get('qty', 10)
-    score    = stock['score']
-    change   = stock['change']
-    stop     = stock.get('stop', price * 0.97)
-    target   = stock.get('target', price * 1.08)
-    rr       = stock.get('rr', 0)
-    cost     = price * qty
-    catalyst = stock.get('catalyst_summary', '')
-    reasons  = "\n".join(f"• {r}" for r in stock.get('reasons', []))
-    bd       = stock.get('breakdown', {})
-    now      = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    symbol      = stock['symbol']
+    price       = stock['price']
+    qty         = stock.get('qty', 10)
+    score       = stock['score']
+    change      = stock['change']
+    stop        = stock.get('stop', price * 0.97)
+    target      = stock.get('target', price * 1.08)
+    rr          = stock.get('rr', 0)
+    cost        = price * qty
+    catalyst    = stock.get('catalyst_summary', '')
+    trade_type  = stock.get('trade_type', '').upper()
+    hold_period = stock.get('hold_period', '1-2 weeks')
+    reasons     = "\n".join(f"• {r}" for r in stock.get('reasons', []))
+    bd          = stock.get('breakdown', {})
+    now         = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    type_emoji = {"BREAKOUT": "🚀", "MOMENTUM": "📈", "REVERSAL": "🔄", "AVOID": "⛔"}.get(trade_type, "📊")
 
     score_bar = (
         f"`Catalyst     {bd.get('catalyst', 0):>2}/30`\n"
@@ -28,12 +32,13 @@ def send(stock):
     )
 
     msg = (
-        f"🟢 **BUY SIGNAL — {symbol}**\n"
+        f"🟢 **GEM FOUND — {symbol}** {type_emoji} `{trade_type}`\n"
         f"🕐 {now}\n\n"
-        f"**Catalyst:** {catalyst}\n\n"
+        f"**Opportunity:** {catalyst}\n\n"
         f"**Score Breakdown:**\n{score_bar}\n\n"
         f"**Entry:** ${price:.2f} × {qty} shares = ${cost:,.2f}  |  Change: {change:+.2f}%\n"
-        f"📈 **Target:** ${target:.2f}  |  🛑 **Stop:** ${stop:.2f}  |  ⚖️ **R:R {rr:.1f}:1**\n\n"
+        f"📈 **Target:** ${target:.2f}  |  🛑 **Stop:** ${stop:.2f}  |  ⚖️ **R:R {rr:.1f}:1**\n"
+        f"🗓️ **Hold:** {hold_period}\n\n"
         f"**Reasons:**\n{reasons}"
     )
 

@@ -11,25 +11,39 @@ def analyze(stock, news, macro):
     change = stock.get('change', 0)
     volume = stock.get('volume', 0)
 
-    prompt = f"""You are a professional swing trader evaluating stocks for 1-4 week holds.
+    prompt = f"""You are a professional swing trader hunting for GEM opportunities — stocks with 10%+ upside potential over 1-4 weeks.
+
+You are NOT just looking for stocks already moving up. You are scouting for:
+1. Stocks with a strong catalyst (earnings beat, analyst upgrade, new contract, product launch) that have upside
+2. Oversold stocks that dropped on panic/sector rotation but have strong fundamentals — bounce candidates
+3. Stocks with major volume spikes suggesting institutional accumulation before a big move
+4. Early-stage breakouts before the crowd notices
+5. Stocks where news impact hasn't fully priced in yet
 
 Symbol: {symbol}
 Price: ${price:.2f} | Change today: {change:+.2f}% | Volume: {volume:,}
 
 Recent News:
-{news or 'No recent news'}
+{news or 'No recent news available'}
 
 Market Context:
 {macro}
 
-Score this stock across 5 categories. Be strict — only genuinely high-conviction setups deserve high scores.
+Score this stock across 5 categories. Be strict and honest.
+A stock DOWN today can still score high if there is a real recovery catalyst.
+A stock UP today can score low if the move is random with no fundamental reason.
 
 SCORING GUIDE:
-- catalyst (0-30): Is there a clear reason driving this move? (earnings beat=25-30, analyst upgrade=15-20, no catalyst=0-5)
-- market (0-20): Is the macro environment supportive? (SPY up + sector strong + rates favorable=18-20, bearish macro=0-8)
-- fundamentals (0-20): Does the company have strong revenue growth, analyst upgrades, price target upside? (strong=16-20, weak=0-8)
-- technicals (0-20): Is the chart setup good? (breakout from resistance + volume confirmation=16-20, no setup=0-8)
-- sentiment (0-10): Positive analyst consensus, institutional interest, news tone? (very positive=8-10, mixed=4-6, negative=0-3)
+- catalyst (0-30): Clear specific reason for a move in the next 1-4 weeks?
+  (Earnings beat / major contract / FDA approval = 25-30, Analyst upgrade = 15-20, Sector tailwind = 10-15, No catalyst = 0-5)
+- market (0-20): Is macro environment supportive for THIS stock?
+  (Rate cuts favor fintechs, defense stocks strong in geopolitical tension, etc. Relevant tailwind = 15-20, Headwind = 0-8)
+- fundamentals (0-20): Revenue growth, profitability trend, analyst price target vs current price?
+  (Strong growth + target upside >15% = 16-20, Declining or no upside = 0-8)
+- technicals (0-20): Chart setup — is there a clear entry with defined risk?
+  (Near support after drop + volume = 16-20, Breakout from base = 14-18, Extended/no setup = 0-8)
+- sentiment (0-10): Analyst consensus, institutional interest, news tone, insider activity?
+  (Strong buy consensus + positive news = 8-10, Mixed = 4-6, Negative = 0-3)
 
 Return JSON only:
 {{
@@ -38,9 +52,10 @@ Return JSON only:
   "fundamentals": <int 0-20>,
   "technicals": <int 0-20>,
   "sentiment": <int 0-10>,
-  "trade_type": "breakout|momentum|avoid",
+  "trade_type": "breakout|momentum|reversal|avoid",
   "risk_level": "low|medium|high",
-  "catalyst_summary": "<one sentence: main catalyst or why there is none>",
+  "catalyst_summary": "<one sentence: the specific gem opportunity or why there is none>",
+  "hold_period": "<1-3 days|1-2 weeks|2-4 weeks>",
   "reasons": ["<specific reason 1>", "<specific reason 2>", "<specific reason 3>"]
 }}"""
 

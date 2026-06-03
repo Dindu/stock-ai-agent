@@ -92,12 +92,17 @@ def run():
         if macro:
             log(f"Macro: SPY {macro.get('spy_change_pct', '?')}% | VIX {macro.get('vix', '?')} ({macro.get('fear_level', '?')} fear)")
 
-        # Pre-filter: only bullish candidates — must be moving UP with momentum or high volume
+        # Scout for opportunity — not just stocks already moving up
+        # Include: strong upward moves, significant drops (bounce candidates), major volume events
         candidates = [
             s for s in stocks
-            if s["change"] > 0 and (s["change"] >= 1.5 or s["volume"] >= 500000)
+            if s["volume"] >= 500000 and (
+                s["change"] >= 1.5          # clear upward momentum
+                or s["change"] <= -3.0      # oversold — potential reversal with catalyst
+                or s["volume"] >= 2000000   # major institutional activity regardless of direction
+            )
         ]
-        log(f"Pre-filtered to {len(candidates)} bullish candidates")
+        log(f"Pre-filtered to {len(candidates)} candidates (momentum + oversold + volume anomalies)")
 
         for s in candidates:
 
@@ -111,7 +116,7 @@ def run():
 
             news = get_news(s["symbol"])
             ai = analyze(s, news, macro)
-            score, reasons, breakdown, catalyst_summary = score_stock(s, ai)
+            score, reasons, breakdown, catalyst_summary, hold_period, trade_type = score_stock(s, ai)
             score = adjust(score, {})
 
             # Dynamic target based on conviction score
@@ -123,8 +128,8 @@ def run():
             rr     = reward / risk if risk > 0 else 0
 
             log(f"  Score: {score:.0f}/100 | Catalyst:{breakdown['catalyst']}/30 Market:{breakdown['market']}/20 Fundamentals:{breakdown['fundamentals']}/20 Technicals:{breakdown['technicals']}/20 Sentiment:{breakdown['sentiment']}/10")
-            log(f"  Catalyst: {catalyst_summary}")
-            log(f"  R:R {rr:.1f}:1 | Entry: ${s['price']:.2f} | Stop: ${stop:.2f} | Target: ${target:.2f}")
+            log(f"  [{trade_type.upper()}] {catalyst_summary}")
+            log(f"  R:R {rr:.1f}:1 | Hold: {hold_period} | Entry: ${s['price']:.2f} | Stop: ${stop:.2f} | Target: ${target:.2f}")
 
             if score >= 80 and s["symbol"] not in held_symbols:
 
@@ -139,6 +144,8 @@ def run():
                     "reasons": reasons,
                     "breakdown": breakdown,
                     "catalyst_summary": catalyst_summary,
+                    "hold_period": hold_period,
+                    "trade_type": trade_type,
                     "qty": 10,
                     "stop": stop,
                     "target": target,
