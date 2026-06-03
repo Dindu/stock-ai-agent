@@ -11,7 +11,7 @@ LOCK_FILE = "/tmp/stock_ai_agent.lock"
 from engine.scanner import fetch_market
 from engine.ai import analyze
 from engine.news import get_news, get_macro, refresh_macro
-from engine.strategy import score_stock, pre_score
+from engine.strategy import score_stock, pre_score, detect_scenario
 from engine.regime import adjust
 from engine.exits import check_exits
 from execution.alpaca import buy, get_positions
@@ -92,27 +92,31 @@ def run():
         if macro:
             log(f"Macro: SPY {macro.get('spy_change_pct', '?')}% | VIX {macro.get('vix', '?')} ({macro.get('fear_level', '?')} fear)")
 
-        # Scout for opportunity — not just stocks already moving up
-        # Include: strong upward moves, significant drops (bounce candidates), major volume events
-        candidates = [
-            s for s in stocks
-            if s["volume"] >= 500000 and (
-                s["change"] >= 1.5          # clear upward momentum
-                or s["change"] <= -3.0      # oversold — potential reversal with catalyst
-                or s["volume"] >= 2000000   # major institutional activity regardless of direction
-            )
-        ]
-        log(f"Pre-filtered to {len(candidates)} candidates (momentum + oversold + volume anomalies)")
+        # Scout for opportunity across all market scenarios
+        candidates = []
+        for s in stocks:
+            scenario, desc = detect_scenario(s)
+            if scenario != "none":
+                s["scenario"] = scenario
+                s["scenario_desc"] = desc
+                candidates.append(s)
+        log(f"Pre-filtered to {len(candidates)} candidates across scenarios")
+
+        # Tally scenario breakdown for visibility
+        from collections import Counter
+        sc = Counter(s["scenario"] for s in candidates)
+        log(f"  Scenarios: {dict(sc)}")
 
         for s in candidates:
 
             # Rule-based pre-score — skip Groq if no chance of reaching 75
             ps = pre_score(s)
             if ps < 10:
-                log(f"  Pre-score {ps} too low, skipping AI")
+                log(f"  [{s['scenario'].upper()}] Pre-score {ps} too low, skipping")
                 continue
 
-            log(f"Analyzing {s['symbol']} | Price: ${s['price']:.2f} | Change: {s['change']:.2f}% | Vol: {s['volume']:,} | Pre-score: {ps}")
+            log(f"Analyzing {s['symbol']} | {s['scenario'].upper()} | Price: ${s['price']:.2f} | Change: {s['change']:+.2f}% | Gap: {s.get('gap_pct', 0):+.2f}% | Vol: {s['volume']:,} | RelVol: {s.get('rel_volume', 1):.1f}x | Pre-score: {ps}")
+            log(f"  Scenario: {s['scenario_desc']}")
 
             news = get_news(s["symbol"])
             ai = analyze(s, news, macro)

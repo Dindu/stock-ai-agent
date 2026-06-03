@@ -43,14 +43,42 @@ def fetch_market():
 
         for symbol, d in r.json().items():
             try:
-                bar = d["dailyBar"]
-                trade = d["latestTrade"]
-                change = ((bar["c"] - bar["o"]) / bar["o"]) * 100
+                bar      = d["dailyBar"]
+                prev_bar = d.get("prevDailyBar", {})
+                trade    = d["latestTrade"]
+
+                open_price  = bar["o"]
+                close_price = bar["c"]
+                high_price  = bar["h"]
+                low_price   = bar["l"]
+                volume      = bar["v"]
+                prev_close  = prev_bar.get("c", open_price)
+                prev_volume = prev_bar.get("v", volume) or volume
+
+                # Intraday change (open → current)
+                change = ((trade["p"] - open_price) / open_price) * 100
+
+                # Overnight gap (prev close → today open)
+                gap_pct = ((open_price - prev_close) / prev_close) * 100
+
+                # Relative volume vs yesterday
+                rel_volume = volume / prev_volume
+
+                # Intraday range as % of price (volatility proxy)
+                range_pct = ((high_price - low_price) / low_price) * 100
+
                 results.append({
-                    "symbol": symbol,
-                    "price": trade["p"],
-                    "change": change,
-                    "volume": bar["v"]
+                    "symbol":     symbol,
+                    "price":      trade["p"],
+                    "open":       open_price,
+                    "high":       high_price,
+                    "low":        low_price,
+                    "prev_close": prev_close,
+                    "change":     change,
+                    "gap_pct":    gap_pct,
+                    "volume":     volume,
+                    "rel_volume": rel_volume,
+                    "range_pct":  range_pct,
                 })
             except:
                 continue
