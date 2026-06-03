@@ -85,7 +85,7 @@ def run():
 
             log(f"  Score: {score:.1f} | Reasons: {reasons}")
 
-            if score >= 80 and s["symbol"] not in open_positions:
+            if score >= 70 and s["symbol"] not in open_positions:
 
                 log(f"  *** BUY SIGNAL: {s['symbol']} at ${s['price']:.2f} (score={score:.1f}) ***")
                 buy(s["symbol"], 1)
@@ -110,7 +110,7 @@ def run():
             elif s["symbol"] in open_positions:
                 log(f"  Skipping {s['symbol']} — already in position")
             else:
-                log(f"  No signal (score below 80)")
+                log(f"  No signal (score below 70)")
 
         log(f"Scan complete. Sleeping {SCAN_INTERVAL}s...\n")
         time.sleep(SCAN_INTERVAL)

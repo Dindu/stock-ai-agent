@@ -17,7 +17,7 @@ def score_stock(stock, ai_raw):
         risk = ai.get("risk_level", "")
         trade_type = ai.get("trade_type", "")
 
-        score += confidence * 0.5
+        score += confidence * 0.7
 
         if trade_type in ["momentum", "breakout"]:
             score += 20
