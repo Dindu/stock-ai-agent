@@ -46,7 +46,11 @@ def _analyze_groq(symbol, prompt):
             },
             timeout=30
         )
-        result = r.json()["choices"][0]["message"]["content"]
+        data = r.json()
+        if "choices" not in data:
+            print(f"[AI] Groq ERROR for {symbol}: {data.get('error', data)}", flush=True)
+            return None
+        result = data["choices"][0]["message"]["content"]
         print(f"[AI] Got response for {symbol}", flush=True)
         return result
     except Exception as e:
