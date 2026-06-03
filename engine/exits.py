@@ -17,7 +17,7 @@ def get_price(symbol):
     r = requests.get(url, headers=HEADERS)
 
     try:
-        return r.json()[symbol]["price"]
+        return r.json()["trades"][symbol]["p"]
     except:
         return None
 
