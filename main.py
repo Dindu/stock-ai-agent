@@ -2,6 +2,7 @@ import os
 import time
 import shutil
 import subprocess
+import threading
 import requests
 from datetime import datetime
 
@@ -54,19 +55,31 @@ def start_ollama():
     log("WARNING: Ollama did not start in time. AI analysis may fail.")
     return proc
 
+def exit_monitor():
+    """Runs in background, checks open positions for stop/target every 5 min."""
+    while True:
+        time.sleep(300)
+        if open_positions:
+            log(f"[EXIT MONITOR] Checking {len(open_positions)} open position(s)...")
+            check_exits()
+        else:
+            log("[EXIT MONITOR] No open positions to check.")
+
 def run():
 
     ollama_proc = start_ollama()
 
     log("AI Trading System Running...")
 
+    # Start background thread to monitor exits every 5 minutes
+    t = threading.Thread(target=exit_monitor, daemon=True)
+    t.start()
+    log("Exit monitor started (checks every 5 min)")
+
     while True:
 
         log("--- New Scan Cycle ---")
         log(f"Open positions: {list(open_positions.keys()) or 'none'}")
-
-        log("Checking exits...")
-        check_exits()
 
         log("Fetching market data...")
         stocks = fetch_market()
