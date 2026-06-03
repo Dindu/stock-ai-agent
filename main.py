@@ -4,7 +4,7 @@ import shutil
 import subprocess
 import threading
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 LOCK_FILE = "/tmp/stock_ai_agent.lock"
 
@@ -78,9 +78,10 @@ def run():
 
     while True:
 
-        now = datetime.now()
+        EST = timezone(timedelta(hours=-5))
+        now = datetime.now(EST)
         if now.hour >= 18:
-            log(f"Market closed (after 6:00 PM). Exiting.")
+            log(f"Market closed (after 6:00 PM EST). Exiting.")
             break
 
         log("--- New Scan Cycle ---")
