@@ -91,15 +91,28 @@ def send_watchlist(stock):
 def send_exit(symbol, reason, entry, exit_price, qty, pnl):
     now     = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     pnl_amt = (exit_price - entry) * qty
-    emoji   = "🟢" if pnl >= 0 else "🔴"
+
+    if pnl >= 5:
+        outcome = "🟢 **PROFIT**"
+        bar = "█" * min(int(pnl), 20)
+    elif pnl > 0:
+        outcome = "🟡 **SMALL PROFIT**"
+        bar = "▒" * min(int(pnl * 2), 20)
+    elif pnl >= -3:
+        outcome = "🔴 **SMALL LOSS**"
+        bar = "░" * min(int(abs(pnl) * 2), 20)
+    else:
+        outcome = "🔴 **LOSS**"
+        bar = "░" * min(int(abs(pnl)), 20)
 
     msg = (
-        f"{emoji} **EXIT — {symbol}**\n"
+        f"{'🟢' if pnl >= 0 else '🔴'} **EXITING {symbol}**\n"
         f"🕐 {now}\n\n"
-        f"**Reason:** {reason}\n"
+        f"**Reason:** {reason}\n\n"
         f"**Entry:** ${entry:.2f}  →  **Exit:** ${exit_price:.2f}\n"
-        f"**Qty:** {qty} shares\n"
-        f"**P&L:** {pnl:+.2f}%  (${pnl_amt:+.2f})"
+        f"**Shares:** {qty}  |  **Move:** {((exit_price - entry) / entry * 100):+.2f}%\n\n"
+        f"{outcome}\n"
+        f"`{bar}` {pnl:+.2f}%  (${pnl_amt:+.2f})"
     )
 
     requests.post(DISCORD_WEBHOOK, json={"content": msg})
