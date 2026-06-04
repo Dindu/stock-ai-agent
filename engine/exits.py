@@ -1,5 +1,6 @@
 from execution.alpaca import get_positions, sell
 from output.discord import send_exit
+from engine import learner
 
 
 def check_exits():
@@ -23,8 +24,10 @@ def check_exits():
             print(f"[EXITS] STOP HIT on {sym} — selling at ${price:.2f} (PnL: {pnl:.2f}%)", flush=True)
             sell(sym, qty)
             send_exit(sym, "🛑 Stop Loss Hit", entry, price, qty, pnl)
+            learner.log_exit(sym, price, "stop_loss", pnl)
 
         elif price >= target:
             print(f"[EXITS] TARGET HIT on {sym} — selling at ${price:.2f} (PnL: {pnl:.2f}%)", flush=True)
             sell(sym, qty)
             send_exit(sym, "🎯 Take Profit Hit", entry, price, qty, pnl)
+            learner.log_exit(sym, price, "take_profit", pnl)
