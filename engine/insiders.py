@@ -30,11 +30,15 @@ def get_insider_signal(symbol):
 
 
 def _fetch(symbol, now):
+    """
+    Use SEC EDGAR full-text search API to find recent Form 4 filings.
+    This is the reliable free endpoint — returns JSON, no XML parsing needed.
+    """
     try:
         url = (
-            f"https://www.sec.gov/cgi-bin/browse-edgar"
-            f"?action=getcompany&symbol={symbol}&type=4"
-            f"&dateb=&owner=include&count=10&output=atom"
+            f"https://efts.sec.gov/LATEST/search-index?q=%22{symbol}%22"
+            f"&dateRange=custom&startdt={(now - timedelta(days=30)).strftime('%Y-%m-%d')}"
+            f"&enddt={now.strftime('%Y-%m-%d')}&forms=4"
         )
         r = requests.get(
             url,
@@ -44,22 +48,10 @@ def _fetch(symbol, now):
         if r.status_code != 200:
             return (0, "")
 
-        root = ET.fromstring(r.text)
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        entries = root.findall("atom:entry", ns)
+        hits = r.json().get("hits", {}).get("hits", [])
+        recent_count = len(hits)
 
-        cutoff = now - timedelta(days=30)
-        recent_count = 0
-
-        for entry in entries:
-            updated = entry.find("atom:updated", ns)
-            if updated is not None:
-                try:
-                    dt = datetime.fromisoformat(updated.text[:10])
-                    if dt >= cutoff:
-                        recent_count += 1
-                except Exception:
-                    pass
+        print(f"[INSIDERS] {symbol}: {recent_count} Form 4 filing(s) in last 30 days", flush=True)
 
         if recent_count >= 3:
             return (20, f"{recent_count} insider filings in last 30 days — multiple insiders active")
@@ -70,5 +62,6 @@ def _fetch(symbol, now):
         else:
             return (0, "")
 
-    except Exception:
+    except Exception as e:
+        print(f"[INSIDERS] {symbol} error: {e}", flush=True)
         return (0, "")

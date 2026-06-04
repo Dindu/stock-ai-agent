@@ -57,11 +57,23 @@ def get_macro():
                 spy_change = ((bar.get("c", 0) - bar.get("o", 1)) / bar.get("o", 1)) * 100
                 macro["spy_change_pct"] = round(spy_change, 2)
                 macro["market_trend"] = "bullish" if spy_change > 0.3 else "bearish" if spy_change < -0.3 else "neutral"
-            if "VIX" in data:
-                vix = data["VIX"].get("latestTrade", {}).get("p")
-                if vix:
-                    macro["vix"] = round(vix, 1)
-                    macro["fear_level"] = "high" if vix > 25 else "low" if vix < 15 else "moderate"
+    except Exception:
+        pass
+
+    # VIX via VIXY ETF (tracks VIX, available on Alpaca free tier)
+    try:
+        r2 = requests.get(
+            f"{ALPACA_DATA_URL}/v2/stocks/VIXY/bars?timeframe=1Day&limit=1",
+            headers=HEADERS, timeout=8
+        )
+        if r2.status_code == 200:
+            bars = r2.json().get("bars", [])
+            if bars:
+                vixy = bars[-1]["c"]
+                # VIXY ≈ VIX/4.5 rough approximation for fear level
+                vix_approx = round(vixy, 1)
+                macro["vix"] = vix_approx
+                macro["fear_level"] = "high" if vix_approx > 20 else "low" if vix_approx < 12 else "moderate"
     except Exception:
         pass
 

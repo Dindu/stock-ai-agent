@@ -1,24 +1,18 @@
 """
-Accumulation Scanner — Alpaca 15-day bar analysis (free, uses existing key).
+Accumulation Scanner — yfinance 20-day bar analysis (free, no API key needed).
 Detects institutional accumulation pattern: price in a tight range while volume quietly rises.
 This often precedes a breakout move as institutions build a position before the crowd notices.
 Cache: per scan cycle (cleared at start of each cycle).
 """
 
-import requests
-from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_DATA_URL
-
-HEADERS = {
-    "APCA-API-KEY-ID": ALPACA_API_KEY,
-    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-}
+import yfinance as yf
 
 _cache = {}  # {symbol: (score, description)} — cleared each scan cycle
 
 
 def check_accumulation(symbol):
     """
-    Detect institutional accumulation: tight price range + volume trending up over 15 days.
+    Detect institutional accumulation: tight price range + volume trending up over 20 days.
     Returns (score 0-15, description)
     """
     if symbol in _cache:
@@ -31,18 +25,26 @@ def check_accumulation(symbol):
 
 def _fetch(symbol):
     try:
-        url = (
-            f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
-            f"?timeframe=1Day&limit=15&adjustment=raw"
-        )
-        r = requests.get(url, headers=HEADERS, timeout=8)
-        bars = r.json().get("bars", [])
-
-        if len(bars) < 8:
+        df = yf.download(symbol, period="20d", interval="1d", progress=False, auto_adjust=False)
+        if df is None or len(df) < 8:
             return (0, "")
 
-        closes  = [b["c"] for b in bars]
-        volumes = [b["v"] for b in bars]
+        # yfinance returns multi-level columns when auto_adjust=False: (field, ticker)
+        close_col  = ("Close",  symbol)
+        open_col   = ("Open",   symbol)
+        volume_col = ("Volume", symbol)
+        if close_col not in df.columns:
+            # Fallback for single-ticker simple column names
+            close_col  = "Close"
+            open_col   = "Open"
+            volume_col = "Volume"
+
+        closes  = df[close_col].dropna().tolist()
+        opens   = df[open_col].dropna().tolist()
+        volumes = df[volume_col].dropna().tolist()
+
+        n = min(len(closes), len(opens), len(volumes))
+        closes, opens, volumes = closes[:n], opens[:n], volumes[:n]
 
         avg_price       = sum(closes) / len(closes)
         price_range_pct = (max(closes) - min(closes)) / avg_price * 100
@@ -52,13 +54,27 @@ def _fetch(symbol):
         recent_vol_avg   = sum(volumes[mid:]) / (len(volumes) - mid)
         vol_trend        = recent_vol_avg / early_vol_avg if early_vol_avg > 0 else 1.0
 
-        # Classic accumulation: price going sideways while volume quietly increases
-        if price_range_pct < 4.0 and vol_trend >= 1.5:
-            return (15, f"Strong accumulation: {price_range_pct:.1f}% price range over {len(bars)} days, volume rising {vol_trend:.1f}x")
-        elif price_range_pct < 6.0 and vol_trend >= 1.3:
-            return (8, f"Mild accumulation: {price_range_pct:.1f}% price range, volume up {vol_trend:.1f}x")
-        else:
-            return (0, "")
+        # Signal 1: Classic accumulation — tight range + rising volume
+        # Thresholds adjusted for volatile market conditions
+        if price_range_pct < 6.0 and vol_trend >= 1.4:
+            return (15, f"Strong accumulation: {price_range_pct:.1f}% range, volume up {vol_trend:.1f}x over {n} days")
+        if price_range_pct < 12.0 and vol_trend >= 1.2:
+            return (8, f"Mild accumulation: {price_range_pct:.1f}% range, volume up {vol_trend:.1f}x")
+
+        # Signal 2: On-balance volume pressure — more buying days with big volume than selling days
+        avg_vol = sum(volumes) / len(volumes)
+        up_vol_days   = sum(1 for i in range(n) if closes[i] > opens[i] and volumes[i] > avg_vol)
+        down_vol_days = sum(1 for i in range(n) if closes[i] < opens[i] and volumes[i] > avg_vol)
+        total_high_vol_days = up_vol_days + down_vol_days
+
+        if total_high_vol_days >= 4 and up_vol_days / total_high_vol_days >= 0.65:
+            pct = round(up_vol_days / total_high_vol_days * 100)
+            return (8, f"Volume pressure: {pct}% of high-vol days were up days ({up_vol_days}/{total_high_vol_days})")
+
+        return (0, "")
+
+    except Exception:
+        return (0, "")
 
     except Exception:
         return (0, "")
