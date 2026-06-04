@@ -2,14 +2,17 @@
 Insider Buying Scanner — SEC EDGAR Form 4 filings (free, no API key required).
 Checks for recent insider transactions. Multiple filings = institutional confidence signal.
 Cache: 4 hours per symbol (insider data doesn't change minute to minute).
+
+Uses EDGAR company search by ticker to get the CIK, then fetches actual Form 4 filings
+for that specific company — avoids false positives from common-word tickers like T, TECH.
 """
 
 import requests
-import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
-_cache = {}  # {symbol: (timestamp, (score, description))}
-_CACHE_TTL = 14400  # 4 hours
+_cache = {}          # {symbol: (timestamp, (score, description))}
+_cik_cache = {}      # {symbol: cik_str}
+_CACHE_TTL = 14400   # 4 hours
 
 
 def get_insider_signal(symbol):
@@ -29,17 +32,40 @@ def get_insider_signal(symbol):
     return result
 
 
+def _get_cik(symbol):
+    """Resolve ticker → CIK using EDGAR's company tickers JSON (cached)."""
+    if symbol in _cik_cache:
+        return _cik_cache[symbol]
+    try:
+        r = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers={"User-Agent": "StockScanBot research@stockscan.com"},
+            timeout=8,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        for entry in data.values():
+            if entry.get("ticker", "").upper() == symbol.upper():
+                cik = str(entry["cik_str"]).zfill(10)
+                _cik_cache[symbol] = cik
+                return cik
+    except Exception:
+        pass
+    return None
+
+
 def _fetch(symbol, now):
     """
-    Use SEC EDGAR full-text search API to find recent Form 4 filings.
-    This is the reliable free endpoint — returns JSON, no XML parsing needed.
+    Fetch Form 4 filings via EDGAR submissions API using CIK.
+    Counts filings in the last 30 days for this exact company.
     """
     try:
-        url = (
-            f"https://efts.sec.gov/LATEST/search-index?q=%22{symbol}%22"
-            f"&dateRange=custom&startdt={(now - timedelta(days=30)).strftime('%Y-%m-%d')}"
-            f"&enddt={now.strftime('%Y-%m-%d')}&forms=4"
-        )
+        cik = _get_cik(symbol)
+        if not cik:
+            return (0, "")
+
+        url = f"https://data.sec.gov/submissions/CIK{cik}.json"
         r = requests.get(
             url,
             headers={"User-Agent": "StockScanBot research@stockscan.com"},
@@ -48,8 +74,15 @@ def _fetch(symbol, now):
         if r.status_code != 200:
             return (0, "")
 
-        hits = r.json().get("hits", {}).get("hits", [])
-        recent_count = len(hits)
+        filings = r.json().get("filings", {}).get("recent", {})
+        forms = filings.get("form", [])
+        dates = filings.get("filingDate", [])
+
+        cutoff = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+        recent_count = sum(
+            1 for form, date in zip(forms, dates)
+            if form == "4" and date >= cutoff
+        )
 
         print(f"[INSIDERS] {symbol}: {recent_count} Form 4 filing(s) in last 30 days", flush=True)
 
