@@ -190,12 +190,3 @@ def score_stock(stock, ai_raw):
         reasons = ["AI parse error"]
 
     return min(score, 100), reasons, breakdown, catalyst_summary, hold_period, trade_type
-
-
-        reasons = ai.get("reasons", [])
-
-    except:
-        score -= 10
-        reasons = ["AI error"]
-
-    return min(max(score, 0), 100), reasons
