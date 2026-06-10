@@ -9,6 +9,7 @@ No WebSocket -> no Alpaca connection-limit issues.
 """
 
 import os
+import sys
 import time
 import traceback
 from datetime import datetime, date, timedelta, timezone
@@ -24,6 +25,12 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
 
+
+# Force line-buffered stdout so logs appear in real time on Render / Docker.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 load_dotenv()
 
@@ -253,6 +260,10 @@ def fetch_bars(client):
     return bars
 
 
+def log(msg):
+    print(f"[{datetime.now(central):%Y-%m-%d %H:%M:%S} CT] {msg}", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # main loop
 # ---------------------------------------------------------------------------
@@ -260,18 +271,18 @@ def run_cycle(client):
     global last_alert_contract
 
     if not market_open_now():
-        print(f"[{datetime.now(central):%H:%M:%S}] Market closed — skipping.")
+        log("Market closed — skipping.")
         return
 
     bars = fetch_bars(client)
+    log(f"Fetched {len(bars)} bars.")
     if len(bars) < 55:
-        print(f"[{datetime.now(central):%H:%M:%S}] Bars: {len(bars)}/55 — warming up.")
+        log(f"Bars: {len(bars)}/55 — warming up.")
         return
 
     signal, data = analyze(bars, client)
     if data:
-        print(
-            f"[{datetime.now(central):%H:%M:%S}] "
+        log(
             f"SPY {data['price']:.2f} | Signal {signal} | "
             f"VWAP {data['vwap']:.2f} | EMA20 {data['ema20']:.2f} | "
             f"EMA50 {data['ema50']:.2f}"
@@ -337,14 +348,16 @@ def main():
         f"✅ SPY Options Alert Bot (polling every {POLL_SECONDS}s) started. "
         "Minimum 1DTE. Alerts only."
     )
-    print(f"Polling every {POLL_SECONDS}s. Feed={FEED}.")
+    log(f"Polling every {POLL_SECONDS}s. Feed={FEED}.")
 
     while True:
         try:
             run_cycle(client)
         except Exception:
-            print("Cycle error:")
+            log("Cycle error:")
             traceback.print_exc()
+            sys.stdout.flush()
+        log(f"Sleeping {POLL_SECONDS}s...")
         time.sleep(POLL_SECONDS)
 
 
