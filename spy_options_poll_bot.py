@@ -55,6 +55,14 @@ SCORE_SIGNAL = int(os.getenv("SCORE_SIGNAL", "65"))   # CALL/PUT alert
 SCORE_WATCH  = int(os.getenv("SCORE_WATCH",  "50"))   # WATCHLIST heads-up
 SCORE_DOMINANCE = int(os.getenv("SCORE_DOMINANCE", "20"))  # bull must lead bear by this much (and vice versa)
 
+# Trend-ignition filter: only fire when the score is *starting* to rise into the threshold.
+# CALL example: 5 minutes ago BULL was below IGNITION_PRIOR_MAX, now it has gained at least IGNITION_MIN_DELTA.
+# Set IGNITION_REQUIRED=0 in env to disable and revert to absolute-score-only firing.
+IGNITION_REQUIRED   = os.getenv("IGNITION_REQUIRED", "1") == "1"
+IGNITION_MIN_DELTA  = int(os.getenv("IGNITION_MIN_DELTA",  "20"))  # BULL/BEAR must have risen at least this much in 5 min
+IGNITION_PRIOR_MAX  = int(os.getenv("IGNITION_PRIOR_MAX",  "65"))  # 5 min ago BULL/BEAR must have been below this
+IGNITION_LOOKBACK_S = int(os.getenv("IGNITION_LOOKBACK_S", "300"))  # how far back to compare (default 5 min)
+
 # Score-trend history (one reading per cycle).
 # At POLL_SECONDS=30s, capacity 24 = 12 minutes of history.
 _SCORE_HISTORY_CAP = 24
@@ -257,8 +265,8 @@ def analyze(df, client):
                 return b, s
         return (None, None)
 
-    bull_5m, bear_5m = history_at(300)
-    bull_10m, bear_10m = history_at(600)
+    bull_5m, bear_5m = history_at(IGNITION_LOOKBACK_S)
+    bull_10m, bear_10m = history_at(IGNITION_LOOKBACK_S * 2)
 
     print(f"BULL score: {bull_score:3d} | BEAR score: {bear_score:3d}", flush=True)
     if bull_5m is not None:
@@ -431,6 +439,43 @@ def run_cycle(client):
     if side in _alerted_today["keys"]:
         log(f"Already alerted {side} today \u2014 suppressed.")
         return
+
+    # Trend-ignition filter: only fire when the move is *just starting*, not mid- or late-trend.
+    # For CALL: 5 min ago BULL was relatively low, and BULL has surged by at least IGNITION_MIN_DELTA.
+    # For PUT : same logic on BEAR.
+    if IGNITION_REQUIRED:
+        if side == "CALL":
+            now_score = data["bull_score"]
+            past_score = data["bull_5m"]
+        else:
+            now_score = data["bear_score"]
+            past_score = data["bear_5m"]
+
+        if past_score is None:
+            log(
+                f"Ignition gate: insufficient history (need {IGNITION_LOOKBACK_S}s) \u2014 "
+                "holding alert until trend can be measured."
+            )
+            return
+
+        delta = now_score - past_score
+        if past_score >= IGNITION_PRIOR_MAX:
+            log(
+                f"Ignition gate: {side} 5m ago was already {past_score} "
+                f"(>= {IGNITION_PRIOR_MAX}) \u2014 mid/late trend, no alert."
+            )
+            return
+        if delta < IGNITION_MIN_DELTA:
+            log(
+                f"Ignition gate: {side} delta only +{delta} (need +{IGNITION_MIN_DELTA}) "
+                f"\u2014 trend not igniting, no alert."
+            )
+            return
+
+        log(
+            f"\U0001f680 Ignition confirmed: {side} score {past_score} \u2192 {now_score} "
+            f"(\u0394 +{delta}) over last {IGNITION_LOOKBACK_S}s."
+        )
 
     option = get_option_contract(side, data["price"])
     if not option:
