@@ -35,6 +35,7 @@ FEED = os.getenv("ALPACA_FEED", "iex").lower()
 SYMBOL = "SPY"
 BAR_MINUTES = 5
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))  # 2 minutes
+RUN_ONCE = os.getenv("RUN_ONCE", "0") == "1"  # for cron / one-shot environments
 LOOKBACK_BARS = 120
 MIN_DTE = 1
 MAX_DTE = 7
@@ -43,6 +44,7 @@ REQUIRE_VWAP_DIRECTION = True
 
 central = pytz.timezone("America/Chicago")
 last_alert_contract = None
+_pdh_pdl_cache = {"date": None, "pdh": None, "pdl": None}
 
 
 # ---------------------------------------------------------------------------
@@ -67,20 +69,43 @@ def market_open_now():
     return start <= now <= end
 
 
-def get_previous_day_levels():
-    daily = yf.download(
-        SYMBOL,
-        period="10d",
-        interval="1d",
-        progress=False,
-        auto_adjust=True,
-    ).dropna()
+def get_previous_day_levels(client):
+    """Return previous trading day's high/low using Alpaca daily bars.
 
+    Cached per session date so we only hit the API once per day, avoiding
+    yfinance rate limits that affect cron environments.
+    """
+    today = datetime.now(central).date()
+    if _pdh_pdl_cache["date"] == today and _pdh_pdl_cache["pdh"] is not None:
+        return _pdh_pdl_cache["pdh"], _pdh_pdl_cache["pdl"]
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=14)  # buffer for weekends/holidays
+
+    req = StockBarsRequest(
+        symbol_or_symbols=SYMBOL,
+        timeframe=TimeFrame(1, TimeFrameUnit.Day),
+        start=start,
+        end=end,
+        feed=DataFeed(FEED),
+    )
+    daily = client.get_stock_bars(req).df
+    if daily is None or daily.empty:
+        raise Exception("Not enough daily data from Alpaca.")
+
+    if isinstance(daily.index, pd.MultiIndex):
+        daily = daily.xs(SYMBOL, level=0)
+
+    daily = daily.dropna()
     if len(daily) < 2:
-        raise Exception("Not enough daily data.")
+        raise Exception("Not enough daily data from Alpaca.")
 
-    pdh = float(daily["High"].iloc[-2])
-    pdl = float(daily["Low"].iloc[-2])
+    pdh = float(daily["high"].iloc[-2])
+    pdl = float(daily["low"].iloc[-2])
+
+    _pdh_pdl_cache["date"] = today
+    _pdh_pdl_cache["pdh"] = pdh
+    _pdh_pdl_cache["pdl"] = pdl
     return pdh, pdl
 
 
@@ -95,11 +120,11 @@ def calculate_indicators(df):
     return df
 
 
-def analyze(df):
+def analyze(df, client):
     if len(df) < 55:
         return "NO TRADE", None
 
-    pdh, pdl = get_previous_day_levels()
+    pdh, pdl = get_previous_day_levels(client)
     df = calculate_indicators(df)
 
     latest = df.iloc[-1]
@@ -163,12 +188,15 @@ def get_valid_expiry(ticker):
 
 
 def get_option_contract(signal, spy_price):
-    ticker = yf.Ticker(SYMBOL)
-    expiry, dte = get_valid_expiry(ticker)
-    if not expiry:
+    try:
+        ticker = yf.Ticker(SYMBOL)
+        expiry, dte = get_valid_expiry(ticker)
+        if not expiry:
+            return None
+        chain = ticker.option_chain(expiry)
+    except Exception as e:
+        print(f"Option chain fetch failed: {e}")
         return None
-
-    chain = ticker.option_chain(expiry)
     if signal == "CALL":
         options = chain.calls.copy()
         options = options[options["strike"] >= spy_price]
@@ -241,7 +269,7 @@ def run_cycle(client):
         print(f"[{datetime.now(central):%H:%M:%S}] Bars: {len(bars)}/55 — warming up.")
         return
 
-    signal, data = analyze(bars)
+    signal, data = analyze(bars, client)
     if data:
         print(
             f"[{datetime.now(central):%H:%M:%S}] "
@@ -305,6 +333,15 @@ def main():
         raise Exception("Missing Alpaca API keys in .env")
 
     client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+    if RUN_ONCE:
+        print(f"RUN_ONCE mode. Feed={FEED}.")
+        try:
+            run_cycle(client)
+        except Exception:
+            print("Cycle error:")
+            traceback.print_exc()
+        return
 
     send_discord(
         f"✅ SPY Options Alert Bot (polling every {POLL_SECONDS}s) started. "
