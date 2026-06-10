@@ -374,6 +374,12 @@ def run_cycle(client):
     if side == "NO TRADE":
         return
 
+    # Only send Discord alerts for the perfect setup (STRONG tier, score >= SCORE_STRONG).
+    # Lower tiers (CALL/PUT/WATCHLIST) are logged but not posted.
+    if data["tier"] != "STRONG":
+        log(f"{data['signal']} (score {data['score']}) — below STRONG threshold, no Discord alert.")
+        return
+
     option = get_option_contract(side, data["price"])
     if not option:
         send_discord(f"⚠️ {data['signal']} setup detected, but no valid 1DTE+ option found.")
