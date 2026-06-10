@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import traceback
+from collections import deque
 from datetime import datetime, date, timedelta, timezone
 
 import pandas as pd
@@ -52,10 +53,16 @@ VOLUME_MULTIPLIER = 1.5
 SCORE_STRONG = int(os.getenv("SCORE_STRONG", "80"))   # STRONG CALL/PUT alert
 SCORE_SIGNAL = int(os.getenv("SCORE_SIGNAL", "65"))   # CALL/PUT alert
 SCORE_WATCH  = int(os.getenv("SCORE_WATCH",  "50"))   # WATCHLIST heads-up
+SCORE_DOMINANCE = int(os.getenv("SCORE_DOMINANCE", "20"))  # bull must lead bear by this much (and vice versa)
+
+# Score-trend history (one reading per cycle).
+# At POLL_SECONDS=30s, capacity 24 = 12 minutes of history.
+_SCORE_HISTORY_CAP = 24
+score_history: "deque[tuple[datetime, int, int]]" = deque(maxlen=_SCORE_HISTORY_CAP)
 
 central = pytz.timezone("America/Chicago")
-# Track contracts already alerted today so we never duplicate.
-# Keyed on (side, contract); reset automatically when the trading date changes.
+# Track which side already alerted today so we never duplicate.
+# Reset automatically when the trading date changes.
 _alerted_today = {"date": None, "keys": set()}
 _pdh_pdl_cache = {"date": None, "pdh": None, "pdl": None}
 
@@ -134,6 +141,17 @@ def calculate_indicators(df):
 
 
 def analyze(df, client):
+    """Compute independent Bull and Bear scores (0-100) from the latest bars.
+
+    Components (each side, max 100):
+      Price vs VWAP   : 20
+      Price vs EMA20  : 15
+      Price vs EMA50  : 15
+      EMA20 slope     : 10
+      Volume + candle : 15  (only if volume > 1.5x avg AND candle agrees)
+      Higher high / lower low : 15
+      VWAP direction  : 10
+    """
     if len(df) < 55:
         return "NO TRADE", None
 
@@ -144,6 +162,7 @@ def analyze(df, client):
     previous = df.iloc[-2]
 
     price = float(latest["close"])
+    open_ = float(latest["open"])
     vwap = float(latest["VWAP"])
     ema20 = float(latest["EMA20"])
     ema50 = float(latest["EMA50"])
@@ -153,81 +172,113 @@ def analyze(df, client):
     if pd.isna(vol_avg):
         return "NO TRADE", None
 
-    bullish = price > vwap and price > ema20 and ema20 > ema50
-    bearish = price < vwap and price < ema20 and ema20 < ema50
+    # EMA20 slope: compare current EMA20 to EMA20 a few bars back.
+    ema20_back = float(df["EMA20"].iloc[-5]) if len(df) >= 5 else float(df["EMA20"].iloc[0])
+    ema20_rising = ema20 > ema20_back
+    ema20_falling = ema20 < ema20_back
+
     strong_volume = volume > vol_avg * VOLUME_MULTIPLIER
+    bullish_candle = price > open_
+    bearish_candle = price < open_
 
-    vwap_distance_now = float(latest["close"] - latest["VWAP"])
-    vwap_distance_prev = float(previous["close"] - previous["VWAP"])
-
+    vwap_distance_now = price - vwap
+    vwap_distance_prev = float(previous["close"]) - float(previous["VWAP"])
     moving_away_bullish = vwap_distance_now > vwap_distance_prev
     moving_away_bearish = vwap_distance_now < vwap_distance_prev
 
-    # Intraday recent high/low (exclude the current bar so a break is meaningful)
+    # Intraday recent high/low (exclude current bar so a break is meaningful).
     recent_window = df.iloc[-(RECENT_HIGH_LOOKBACK + 1):-1]
     recent_high = float(recent_window["high"].max()) if len(recent_window) else price
     recent_low = float(recent_window["low"].min()) if len(recent_window) else price
 
-    above_pdh = price > pdh
-    below_pdl = price < pdl
-    above_recent_high = price > recent_high
-    below_recent_low = price < recent_low
-
-    # ---- Score (CALL side) ----
-    call_score = 0
-    if bullish:
-        call_score += 30
-    if strong_volume:
-        call_score += 20
+    # ---------------- Bull score ----------------
+    bull_breakdown = {}
+    bull_score = 0
+    if price > vwap:
+        bull_score += 20; bull_breakdown["Price > VWAP"] = 20
+    if price > ema20:
+        bull_score += 15; bull_breakdown["Price > EMA20"] = 15
+    if price > ema50:
+        bull_score += 15; bull_breakdown["Price > EMA50"] = 15
+    if ema20_rising:
+        bull_score += 10; bull_breakdown["EMA20 rising"] = 10
+    if strong_volume and bullish_candle:
+        bull_score += 15; bull_breakdown["Strong volume + bull candle"] = 15
+    if price > recent_high:
+        bull_score += 15; bull_breakdown["Higher high"] = 15
     if moving_away_bullish:
-        call_score += 20
-    if above_pdh:
-        call_score += 15
-    if above_recent_high:
-        call_score += 15
+        bull_score += 10; bull_breakdown["VWAP direction bullish"] = 10
 
-    # ---- Score (PUT side) ----
-    put_score = 0
-    if bearish:
-        put_score += 30
-    if strong_volume:
-        put_score += 20
+    # ---------------- Bear score ----------------
+    bear_breakdown = {}
+    bear_score = 0
+    if price < vwap:
+        bear_score += 20; bear_breakdown["Price < VWAP"] = 20
+    if price < ema20:
+        bear_score += 15; bear_breakdown["Price < EMA20"] = 15
+    if price < ema50:
+        bear_score += 15; bear_breakdown["Price < EMA50"] = 15
+    if ema20_falling:
+        bear_score += 10; bear_breakdown["EMA20 falling"] = 10
+    if strong_volume and bearish_candle:
+        bear_score += 15; bear_breakdown["Strong volume + bear candle"] = 15
+    if price < recent_low:
+        bear_score += 15; bear_breakdown["Lower low"] = 15
     if moving_away_bearish:
-        put_score += 20
-    if below_pdl:
-        put_score += 15
-    if below_recent_low:
-        put_score += 15
+        bear_score += 10; bear_breakdown["VWAP direction bearish"] = 10
 
-    print("Bullish:", bullish, flush=True)
-    print("Strong Volume:", strong_volume, flush=True)
-    print("Above PDH:", above_pdh, flush=True)
-    print("Above Recent High:", above_recent_high, flush=True)
-    print("VWAP Direction (bull):", moving_away_bullish, flush=True)
-    print(f"CALL score: {call_score} | PUT score: {put_score}", flush=True)
+    # ---------------- Decision ----------------
+    # The dominant side must lead by SCORE_DOMINANCE points; otherwise NO TRADE.
+    diff = bull_score - bear_score
 
-    if call_score >= put_score and call_score >= SCORE_WATCH:
-        side = "CALL"
-        score = call_score
-    elif put_score > call_score and put_score >= SCORE_WATCH:
-        side = "PUT"
-        score = put_score
+    if bull_score >= SCORE_STRONG and diff >= SCORE_DOMINANCE:
+        side, score, tier, signal = "CALL", bull_score, "STRONG", "STRONG CALL"
+    elif bear_score >= SCORE_STRONG and -diff >= SCORE_DOMINANCE:
+        side, score, tier, signal = "PUT", bear_score, "STRONG", "STRONG PUT"
+    elif bull_score >= SCORE_SIGNAL and diff >= SCORE_DOMINANCE:
+        side, score, tier, signal = "CALL", bull_score, "SIGNAL", "CALL"
+    elif bear_score >= SCORE_SIGNAL and -diff >= SCORE_DOMINANCE:
+        side, score, tier, signal = "PUT", bear_score, "SIGNAL", "PUT"
+    elif bull_score >= SCORE_WATCH and bull_score > bear_score:
+        side, score, tier, signal = "CALL", bull_score, "WATCH", "WATCHLIST"
+    elif bear_score >= SCORE_WATCH and bear_score > bull_score:
+        side, score, tier, signal = "PUT", bear_score, "WATCH", "WATCHLIST"
     else:
-        side = "NO TRADE"
-        score = max(call_score, put_score)
+        side, score, tier, signal = "NO TRADE", max(bull_score, bear_score), "NONE", "NO TRADE"
 
-    if side == "NO TRADE":
-        tier = "NONE"
-        signal = "NO TRADE"
-    elif score >= SCORE_STRONG:
-        tier = "STRONG"
-        signal = f"STRONG {side}"
-    elif score >= SCORE_SIGNAL:
-        tier = "SIGNAL"
-        signal = side
-    else:  # >= SCORE_WATCH
-        tier = "WATCH"
-        signal = "WATCHLIST"
+    # ---------------- Trend ----------------
+    score_history.append((datetime.now(central), bull_score, bear_score))
+
+    def history_at(seconds_ago):
+        """Return (bull, bear) closest to N seconds ago, or (None, None)."""
+        target = datetime.now(central) - timedelta(seconds=seconds_ago)
+        for ts, b, s in reversed(score_history):
+            if ts <= target:
+                return b, s
+        return (None, None)
+
+    bull_5m, bear_5m = history_at(300)
+    bull_10m, bear_10m = history_at(600)
+
+    print(f"BULL score: {bull_score:3d} | BEAR score: {bear_score:3d}", flush=True)
+    if bull_5m is not None:
+        print(f"  5m ago : BULL {bull_5m:3d} | BEAR {bear_5m:3d}  (Δ BULL {bull_score - bull_5m:+d})", flush=True)
+    if bull_10m is not None:
+        print(f" 10m ago : BULL {bull_10m:3d} | BEAR {bear_10m:3d}  (Δ BULL {bull_score - bull_10m:+d})", flush=True)
+    print(f"  Bull components: {bull_breakdown}", flush=True)
+    print(f"  Bear components: {bear_breakdown}", flush=True)
+
+    # Sentiment summary line for the human glance.
+    if diff >= 30:
+        sentiment = "BULL DOMINANT"
+    elif diff <= -30:
+        sentiment = "BEAR DOMINANT"
+    elif abs(diff) <= 10:
+        sentiment = "BALANCED"
+    elif diff > 0:
+        sentiment = "Bull lean"
+    else:
+        sentiment = "Bear lean"
 
     data = {
         "price": price,
@@ -242,22 +293,17 @@ def analyze(df, client):
         "recent_low": recent_low,
         "vwap_distance_now": vwap_distance_now,
         "vwap_distance_prev": vwap_distance_prev,
-        "call_score": call_score,
-        "put_score": put_score,
+        "bull_score": bull_score,
+        "bear_score": bear_score,
+        "bull_breakdown": bull_breakdown,
+        "bear_breakdown": bear_breakdown,
+        "bull_5m": bull_5m, "bear_5m": bear_5m,
+        "bull_10m": bull_10m, "bear_10m": bear_10m,
         "score": score,
         "tier": tier,
         "side": side,
         "signal": signal,
-        "checks": {
-            "bullish": bullish,
-            "bearish": bearish,
-            "strong_volume": strong_volume,
-            "vwap_direction": moving_away_bullish if side == "CALL" else moving_away_bearish,
-            "above_pdh": above_pdh,
-            "below_pdl": below_pdl,
-            "above_recent_high": above_recent_high,
-            "below_recent_low": below_recent_low,
-        },
+        "sentiment": sentiment,
     }
 
     return side, data
@@ -365,102 +411,83 @@ def run_cycle(client):
 
     side, data = analyze(bars, client)
     if data:
+        trend_5m = f" | 5m\u0394 BULL {data['bull_score'] - data['bull_5m']:+d}" if data['bull_5m'] is not None else ""
         log(
-            f"SPY {data['price']:.2f} | {data['signal']} ({data['score']}) | "
-            f"VWAP {data['vwap']:.2f} | EMA20 {data['ema20']:.2f} | "
-            f"EMA50 {data['ema50']:.2f} | RecentHigh {data['recent_high']:.2f}"
+            f"SPY {data['price']:.2f} | {data['signal']} | "
+            f"BULL {data['bull_score']} BEAR {data['bear_score']} ({data['sentiment']}){trend_5m}"
         )
 
     if side == "NO TRADE":
         return
 
-    # Only send Discord alerts for the perfect setup (STRONG tier, score >= SCORE_STRONG).
-    # Lower tiers (CALL/PUT/WATCHLIST) are logged but not posted.
+    # Only send Discord alerts for the perfect setup (STRONG tier).
+    # SIGNAL/WATCHLIST tiers are logged but not posted.
     if data["tier"] != "STRONG":
-        log(f"{data['signal']} (score {data['score']}) — below STRONG threshold, no Discord alert.")
+        log(f"{data['signal']} (BULL {data['bull_score']} / BEAR {data['bear_score']}) "
+            f"\u2014 below STRONG threshold, no Discord alert.")
         return
 
-    # Dedupe by side per day: one STRONG CALL alert and one STRONG PUT alert max per day.
-    # SPY's nearest strike shifts as price drifts, so a per-contract key would re-fire too often.
+    # One STRONG CALL alert and one STRONG PUT alert max per trading day.
     if side in _alerted_today["keys"]:
-        log(f"Already alerted {side} today — suppressed.")
+        log(f"Already alerted {side} today \u2014 suppressed.")
         return
 
     option = get_option_contract(side, data["price"])
     if not option:
-        # Only log; don't spam Discord with this every cycle.
         log(f"{data['signal']} setup detected, but no valid 1DTE+ option found.")
         return
 
-    tier = data["tier"]
-    if tier == "STRONG":
-        emoji = "🟢" if side == "CALL" else "🔴"
-        header = f"{emoji} **SPY {data['signal']} SETUP** (score {data['score']}/100)"
-        footer = "Strong setup — all major confirmations aligned."
-    elif tier == "SIGNAL":
-        emoji = "🟢" if side == "CALL" else "🔴"
-        header = f"{emoji} **SPY {data['signal']} SETUP** (score {data['score']}/100)"
-        footer = "Confirmed setup — trend + one breakout confirmation."
-    else:  # WATCH
-        emoji = "🟡"
-        header = f"{emoji} **SPY {side} WATCHLIST** (score {data['score']}/100)"
-        footer = "Watchlist — wait for volume / breakout confirmation before entering."
+    emoji = "\U0001f7e2" if side == "CALL" else "\U0001f534"
+    header = f"\U0001f6a8 {emoji} **SPY {data['signal']}**"
 
-    checks = data["checks"]
-    if side == "CALL":
-        checklist = (
-            f"Bullish trend: `{checks['bullish']}`\n"
-            f"Strong volume: `{checks['strong_volume']}`\n"
-            f"VWAP direction: `{checks['vwap_direction']}`\n"
-            f"Above PDH: `{checks['above_pdh']}`\n"
-            f"Above recent high: `{checks['above_recent_high']}`"
+    breakdown = data["bull_breakdown"] if side == "CALL" else data["bear_breakdown"]
+    checklist = "\n".join(f"\u2705 {k} (+{v})" for k, v in breakdown.items()) or "(no positive components)"
+
+    # Trend lines
+    trend_lines = []
+    if data["bull_5m"] is not None:
+        trend_lines.append(
+            f"5m ago : BULL `{data['bull_5m']}` / BEAR `{data['bear_5m']}` "
+            f"(\u0394 BULL {data['bull_score'] - data['bull_5m']:+d})"
         )
-    else:
-        checklist = (
-            f"Bearish trend: `{checks['bearish']}`\n"
-            f"Strong volume: `{checks['strong_volume']}`\n"
-            f"VWAP direction: `{checks['vwap_direction']}`\n"
-            f"Below PDL: `{checks['below_pdl']}`\n"
-            f"Below recent low: `{checks['below_recent_low']}`"
+    if data["bull_10m"] is not None:
+        trend_lines.append(
+            f"10m ago: BULL `{data['bull_10m']}` / BEAR `{data['bear_10m']}` "
+            f"(\u0394 BULL {data['bull_score'] - data['bull_10m']:+d})"
         )
+    trend_block = "\n".join(trend_lines) if trend_lines else "(insufficient history)"
 
     message = f"""
 {header}
 
+**SPY:** `{data['price']:.2f}`
+**Bull Score:** `{data['bull_score']}/100`   |   **Bear Score:** `{data['bear_score']}/100`
+**Sentiment:** `{data['sentiment']}`
+
 **Suggested Option**
 Contract: `{option['contract']}`
-Expiry: `{option['expiry']}`
-DTE: `{option['dte']}`
+Expiry: `{option['expiry']}` (DTE {option['dte']})
 Strike: `{option['strike']}`
-Bid: `{option['bid']}`
-Ask: `{option['ask']}`
-Last: `{option['last']}`
-Volume: `{option['volume']}`
-Open Interest: `{option['open_interest']}`
+Bid/Ask/Last: `{option['bid']}` / `{option['ask']}` / `{option['last']}`
+Volume / OI: `{option['volume']}` / `{option['open_interest']}`
 
-**Score Breakdown**
+**Score Components**
 {checklist}
 
-**SPY Levels**
-Price: `{data['price']:.2f}`
-VWAP: `{data['vwap']:.2f}`
-EMA20: `{data['ema20']:.2f}`
-EMA50: `{data['ema50']:.2f}`
+**Score Trend**
+{trend_block}
+
+**Levels**
+VWAP: `{data['vwap']:.2f}` | EMA20: `{data['ema20']:.2f}` | EMA50: `{data['ema50']:.2f}`
 PDH: `{data['pdh']:.2f}` | PDL: `{data['pdl']:.2f}`
 Recent High: `{data['recent_high']:.2f}` | Recent Low: `{data['recent_low']:.2f}`
-Current Volume: `{int(data['volume'])}` | Avg Volume: `{int(data['vol_avg'])}`
+Volume: `{int(data['volume'])}` | Avg: `{int(data['vol_avg'])}`
 
-**VWAP Direction**
-Now: `{data['vwap_distance_now']:.2f}` | Previous: `{data['vwap_distance_prev']:.2f}`
-
-**Rule**
-Minimum 1DTE. Near-the-money only.
-{footer}
-Alert only — verify chart before taking play.
+Alert only \u2014 verify chart before taking play.
 """
     send_discord(message)
     _alerted_today["keys"].add(side)
-    log(f"Alert sent: {data['signal']} {option['contract']} (score {data['score']})")
+    log(f"Alert sent: {data['signal']} {option['contract']} (BULL {data['bull_score']} / BEAR {data['bear_score']})")
 
 
 def main():
