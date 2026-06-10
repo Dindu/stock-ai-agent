@@ -1,9 +1,10 @@
 """
-SPY Options Alerts Bot — polling version.
+Index ETF Options Alerts Bot — polling version (SPY / QQQ / IWM by default).
 
-Pulls SPY 5-minute bars from Alpaca REST every POLL_SECONDS, runs the same
-VWAP / EMA20 / EMA50 / volume / PDH / PDL + VWAP-direction logic, and posts
-a Discord alert with a near-the-money 1DTE+ option contract from yfinance.
+Pulls 5-minute bars from Alpaca REST every POLL_SECONDS for each configured
+symbol, runs a Bull/Bear market scorecard, applies a trend-ignition filter,
+and posts a Discord alert with a near-the-money 1DTE+ option contract from
+yfinance when the score ignites into STRONG territory.
 
 No WebSocket -> no Alpaca connection-limit issues.
 """
@@ -40,9 +41,10 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK")
 FEED = os.getenv("ALPACA_FEED", "iex").lower()
 
-SYMBOL = "SPY"
+# Symbols to scan, in order. Override via env: SYMBOLS="SPY,QQQ,IWM"
+SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "SPY,QQQ,IWM").split(",") if s.strip()]
 BAR_MINUTES = 5
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for SPY options
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index options
 LOOKBACK_BARS = 120
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
 MIN_DTE = 1
@@ -63,16 +65,19 @@ IGNITION_MIN_DELTA  = int(os.getenv("IGNITION_MIN_DELTA",  "20"))  # BULL/BEAR m
 IGNITION_PRIOR_MAX  = int(os.getenv("IGNITION_PRIOR_MAX",  "65"))  # 5 min ago BULL/BEAR must have been below this
 IGNITION_LOOKBACK_S = int(os.getenv("IGNITION_LOOKBACK_S", "300"))  # how far back to compare (default 5 min)
 
-# Score-trend history (one reading per cycle).
+# Per-symbol score-trend history (one reading per cycle).
 # At POLL_SECONDS=30s, capacity 24 = 12 minutes of history.
 _SCORE_HISTORY_CAP = 24
-score_history: "deque[tuple[datetime, int, int]]" = deque(maxlen=_SCORE_HISTORY_CAP)
+score_history: "dict[str, deque[tuple[datetime, int, int]]]" = {
+    sym: deque(maxlen=_SCORE_HISTORY_CAP) for sym in SYMBOLS
+}
 
 central = pytz.timezone("America/Chicago")
-# Track which side already alerted today so we never duplicate.
+# Track which (symbol, side) pairs already alerted today so we never duplicate.
 # Reset automatically when the trading date changes.
 _alerted_today = {"date": None, "keys": set()}
-_pdh_pdl_cache = {"date": None, "pdh": None, "pdl": None}
+# Per-symbol prev-day high/low cache.
+_pdh_pdl_cache: "dict[str, dict]" = {sym: {"date": None, "pdh": None, "pdl": None} for sym in SYMBOLS}
 
 
 # ---------------------------------------------------------------------------
@@ -97,21 +102,21 @@ def market_open_now():
     return start <= now <= end
 
 
-def get_previous_day_levels(client):
-    """Return previous trading day's high/low using Alpaca daily bars.
+def get_previous_day_levels(client, symbol):
+    """Return previous trading day's high/low for ``symbol`` using Alpaca daily bars.
 
-    Cached per session date so we only hit the API once per day, avoiding
-    yfinance rate limits that affect cron environments.
+    Cached per session date (per symbol) so we only hit the API once per day.
     """
     today = datetime.now(central).date()
-    if _pdh_pdl_cache["date"] == today and _pdh_pdl_cache["pdh"] is not None:
-        return _pdh_pdl_cache["pdh"], _pdh_pdl_cache["pdl"]
+    cache = _pdh_pdl_cache.setdefault(symbol, {"date": None, "pdh": None, "pdl": None})
+    if cache["date"] == today and cache["pdh"] is not None:
+        return cache["pdh"], cache["pdl"]
 
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=14)  # buffer for weekends/holidays
 
     req = StockBarsRequest(
-        symbol_or_symbols=SYMBOL,
+        symbol_or_symbols=symbol,
         timeframe=TimeFrame(1, TimeFrameUnit.Day),
         start=start,
         end=end,
@@ -119,21 +124,21 @@ def get_previous_day_levels(client):
     )
     daily = client.get_stock_bars(req).df
     if daily is None or daily.empty:
-        raise Exception("Not enough daily data from Alpaca.")
+        raise Exception(f"Not enough daily data from Alpaca for {symbol}.")
 
     if isinstance(daily.index, pd.MultiIndex):
-        daily = daily.xs(SYMBOL, level=0)
+        daily = daily.xs(symbol, level=0)
 
     daily = daily.dropna()
     if len(daily) < 2:
-        raise Exception("Not enough daily data from Alpaca.")
+        raise Exception(f"Not enough daily data from Alpaca for {symbol}.")
 
     pdh = float(daily["high"].iloc[-2])
     pdl = float(daily["low"].iloc[-2])
 
-    _pdh_pdl_cache["date"] = today
-    _pdh_pdl_cache["pdh"] = pdh
-    _pdh_pdl_cache["pdl"] = pdl
+    cache["date"] = today
+    cache["pdh"] = pdh
+    cache["pdl"] = pdl
     return pdh, pdl
 
 
@@ -148,7 +153,7 @@ def calculate_indicators(df):
     return df
 
 
-def analyze(df, client):
+def analyze(df, client, symbol):
     """Compute independent Bull and Bear scores (0-100) from the latest bars.
 
     Components (each side, max 100):
@@ -163,7 +168,7 @@ def analyze(df, client):
     if len(df) < 55:
         return "NO TRADE", None
 
-    pdh, pdl = get_previous_day_levels(client)
+    pdh, pdl = get_previous_day_levels(client, symbol)
     df = calculate_indicators(df)
 
     latest = df.iloc[-1]
@@ -255,12 +260,13 @@ def analyze(df, client):
         side, score, tier, signal = "NO TRADE", max(bull_score, bear_score), "NONE", "NO TRADE"
 
     # ---------------- Trend ----------------
-    score_history.append((datetime.now(central), bull_score, bear_score))
+    history = score_history.setdefault(symbol, deque(maxlen=_SCORE_HISTORY_CAP))
+    history.append((datetime.now(central), bull_score, bear_score))
 
     def history_at(seconds_ago):
         """Return (bull, bear) closest to N seconds ago, or (None, None)."""
         target = datetime.now(central) - timedelta(seconds=seconds_ago)
-        for ts, b, s in reversed(score_history):
+        for ts, b, s in reversed(history):
             if ts <= target:
                 return b, s
         return (None, None)
@@ -268,13 +274,13 @@ def analyze(df, client):
     bull_5m, bear_5m = history_at(IGNITION_LOOKBACK_S)
     bull_10m, bear_10m = history_at(IGNITION_LOOKBACK_S * 2)
 
-    print(f"BULL score: {bull_score:3d} | BEAR score: {bear_score:3d}", flush=True)
+    print(f"[{symbol}] BULL score: {bull_score:3d} | BEAR score: {bear_score:3d}", flush=True)
     if bull_5m is not None:
-        print(f"  5m ago : BULL {bull_5m:3d} | BEAR {bear_5m:3d}  (Δ BULL {bull_score - bull_5m:+d})", flush=True)
+        print(f"[{symbol}]   5m ago : BULL {bull_5m:3d} | BEAR {bear_5m:3d}  (Δ BULL {bull_score - bull_5m:+d})", flush=True)
     if bull_10m is not None:
-        print(f" 10m ago : BULL {bull_10m:3d} | BEAR {bear_10m:3d}  (Δ BULL {bull_score - bull_10m:+d})", flush=True)
-    print(f"  Bull components: {bull_breakdown}", flush=True)
-    print(f"  Bear components: {bear_breakdown}", flush=True)
+        print(f"[{symbol}]  10m ago : BULL {bull_10m:3d} | BEAR {bear_10m:3d}  (Δ BULL {bull_score - bull_10m:+d})", flush=True)
+    print(f"[{symbol}]   Bull components: {bull_breakdown}", flush=True)
+    print(f"[{symbol}]   Bear components: {bear_breakdown}", flush=True)
 
     # Sentiment summary line for the human glance.
     if diff >= 30:
@@ -326,29 +332,29 @@ def get_valid_expiry(ticker):
     return None, None
 
 
-def get_option_contract(signal, spy_price):
+def get_option_contract(symbol, signal, underlying_price):
     try:
-        ticker = yf.Ticker(SYMBOL)
+        ticker = yf.Ticker(symbol)
         expiry, dte = get_valid_expiry(ticker)
         if not expiry:
             return None
         chain = ticker.option_chain(expiry)
     except Exception as e:
-        print(f"Option chain fetch failed: {e}")
+        print(f"[{symbol}] Option chain fetch failed: {e}")
         return None
     if signal == "CALL":
         options = chain.calls.copy()
-        options = options[options["strike"] >= spy_price]
+        options = options[options["strike"] >= underlying_price]
     elif signal == "PUT":
         options = chain.puts.copy()
-        options = options[options["strike"] <= spy_price]
+        options = options[options["strike"] <= underlying_price]
     else:
         return None
 
     if options.empty:
         return None
 
-    options["distance"] = abs(options["strike"] - spy_price)
+    options["distance"] = abs(options["strike"] - underlying_price)
     option = options.sort_values("distance").iloc[0]
 
     return {
@@ -367,14 +373,14 @@ def get_option_contract(signal, spy_price):
 # ---------------------------------------------------------------------------
 # Alpaca REST
 # ---------------------------------------------------------------------------
-def fetch_bars(client):
-    """Pull the most recent ~LOOKBACK_BARS 5-minute SPY bars from Alpaca."""
+def fetch_bars(client, symbol):
+    """Pull the most recent ~LOOKBACK_BARS 5-minute bars for ``symbol`` from Alpaca."""
     end = datetime.now(timezone.utc)
     # 2 days back is plenty of buffer for ~120 5-min bars + overnight gap.
     start = end - timedelta(days=2)
 
     req = StockBarsRequest(
-        symbol_or_symbols=SYMBOL,
+        symbol_or_symbols=symbol,
         timeframe=TimeFrame(BAR_MINUTES, TimeFrameUnit.Minute),
         start=start,
         end=end,
@@ -387,7 +393,7 @@ def fetch_bars(client):
 
     # When a single symbol is requested the result has a MultiIndex (symbol, ts).
     if isinstance(bars.index, pd.MultiIndex):
-        bars = bars.xs(SYMBOL, level=0)
+        bars = bars.xs(symbol, level=0)
 
     bars = bars[["open", "high", "low", "close", "volume"]].tail(LOOKBACK_BARS)
     return bars
@@ -411,17 +417,27 @@ def run_cycle(client):
         _alerted_today["date"] = today
         _alerted_today["keys"] = set()
 
-    bars = fetch_bars(client)
-    log(f"Fetched {len(bars)} bars.")
+    for symbol in SYMBOLS:
+        try:
+            run_symbol(client, symbol)
+        except Exception:
+            log(f"[{symbol}] Cycle error:")
+            traceback.print_exc()
+            sys.stdout.flush()
+
+
+def run_symbol(client, symbol):
+    bars = fetch_bars(client, symbol)
+    log(f"[{symbol}] Fetched {len(bars)} bars.")
     if len(bars) < 55:
-        log(f"Bars: {len(bars)}/55 — warming up.")
+        log(f"[{symbol}] Bars: {len(bars)}/55 — warming up.")
         return
 
-    side, data = analyze(bars, client)
+    side, data = analyze(bars, client, symbol)
     if data:
         trend_5m = f" | 5m\u0394 BULL {data['bull_score'] - data['bull_5m']:+d}" if data['bull_5m'] is not None else ""
         log(
-            f"SPY {data['price']:.2f} | {data['signal']} | "
+            f"[{symbol}] {data['price']:.2f} | {data['signal']} | "
             f"BULL {data['bull_score']} BEAR {data['bear_score']} ({data['sentiment']}){trend_5m}"
         )
 
@@ -431,18 +447,17 @@ def run_cycle(client):
     # Only send Discord alerts for the perfect setup (STRONG tier).
     # SIGNAL/WATCHLIST tiers are logged but not posted.
     if data["tier"] != "STRONG":
-        log(f"{data['signal']} (BULL {data['bull_score']} / BEAR {data['bear_score']}) "
+        log(f"[{symbol}] {data['signal']} (BULL {data['bull_score']} / BEAR {data['bear_score']}) "
             f"\u2014 below STRONG threshold, no Discord alert.")
         return
 
-    # One STRONG CALL alert and one STRONG PUT alert max per trading day.
-    if side in _alerted_today["keys"]:
-        log(f"Already alerted {side} today \u2014 suppressed.")
+    # One STRONG CALL alert and one STRONG PUT alert max per (symbol, side) per day.
+    alert_key = (symbol, side)
+    if alert_key in _alerted_today["keys"]:
+        log(f"[{symbol}] Already alerted {side} today \u2014 suppressed.")
         return
 
     # Trend-ignition filter: only fire when the move is *just starting*, not mid- or late-trend.
-    # For CALL: 5 min ago BULL was relatively low, and BULL has surged by at least IGNITION_MIN_DELTA.
-    # For PUT : same logic on BEAR.
     if IGNITION_REQUIRED:
         if side == "CALL":
             now_score = data["bull_score"]
@@ -453,7 +468,7 @@ def run_cycle(client):
 
         if past_score is None:
             log(
-                f"Ignition gate: insufficient history (need {IGNITION_LOOKBACK_S}s) \u2014 "
+                f"[{symbol}] Ignition gate: insufficient history (need {IGNITION_LOOKBACK_S}s) \u2014 "
                 "holding alert until trend can be measured."
             )
             return
@@ -461,29 +476,29 @@ def run_cycle(client):
         delta = now_score - past_score
         if past_score >= IGNITION_PRIOR_MAX:
             log(
-                f"Ignition gate: {side} 5m ago was already {past_score} "
+                f"[{symbol}] Ignition gate: {side} 5m ago was already {past_score} "
                 f"(>= {IGNITION_PRIOR_MAX}) \u2014 mid/late trend, no alert."
             )
             return
         if delta < IGNITION_MIN_DELTA:
             log(
-                f"Ignition gate: {side} delta only +{delta} (need +{IGNITION_MIN_DELTA}) "
+                f"[{symbol}] Ignition gate: {side} delta only +{delta} (need +{IGNITION_MIN_DELTA}) "
                 f"\u2014 trend not igniting, no alert."
             )
             return
 
         log(
-            f"\U0001f680 Ignition confirmed: {side} score {past_score} \u2192 {now_score} "
+            f"[{symbol}] \U0001f680 Ignition confirmed: {side} score {past_score} \u2192 {now_score} "
             f"(\u0394 +{delta}) over last {IGNITION_LOOKBACK_S}s."
         )
 
-    option = get_option_contract(side, data["price"])
+    option = get_option_contract(symbol, side, data["price"])
     if not option:
-        log(f"{data['signal']} setup detected, but no valid 1DTE+ option found.")
+        log(f"[{symbol}] {data['signal']} setup detected, but no valid 1DTE+ option found.")
         return
 
     emoji = "\U0001f7e2" if side == "CALL" else "\U0001f534"
-    header = f"\U0001f6a8 {emoji} **SPY {data['signal']}**"
+    header = f"\U0001f6a8 {emoji} **{symbol} {data['signal']}**"
 
     breakdown = data["bull_breakdown"] if side == "CALL" else data["bear_breakdown"]
     checklist = "\n".join(f"\u2705 {k} (+{v})" for k, v in breakdown.items()) or "(no positive components)"
@@ -505,7 +520,7 @@ def run_cycle(client):
     message = f"""
 {header}
 
-**SPY:** `{data['price']:.2f}`
+**{symbol}:** `{data['price']:.2f}`
 **Bull Score:** `{data['bull_score']}/100`   |   **Bear Score:** `{data['bear_score']}/100`
 **Sentiment:** `{data['sentiment']}`
 
@@ -531,8 +546,8 @@ Volume: `{int(data['volume'])}` | Avg: `{int(data['vol_avg'])}`
 Alert only \u2014 verify chart before taking play.
 """
     send_discord(message)
-    _alerted_today["keys"].add(side)
-    log(f"Alert sent: {data['signal']} {option['contract']} (BULL {data['bull_score']} / BEAR {data['bear_score']})")
+    _alerted_today["keys"].add(alert_key)
+    log(f"[{symbol}] Alert sent: {data['signal']} {option['contract']} (BULL {data['bull_score']} / BEAR {data['bear_score']})")
 
 
 def main():
@@ -541,7 +556,8 @@ def main():
 
     client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-    log(f"SPY Options Alert Bot started. Polling every {POLL_SECONDS}s. Feed={FEED}.")
+    log(f"Options Alert Bot started. Symbols={','.join(SYMBOLS)} "
+        f"Polling every {POLL_SECONDS}s. Feed={FEED}.")
 
     while True:
         try:
