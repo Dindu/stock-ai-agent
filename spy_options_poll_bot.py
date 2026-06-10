@@ -380,14 +380,16 @@ def run_cycle(client):
         log(f"{data['signal']} (score {data['score']}) — below STRONG threshold, no Discord alert.")
         return
 
-    option = get_option_contract(side, data["price"])
-    if not option:
-        send_discord(f"⚠️ {data['signal']} setup detected, but no valid 1DTE+ option found.")
+    # Dedupe by side per day: one STRONG CALL alert and one STRONG PUT alert max per day.
+    # SPY's nearest strike shifts as price drifts, so a per-contract key would re-fire too often.
+    if side in _alerted_today["keys"]:
+        log(f"Already alerted {side} today — suppressed.")
         return
 
-    alert_key = (side, option["contract"])
-    if alert_key in _alerted_today["keys"]:
-        log(f"Duplicate {side} alert for {option['contract']} — suppressed.")
+    option = get_option_contract(side, data["price"])
+    if not option:
+        # Only log; don't spam Discord with this every cycle.
+        log(f"{data['signal']} setup detected, but no valid 1DTE+ option found.")
         return
 
     tier = data["tier"]
@@ -457,7 +459,7 @@ Minimum 1DTE. Near-the-money only.
 Alert only — verify chart before taking play.
 """
     send_discord(message)
-    _alerted_today["keys"].add(alert_key)
+    _alerted_today["keys"].add(side)
     log(f"Alert sent: {data['signal']} {option['contract']} (score {data['score']})")
 
 
@@ -467,11 +469,7 @@ def main():
 
     client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-    send_discord(
-        f"✅ SPY Options Alert Bot (polling every {POLL_SECONDS}s) started. "
-        "Minimum 1DTE. Alerts only."
-    )
-    log(f"Polling every {POLL_SECONDS}s. Feed={FEED}.")
+    log(f"SPY Options Alert Bot started. Polling every {POLL_SECONDS}s. Feed={FEED}.")
 
     while True:
         try:
