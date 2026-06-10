@@ -54,7 +54,9 @@ SCORE_SIGNAL = int(os.getenv("SCORE_SIGNAL", "65"))   # CALL/PUT alert
 SCORE_WATCH  = int(os.getenv("SCORE_WATCH",  "50"))   # WATCHLIST heads-up
 
 central = pytz.timezone("America/Chicago")
-last_alert_key = None  # (tier, contract) so we don't spam the same alert
+# Track contracts already alerted today so we never duplicate.
+# Keyed on (side, contract); reset automatically when the trading date changes.
+_alerted_today = {"date": None, "keys": set()}
 _pdh_pdl_cache = {"date": None, "pdh": None, "pdl": None}
 
 
@@ -345,11 +347,15 @@ def log(msg):
 # main loop
 # ---------------------------------------------------------------------------
 def run_cycle(client):
-    global last_alert_key
-
     if not market_open_now():
         log("Market closed — skipping.")
         return
+
+    # Reset the per-day dedupe set when the date rolls over.
+    today = datetime.now(central).date()
+    if _alerted_today["date"] != today:
+        _alerted_today["date"] = today
+        _alerted_today["keys"] = set()
 
     bars = fetch_bars(client)
     log(f"Fetched {len(bars)} bars.")
@@ -373,8 +379,9 @@ def run_cycle(client):
         send_discord(f"⚠️ {data['signal']} setup detected, but no valid 1DTE+ option found.")
         return
 
-    alert_key = (data["tier"], option["contract"])
-    if alert_key == last_alert_key:
+    alert_key = (side, option["contract"])
+    if alert_key in _alerted_today["keys"]:
+        log(f"Duplicate {side} alert for {option['contract']} — suppressed.")
         return
 
     tier = data["tier"]
@@ -444,7 +451,8 @@ Minimum 1DTE. Near-the-money only.
 Alert only — verify chart before taking play.
 """
     send_discord(message)
-    last_alert_key = alert_key
+    _alerted_today["keys"].add(alert_key)
+    log(f"Alert sent: {data['signal']} {option['contract']} (score {data['score']})")
 
 
 def main():
