@@ -156,6 +156,11 @@ def analyze(df, client):
     moving_away_bullish = vwap_distance_now > vwap_distance_prev
     moving_away_bearish = vwap_distance_now < vwap_distance_prev
 
+    print("Bullish:", bullish, flush=True)
+    print("Strong Volume:", strong_volume, flush=True)
+    print("Above PDH:", price > pdh, flush=True)
+    print("VWAP Direction:", moving_away_bullish, flush=True)
+
     call_signal = bullish and strong_volume and price > pdh
     put_signal = bearish and strong_volume and price < pdl
 
