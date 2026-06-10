@@ -19,3 +19,7 @@ env/
 
 # OS
 .DS_Store
+
+# Bot artifacts
+trade_results.csv
+*.log

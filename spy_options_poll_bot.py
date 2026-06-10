@@ -26,6 +26,9 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 
 
 # Force line-buffered stdout so logs appear in real time on Render / Docker.
@@ -65,6 +68,17 @@ IGNITION_MIN_DELTA  = int(os.getenv("IGNITION_MIN_DELTA",  "20"))  # BULL/BEAR m
 IGNITION_PRIOR_MAX  = int(os.getenv("IGNITION_PRIOR_MAX",  "65"))  # 5 min ago BULL/BEAR must have been below this
 IGNITION_LOOKBACK_S = int(os.getenv("IGNITION_LOOKBACK_S", "300"))  # how far back to compare (default 5 min)
 
+# Paper-trading execution. When ENABLE_ALPACA_PAPER_TRADING=1 the bot will
+# submit a paper-account market BUY when a STRONG signal fires, then poll the
+# option price each cycle and submit a paper-account market SELL at +20% / -20%.
+# Set to 0 to keep the bot in pure alert mode (no orders submitted, no tracking).
+ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "1"
+PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))
+STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.20"))
+MAX_OPEN_TRADES   = int(os.getenv("MAX_OPEN_TRADES",   "1"))
+POSITION_QTY      = int(os.getenv("POSITION_QTY",      "1"))
+TRADE_LOG_FILE    = os.getenv("TRADE_LOG_FILE", "trade_results.csv")
+
 # Per-symbol score-trend history (one reading per cycle).
 # At POLL_SECONDS=30s, capacity 24 = 12 minutes of history.
 _SCORE_HISTORY_CAP = 24
@@ -78,6 +92,12 @@ central = pytz.timezone("America/Chicago")
 _alerted_today = {"date": None, "keys": set()}
 # Per-symbol prev-day high/low cache.
 _pdh_pdl_cache: "dict[str, dict]" = {sym: {"date": None, "pdh": None, "pdl": None} for sym in SYMBOLS}
+
+# Open paper-trade book: contract symbol -> trade record dict.
+# Capped by MAX_OPEN_TRADES across all underlyings.
+_open_trades: "dict[str, dict]" = {}
+# Lazily-initialized Alpaca paper TradingClient (created in main()).
+_trading_client: "TradingClient | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +424,172 @@ def log(msg):
 
 
 # ---------------------------------------------------------------------------
+# Paper-trading execution + position tracking
+# ---------------------------------------------------------------------------
+def place_paper_entry(option_contract):
+    """Submit a paper-account market BUY for a single option contract."""
+    order = MarketOrderRequest(
+        symbol=option_contract["contract"],
+        qty=POSITION_QTY,
+        side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY,
+    )
+    return _trading_client.submit_order(order)
+
+
+def place_paper_exit(contract_symbol):
+    """Submit a paper-account market SELL to close the position."""
+    order = MarketOrderRequest(
+        symbol=contract_symbol,
+        qty=POSITION_QTY,
+        side=OrderSide.SELL,
+        time_in_force=TimeInForce.DAY,
+    )
+    return _trading_client.submit_order(order)
+
+
+def open_trade_record(symbol, signal, option, score):
+    entry_price = option["ask"] if option["ask"] > 0 else option["last"]
+    return {
+        "underlying": symbol,
+        "signal": signal,
+        "contract": option["contract"],
+        "expiry": option["expiry"],
+        "strike": option["strike"],
+        "entry": entry_price,
+        "target": entry_price * (1 + PROFIT_TARGET_PCT),
+        "stop":   entry_price * (1 - STOP_LOSS_PCT),
+        "score": score,
+        "opened_at": datetime.now(central),
+        "status": "OPEN",
+    }
+
+
+def get_current_option_price(trade):
+    """Re-pull the bid/last for an open contract from yfinance."""
+    try:
+        ticker = yf.Ticker(trade["underlying"])
+        chain = ticker.option_chain(trade["expiry"])
+    except Exception as e:
+        log(f"[{trade['underlying']}] Price check failed for {trade['contract']}: {e}")
+        return None
+
+    options = chain.calls if "C" in trade["contract"].split(trade["underlying"], 1)[-1] else chain.puts
+    row = options[options["contractSymbol"] == trade["contract"]]
+    if row.empty:
+        return None
+
+    bid  = float(row.iloc[0]["bid"]) if not pd.isna(row.iloc[0]["bid"]) else 0
+    last = float(row.iloc[0]["lastPrice"]) if not pd.isna(row.iloc[0]["lastPrice"]) else 0
+    return bid if bid > 0 else (last if last > 0 else None)
+
+
+def track_open_trades():
+    """Walk every open paper trade, mark current PnL, and exit on target/stop."""
+    if not _open_trades:
+        return
+
+    for trade in list(_open_trades.values()):
+        current_price = get_current_option_price(trade)
+        if current_price is None:
+            log(f"[{trade['underlying']}] {trade['contract']} — no current price, skipping check.")
+            continue
+
+        entry = trade["entry"]
+        pnl_pct = (current_price - entry) / entry if entry else 0.0
+        log(f"[{trade['underlying']}] {trade['contract']} live ${current_price:.2f} "
+            f"vs entry ${entry:.2f}  ({pnl_pct * 100:+.2f}%)")
+
+        if pnl_pct >= PROFIT_TARGET_PCT:
+            close_trade(trade, current_price, "TARGET HIT", pnl_pct)
+        elif pnl_pct <= -STOP_LOSS_PCT:
+            close_trade(trade, current_price, "STOP LOSS",  pnl_pct)
+
+
+def close_trade(trade, exit_price, reason, pnl_pct):
+    """Submit a paper exit (if enabled), Discord the result, and append to CSV."""
+    if ENABLE_ALPACA_PAPER_TRADING and _trading_client is not None:
+        try:
+            place_paper_exit(trade["contract"])
+        except Exception as e:
+            log(f"[{trade['underlying']}] Paper exit submit failed: {e}")
+
+    emoji = "\u2705" if pnl_pct > 0 else "\u274c"
+    closed_at = datetime.now(central)
+    send_discord(
+        f"{emoji} **{reason}** \u2014 {trade['underlying']} {trade['signal']}\n\n"
+        f"Contract: `{trade['contract']}`\n"
+        f"Entry: `{trade['entry']:.2f}`  Exit: `{exit_price:.2f}`\n"
+        f"PnL: `{pnl_pct * 100:+.2f}%`  Score: `{trade['score']}`\n"
+        f"Opened: `{trade['opened_at']:%Y-%m-%d %H:%M:%S %Z}`\n"
+        f"Closed: `{closed_at:%Y-%m-%d %H:%M:%S %Z}`"
+    )
+
+    row = {
+        "opened_at": trade["opened_at"],
+        "closed_at": closed_at,
+        "underlying": trade["underlying"],
+        "contract":   trade["contract"],
+        "signal":     trade["signal"],
+        "entry":      trade["entry"],
+        "exit":       exit_price,
+        "pnl_pct":    pnl_pct * 100,
+        "reason":     reason,
+        "score":      trade["score"],
+    }
+    try:
+        pd.DataFrame([row]).to_csv(
+            TRADE_LOG_FILE,
+            mode="a",
+            header=not os.path.exists(TRADE_LOG_FILE),
+            index=False,
+        )
+    except Exception as e:
+        log(f"CSV write failed: {e}")
+
+    _open_trades.pop(trade["contract"], None)
+    log(f"[{trade['underlying']}] Closed {trade['contract']} ({reason}, {pnl_pct * 100:+.2f}%)")
+
+
+def try_open_paper_trade(symbol, side, option, data):
+    """Open a paper trade if trading is enabled and we have capacity. Returns True if opened."""
+    if not ENABLE_ALPACA_PAPER_TRADING:
+        return False
+    if len(_open_trades) >= MAX_OPEN_TRADES:
+        log(f"[{symbol}] Paper-trade capacity full ({len(_open_trades)}/{MAX_OPEN_TRADES}) \u2014 alert only.")
+        return False
+    if option["contract"] in _open_trades:
+        log(f"[{symbol}] Already long {option['contract']} \u2014 not stacking.")
+        return False
+
+    score = data["bull_score"] if side == "CALL" else data["bear_score"]
+    signal_label = f"STRONG {side}"
+
+    if _trading_client is not None:
+        try:
+            place_paper_entry(option)
+        except Exception as e:
+            log(f"[{symbol}] Paper entry submit failed: {e} \u2014 not tracking trade.")
+            return False
+
+    trade = open_trade_record(symbol, signal_label, option, score)
+    _open_trades[trade["contract"]] = trade
+
+    send_discord(
+        f"\U0001f4b0 **{symbol} {signal_label} \u2014 PAPER TRADE OPENED**\n\n"
+        f"Contract: `{trade['contract']}`\n"
+        f"Expiry: `{trade['expiry']}`  Strike: `{trade['strike']}`\n\n"
+        f"Entry: `{trade['entry']:.2f}`\n"
+        f"Target: `{trade['target']:.2f}`  (+{PROFIT_TARGET_PCT * 100:.0f}%)\n"
+        f"Stop:   `{trade['stop']:.2f}`  (-{STOP_LOSS_PCT * 100:.0f}%)\n\n"
+        f"Score: `{score}`  Qty: `{POSITION_QTY}`"
+    )
+    log(f"[{symbol}] Paper trade opened: {trade['contract']} entry ${trade['entry']:.2f} "
+        f"target ${trade['target']:.2f} stop ${trade['stop']:.2f}")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # main loop
 # ---------------------------------------------------------------------------
 def run_cycle(client):
@@ -416,6 +602,15 @@ def run_cycle(client):
     if _alerted_today["date"] != today:
         _alerted_today["date"] = today
         _alerted_today["keys"] = set()
+
+    # Manage any open paper trade first so target/stop can fire even when
+    # no new signal is forming this cycle.
+    try:
+        track_open_trades()
+    except Exception:
+        log("track_open_trades error:")
+        traceback.print_exc()
+        sys.stdout.flush()
 
     for symbol in SYMBOLS:
         try:
@@ -549,12 +744,27 @@ Alert only \u2014 verify chart before taking play.
     _alerted_today["keys"].add(alert_key)
     log(f"[{symbol}] Alert sent: {data['signal']} {option['contract']} (BULL {data['bull_score']} / BEAR {data['bear_score']})")
 
+    # Open a paper trade (if enabled + capacity).
+    try:
+        try_open_paper_trade(symbol, side, option, data)
+    except Exception:
+        log(f"[{symbol}] try_open_paper_trade error:")
+        traceback.print_exc()
+        sys.stdout.flush()
+
 
 def main():
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
         raise Exception("Missing Alpaca API keys in .env")
 
     client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+    global _trading_client
+    if ENABLE_ALPACA_PAPER_TRADING:
+        _trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+        log("Paper trading ENABLED — Alpaca paper TradingClient initialized.")
+    else:
+        log("Paper trading DISABLED — alerts only, no orders will be submitted.")
 
     log(f"Options Alert Bot started. Symbols={','.join(SYMBOLS)} "
         f"Polling every {POLL_SECONDS}s. Feed={FEED}.")
