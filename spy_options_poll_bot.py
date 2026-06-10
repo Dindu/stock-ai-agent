@@ -41,15 +41,19 @@ FEED = os.getenv("ALPACA_FEED", "iex").lower()
 
 SYMBOL = "SPY"
 BAR_MINUTES = 5
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))  # 2 minutes
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for SPY options
 LOOKBACK_BARS = 120
+RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
 MIN_DTE = 1
 MAX_DTE = 7
 VOLUME_MULTIPLIER = 1.5
-REQUIRE_VWAP_DIRECTION = True
+
+# Scoring thresholds (0-100)
+SCORE_STRONG = 80   # full STRONG alert
+SCORE_WATCH = 60    # watchlist heads-up
 
 central = pytz.timezone("America/Chicago")
-last_alert_contract = None
+last_alert_key = None  # (tier, contract) so we don't spam the same alert
 _pdh_pdl_cache = {"date": None, "pdh": None, "pdl": None}
 
 
@@ -156,17 +160,65 @@ def analyze(df, client):
     moving_away_bullish = vwap_distance_now > vwap_distance_prev
     moving_away_bearish = vwap_distance_now < vwap_distance_prev
 
+    # Intraday recent high/low (exclude the current bar so a break is meaningful)
+    recent_window = df.iloc[-(RECENT_HIGH_LOOKBACK + 1):-1]
+    recent_high = float(recent_window["high"].max()) if len(recent_window) else price
+    recent_low = float(recent_window["low"].min()) if len(recent_window) else price
+
+    above_pdh = price > pdh
+    below_pdl = price < pdl
+    above_recent_high = price > recent_high
+    below_recent_low = price < recent_low
+
+    # ---- Score (CALL side) ----
+    call_score = 0
+    if bullish:
+        call_score += 30
+    if strong_volume:
+        call_score += 20
+    if moving_away_bullish:
+        call_score += 20
+    if above_pdh:
+        call_score += 15
+    if above_recent_high:
+        call_score += 15
+
+    # ---- Score (PUT side) ----
+    put_score = 0
+    if bearish:
+        put_score += 30
+    if strong_volume:
+        put_score += 20
+    if moving_away_bearish:
+        put_score += 20
+    if below_pdl:
+        put_score += 15
+    if below_recent_low:
+        put_score += 15
+
     print("Bullish:", bullish, flush=True)
     print("Strong Volume:", strong_volume, flush=True)
-    print("Above PDH:", price > pdh, flush=True)
-    print("VWAP Direction:", moving_away_bullish, flush=True)
+    print("Above PDH:", above_pdh, flush=True)
+    print("Above Recent High:", above_recent_high, flush=True)
+    print("VWAP Direction (bull):", moving_away_bullish, flush=True)
+    print(f"CALL score: {call_score} | PUT score: {put_score}", flush=True)
 
-    call_signal = bullish and strong_volume and price > pdh
-    put_signal = bearish and strong_volume and price < pdl
+    if call_score >= put_score and call_score >= SCORE_WATCH:
+        side = "CALL"
+        score = call_score
+    elif put_score > call_score and put_score >= SCORE_WATCH:
+        side = "PUT"
+        score = put_score
+    else:
+        side = "NO TRADE"
+        score = max(call_score, put_score)
 
-    if REQUIRE_VWAP_DIRECTION:
-        call_signal = call_signal and moving_away_bullish
-        put_signal = put_signal and moving_away_bearish
+    if side == "NO TRADE":
+        tier = "NONE"
+    elif score >= SCORE_STRONG:
+        tier = "STRONG"
+    else:
+        tier = "WATCH"
 
     data = {
         "price": price,
@@ -177,15 +229,27 @@ def analyze(df, client):
         "vol_avg": vol_avg,
         "pdh": pdh,
         "pdl": pdl,
+        "recent_high": recent_high,
+        "recent_low": recent_low,
         "vwap_distance_now": vwap_distance_now,
         "vwap_distance_prev": vwap_distance_prev,
+        "call_score": call_score,
+        "put_score": put_score,
+        "score": score,
+        "tier": tier,
+        "checks": {
+            "bullish": bullish,
+            "bearish": bearish,
+            "strong_volume": strong_volume,
+            "vwap_direction": moving_away_bullish if side == "CALL" else moving_away_bearish,
+            "above_pdh": above_pdh,
+            "below_pdl": below_pdl,
+            "above_recent_high": above_recent_high,
+            "below_recent_low": below_recent_low,
+        },
     }
 
-    if call_signal:
-        return "CALL", data
-    if put_signal:
-        return "PUT", data
-    return "NO TRADE", data
+    return side, data
 
 
 def get_valid_expiry(ticker):
@@ -288,9 +352,9 @@ def run_cycle(client):
     signal, data = analyze(bars, client)
     if data:
         log(
-            f"SPY {data['price']:.2f} | Signal {signal} | "
+            f"SPY {data['price']:.2f} | {signal} {data['tier']} ({data['score']}) | "
             f"VWAP {data['vwap']:.2f} | EMA20 {data['ema20']:.2f} | "
-            f"EMA50 {data['ema50']:.2f}"
+            f"EMA50 {data['ema50']:.2f} | RecentHigh {data['recent_high']:.2f}"
         )
 
     if signal == "NO TRADE":
@@ -298,15 +362,41 @@ def run_cycle(client):
 
     option = get_option_contract(signal, data["price"])
     if not option:
-        send_discord(f"⚠️ {signal} setup detected, but no valid 1DTE+ option found.")
+        send_discord(f"⚠️ {signal} {data['tier']} setup detected, but no valid 1DTE+ option found.")
         return
 
-    if option["contract"] == last_alert_contract:
+    alert_key = (data["tier"], option["contract"])
+    global last_alert_key
+    if alert_key == last_alert_key:
         return
 
-    emoji = "🟢" if signal == "CALL" else "🔴"
+    if data["tier"] == "STRONG":
+        emoji = "🟢" if signal == "CALL" else "🔴"
+        header = f"{emoji} **SPY {signal} STRONG SETUP** (score {data['score']}/100)"
+    else:  # WATCH
+        emoji = "🟡"
+        header = f"{emoji} **SPY {signal} WATCHLIST** (score {data['score']}/100)"
+
+    checks = data["checks"]
+    if signal == "CALL":
+        checklist = (
+            f"Bullish trend: `{checks['bullish']}`\n"
+            f"Strong volume: `{checks['strong_volume']}`\n"
+            f"VWAP direction: `{checks['vwap_direction']}`\n"
+            f"Above PDH: `{checks['above_pdh']}`\n"
+            f"Above recent high: `{checks['above_recent_high']}`"
+        )
+    else:
+        checklist = (
+            f"Bearish trend: `{checks['bearish']}`\n"
+            f"Strong volume: `{checks['strong_volume']}`\n"
+            f"VWAP direction: `{checks['vwap_direction']}`\n"
+            f"Below PDL: `{checks['below_pdl']}`\n"
+            f"Below recent low: `{checks['below_recent_low']}`"
+        )
+
     message = f"""
-{emoji} **SPY {signal} SETUP**
+{header}
 
 **Suggested Option**
 Contract: `{option['contract']}`
@@ -319,28 +409,28 @@ Last: `{option['last']}`
 Volume: `{option['volume']}`
 Open Interest: `{option['open_interest']}`
 
+**Score Breakdown**
+{checklist}
+
 **SPY Levels**
 Price: `{data['price']:.2f}`
 VWAP: `{data['vwap']:.2f}`
 EMA20: `{data['ema20']:.2f}`
 EMA50: `{data['ema50']:.2f}`
-PDH: `{data['pdh']:.2f}`
-PDL: `{data['pdl']:.2f}`
-Current Volume: `{int(data['volume'])}`
-Average Volume: `{int(data['vol_avg'])}`
+PDH: `{data['pdh']:.2f}` | PDL: `{data['pdl']:.2f}`
+Recent High: `{data['recent_high']:.2f}` | Recent Low: `{data['recent_low']:.2f}`
+Current Volume: `{int(data['volume'])}` | Avg Volume: `{int(data['vol_avg'])}`
 
 **VWAP Direction**
-Now: `{data['vwap_distance_now']:.2f}`
-Previous: `{data['vwap_distance_prev']:.2f}`
+Now: `{data['vwap_distance_now']:.2f}` | Previous: `{data['vwap_distance_prev']:.2f}`
 
 **Rule**
-Minimum 1DTE.
-Near-the-money only.
-VWAP direction filter enabled.
+Minimum 1DTE. Near-the-money only.
+{'Strong setup — all major confirmations aligned.' if data['tier'] == 'STRONG' else 'Watchlist — wait for volume / breakout confirmation before entering.'}
 Alert only — verify chart before taking play.
 """
     send_discord(message)
-    last_alert_contract = option["contract"]
+    last_alert_key = alert_key
 
 
 def main():
