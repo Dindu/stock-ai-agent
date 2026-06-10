@@ -49,8 +49,9 @@ MAX_DTE = 7
 VOLUME_MULTIPLIER = 1.5
 
 # Scoring thresholds (0-100)
-SCORE_STRONG = 80   # full STRONG alert
-SCORE_WATCH = 60    # watchlist heads-up
+SCORE_STRONG = int(os.getenv("SCORE_STRONG", "80"))   # STRONG CALL/PUT alert
+SCORE_SIGNAL = int(os.getenv("SCORE_SIGNAL", "65"))   # CALL/PUT alert
+SCORE_WATCH  = int(os.getenv("SCORE_WATCH",  "50"))   # WATCHLIST heads-up
 
 central = pytz.timezone("America/Chicago")
 last_alert_key = None  # (tier, contract) so we don't spam the same alert
@@ -215,10 +216,16 @@ def analyze(df, client):
 
     if side == "NO TRADE":
         tier = "NONE"
+        signal = "NO TRADE"
     elif score >= SCORE_STRONG:
         tier = "STRONG"
-    else:
+        signal = f"STRONG {side}"
+    elif score >= SCORE_SIGNAL:
+        tier = "SIGNAL"
+        signal = side
+    else:  # >= SCORE_WATCH
         tier = "WATCH"
+        signal = "WATCHLIST"
 
     data = {
         "price": price,
@@ -237,6 +244,8 @@ def analyze(df, client):
         "put_score": put_score,
         "score": score,
         "tier": tier,
+        "side": side,
+        "signal": signal,
         "checks": {
             "bullish": bullish,
             "bearish": bearish,
@@ -250,7 +259,6 @@ def analyze(df, client):
     }
 
     return side, data
-
 
 def get_valid_expiry(ticker):
     today = date.today()
@@ -337,7 +345,7 @@ def log(msg):
 # main loop
 # ---------------------------------------------------------------------------
 def run_cycle(client):
-    global last_alert_contract
+    global last_alert_key
 
     if not market_open_now():
         log("Market closed — skipping.")
@@ -349,36 +357,42 @@ def run_cycle(client):
         log(f"Bars: {len(bars)}/55 — warming up.")
         return
 
-    signal, data = analyze(bars, client)
+    side, data = analyze(bars, client)
     if data:
         log(
-            f"SPY {data['price']:.2f} | {signal} {data['tier']} ({data['score']}) | "
+            f"SPY {data['price']:.2f} | {data['signal']} ({data['score']}) | "
             f"VWAP {data['vwap']:.2f} | EMA20 {data['ema20']:.2f} | "
             f"EMA50 {data['ema50']:.2f} | RecentHigh {data['recent_high']:.2f}"
         )
 
-    if signal == "NO TRADE":
+    if side == "NO TRADE":
         return
 
-    option = get_option_contract(signal, data["price"])
+    option = get_option_contract(side, data["price"])
     if not option:
-        send_discord(f"⚠️ {signal} {data['tier']} setup detected, but no valid 1DTE+ option found.")
+        send_discord(f"⚠️ {data['signal']} setup detected, but no valid 1DTE+ option found.")
         return
 
     alert_key = (data["tier"], option["contract"])
-    global last_alert_key
     if alert_key == last_alert_key:
         return
 
-    if data["tier"] == "STRONG":
-        emoji = "🟢" if signal == "CALL" else "🔴"
-        header = f"{emoji} **SPY {signal} STRONG SETUP** (score {data['score']}/100)"
+    tier = data["tier"]
+    if tier == "STRONG":
+        emoji = "🟢" if side == "CALL" else "🔴"
+        header = f"{emoji} **SPY {data['signal']} SETUP** (score {data['score']}/100)"
+        footer = "Strong setup — all major confirmations aligned."
+    elif tier == "SIGNAL":
+        emoji = "🟢" if side == "CALL" else "🔴"
+        header = f"{emoji} **SPY {data['signal']} SETUP** (score {data['score']}/100)"
+        footer = "Confirmed setup — trend + one breakout confirmation."
     else:  # WATCH
         emoji = "🟡"
-        header = f"{emoji} **SPY {signal} WATCHLIST** (score {data['score']}/100)"
+        header = f"{emoji} **SPY {side} WATCHLIST** (score {data['score']}/100)"
+        footer = "Watchlist — wait for volume / breakout confirmation before entering."
 
     checks = data["checks"]
-    if signal == "CALL":
+    if side == "CALL":
         checklist = (
             f"Bullish trend: `{checks['bullish']}`\n"
             f"Strong volume: `{checks['strong_volume']}`\n"
@@ -426,7 +440,7 @@ Now: `{data['vwap_distance_now']:.2f}` | Previous: `{data['vwap_distance_prev']:
 
 **Rule**
 Minimum 1DTE. Near-the-money only.
-{'Strong setup — all major confirmations aligned.' if data['tier'] == 'STRONG' else 'Watchlist — wait for volume / breakout confirmation before entering.'}
+{footer}
 Alert only — verify chart before taking play.
 """
     send_discord(message)
