@@ -35,7 +35,6 @@ FEED = os.getenv("ALPACA_FEED", "iex").lower()
 SYMBOL = "SPY"
 BAR_MINUTES = 5
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))  # 2 minutes
-RUN_ONCE = os.getenv("RUN_ONCE", "0") == "1"  # for cron / one-shot environments
 LOOKBACK_BARS = 120
 MIN_DTE = 1
 MAX_DTE = 7
@@ -333,15 +332,6 @@ def main():
         raise Exception("Missing Alpaca API keys in .env")
 
     client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
-
-    if RUN_ONCE:
-        print(f"RUN_ONCE mode. Feed={FEED}.")
-        try:
-            run_cycle(client)
-        except Exception:
-            print("Cycle error:")
-            traceback.print_exc()
-        return
 
     send_discord(
         f"✅ SPY Options Alert Bot (polling every {POLL_SECONDS}s) started. "
