@@ -224,19 +224,6 @@ def run():
 
 if __name__ == "__main__":
     if os.path.exists(LOCK_FILE):
-        print("[LOCK] Another instance running. Exiting.", flush=True)
-        exit(0)
-    try:
-        open(LOCK_FILE, 'w').close()
-        run()
-    except KeyboardInterrupt:
-        log("Shutting down...")
-    finally:
-        if os.path.exists(LOCK_FILE):
-            os.remove(LOCK_FILE)
-
-if __name__ == "__main__":
-    if os.path.exists(LOCK_FILE):
         print("[LOCK] Another instance is already running. Exiting.", flush=True)
         exit(0)
     try:

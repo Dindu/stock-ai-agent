@@ -65,6 +65,9 @@ def buy(symbol, qty):
 
 
 def sell(symbol, qty):
+    if not has_open_position(symbol):
+        print(f"[ALPACA] Skipping sell {symbol} — no open position on Alpaca", flush=True)
+        return None
     r = requests.post(f"{BASE}/v2/orders", json={
         "symbol": symbol,
         "qty": qty,

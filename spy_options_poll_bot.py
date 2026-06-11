@@ -4,7 +4,7 @@ Index ETF Options Alerts Bot — polling version (SPY / QQQ / IWM by default).
 Pulls 5-minute bars from Alpaca REST every POLL_SECONDS for each configured
 symbol, runs a Bull/Bear market scorecard, applies a trend-ignition filter,
 and posts a Discord alert with a near-the-money 1DTE+ option contract from
-yfinance when the score ignites into STRONG territory.
+Alpaca's live options data when the score ignites into STRONG territory.
 
 No WebSocket -> no Alpaca connection-limit issues.
 """
@@ -19,15 +19,14 @@ from datetime import datetime, date, timedelta, timezone
 import pandas as pd
 import pytz
 import requests
-import yfinance as yf
 from dotenv import load_dotenv
 
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest, OptionLatestQuoteRequest, OptionSnapshotRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, GetOptionContractsRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 
@@ -98,6 +97,10 @@ _pdh_pdl_cache: "dict[str, dict]" = {sym: {"date": None, "pdh": None, "pdl": Non
 _open_trades: "dict[str, dict]" = {}
 # Lazily-initialized Alpaca paper TradingClient (created in main()).
 _trading_client: "TradingClient | None" = None
+# Lazily-initialized Alpaca OptionHistoricalDataClient (created in main()).
+_option_client: "OptionHistoricalDataClient | None" = None
+# (symbol, side) -> datetime after which re-alerting is allowed (post-trade cooldown).
+_alert_cooldowns: "dict[tuple, datetime]" = {}
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +110,12 @@ def send_discord(message):
     if not DISCORD_WEBHOOK_URL:
         print("Missing Discord webhook.")
         return
+    if len(message) > 1990:
+        message = message[:1987] + "..."
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=10)
+        r = requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=10)
+        if r.status_code not in (200, 204):
+            print(f"Discord post returned {r.status_code}: {r.text[:100]}", flush=True)
     except Exception as e:
         print(f"Discord post failed: {e}")
 
@@ -169,7 +176,22 @@ def calculate_indicators(df):
     df["VOL_AVG"] = df["volume"].rolling(20).mean()
 
     typical = (df["high"] + df["low"] + df["close"]) / 3
-    df["VWAP"] = (typical * df["volume"]).cumsum() / df["volume"].cumsum()
+
+    # VWAP: reset at today's trading session — never cumsum across the overnight gap.
+    eastern = pytz.timezone("America/New_York")
+    if hasattr(df.index, "tz") and df.index.tz is not None:
+        idx_et = df.index.tz_convert(eastern)
+    else:
+        idx_et = df.index.tz_localize("UTC").tz_convert(eastern)
+    today_et = datetime.now(eastern).date()
+    session_mask = pd.Series(
+        [ts.date() == today_et for ts in idx_et], index=df.index, dtype=bool
+    )
+    vwap = pd.Series(float("nan"), index=df.index, dtype=float)
+    if session_mask.any():
+        t_vol = typical[session_mask] * df.loc[session_mask, "volume"]
+        vwap[session_mask] = t_vol.cumsum() / df.loc[session_mask, "volume"].cumsum()
+    df["VWAP"] = vwap
     return df
 
 
@@ -342,52 +364,83 @@ def analyze(df, client, symbol):
 
     return side, data
 
-def get_valid_expiry(ticker):
-    today = date.today()
-    for expiry in ticker.options:
-        exp_date = datetime.strptime(expiry, "%Y-%m-%d").date()
-        dte = (exp_date - today).days
-        if MIN_DTE <= dte <= MAX_DTE:
-            return expiry, dte
-    return None, None
-
-
 def get_option_contract(symbol, signal, underlying_price):
+    """Fetch the nearest 1-7 DTE ATM option contract from Alpaca (live data, no yfinance)."""
+    if _option_client is None or _trading_client is None:
+        print(f"[{symbol}] Option client not initialised.", flush=True)
+        return None
     try:
-        ticker = yf.Ticker(symbol)
-        expiry, dte = get_valid_expiry(ticker)
-        if not expiry:
+        today = date.today()
+        min_exp = today + timedelta(days=MIN_DTE)
+        max_exp = today + timedelta(days=MAX_DTE)
+        option_type = "call" if signal == "CALL" else "put"
+
+        req = GetOptionContractsRequest(
+            underlying_symbols=[symbol],
+            expiration_date_gte=min_exp,
+            expiration_date_lte=max_exp,
+            type=option_type,
+            strike_price_gte=underlying_price * 0.97,
+            strike_price_lte=underlying_price * 1.03,
+            limit=50,
+        )
+        result = _trading_client.get_option_contracts(req)
+        # SDK may return a list directly or a wrapper with .option_contracts / .contracts.
+        if isinstance(result, list):
+            contracts = result
+        else:
+            contracts = (
+                getattr(result, "option_contracts", None)
+                or getattr(result, "contracts", None)
+                or []
+            )
+        if not contracts:
+            print(f"[{symbol}] No option contracts found ({option_type}, {min_exp}–{max_exp}).", flush=True)
             return None
-        chain = ticker.option_chain(expiry)
+
+        # Nearest expiry first, then closest strike.
+        contracts = sorted(
+            contracts,
+            key=lambda c: (
+                (c.expiration_date - today).days,
+                abs(float(c.strike_price) - underlying_price),
+            ),
+        )
+        best = contracts[0]
+        contract_sym = best.symbol
+
+        # Fetch live bid/ask/last/volume via a single Alpaca snapshot call.
+        snap_req = OptionSnapshotRequest(symbol_or_symbols=contract_sym)
+        snaps = _option_client.get_option_snapshot(snap_req)
+        snap = snaps.get(contract_sym)
+
+        bid = ask = last = vol = oi = 0
+        if snap:
+            if snap.latest_quote:
+                bid = float(snap.latest_quote.bid_price or 0)
+                ask = float(snap.latest_quote.ask_price or 0)
+            if snap.latest_trade:
+                last = float(snap.latest_trade.price or 0)
+            if snap.day:
+                vol = int(snap.day.volume or 0)
+            oi = int(float(snap.open_interest or 0))
+
+        dte = (best.expiration_date - today).days
+        return {
+            "contract":      contract_sym,
+            "expiry":        best.expiration_date.strftime("%Y-%m-%d"),
+            "dte":           dte,
+            "strike":        float(best.strike_price),
+            "bid":           bid,
+            "ask":           ask,
+            "last":          last,
+            "volume":        vol,
+            "open_interest": oi,
+            "side":          signal,  # stored so close_trade can build the alert_key
+        }
     except Exception as e:
-        print(f"[{symbol}] Option chain fetch failed: {e}")
+        print(f"[{symbol}] Option contract fetch failed: {e}", flush=True)
         return None
-    if signal == "CALL":
-        options = chain.calls.copy()
-        options = options[options["strike"] >= underlying_price]
-    elif signal == "PUT":
-        options = chain.puts.copy()
-        options = options[options["strike"] <= underlying_price]
-    else:
-        return None
-
-    if options.empty:
-        return None
-
-    options["distance"] = abs(options["strike"] - underlying_price)
-    option = options.sort_values("distance").iloc[0]
-
-    return {
-        "contract": option["contractSymbol"],
-        "expiry": expiry,
-        "dte": dte,
-        "strike": float(option["strike"]),
-        "bid": float(option["bid"]) if not pd.isna(option["bid"]) else 0,
-        "ask": float(option["ask"]) if not pd.isna(option["ask"]) else 0,
-        "last": float(option["lastPrice"]) if not pd.isna(option["lastPrice"]) else 0,
-        "volume": int(option["volume"]) if not pd.isna(option["volume"]) else 0,
-        "open_interest": int(option["openInterest"]) if not pd.isna(option["openInterest"]) else 0,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -427,14 +480,31 @@ def log(msg):
 # Paper-trading execution + position tracking
 # ---------------------------------------------------------------------------
 def place_paper_entry(option_contract):
-    """Submit a paper-account market BUY for a single option contract."""
-    order = MarketOrderRequest(
+    """Submit a paper BUY and poll up to 5s for the actual fill price.
+
+    Returns (order, fill_price).  fill_price is None if the order did not fill
+    within the polling window — the caller must treat this as a failure.
+    """
+    order_req = MarketOrderRequest(
         symbol=option_contract["contract"],
         qty=POSITION_QTY,
         side=OrderSide.BUY,
         time_in_force=TimeInForce.DAY,
     )
-    return _trading_client.submit_order(order)
+    order = _trading_client.submit_order(order_req)
+
+    fill_price = None
+    for _ in range(10):
+        time.sleep(0.5)
+        try:
+            filled = _trading_client.get_order_by_id(str(order.id))
+            if filled.status.value in ("filled", "partially_filled") and filled.filled_avg_price:
+                fill_price = float(filled.filled_avg_price)
+                break
+        except Exception:
+            pass
+
+    return order, fill_price
 
 
 def place_paper_exit(contract_symbol):
@@ -448,40 +518,45 @@ def place_paper_exit(contract_symbol):
     return _trading_client.submit_order(order)
 
 
-def open_trade_record(symbol, signal, option, score):
-    entry_price = option["ask"] if option["ask"] > 0 else option["last"]
+def open_trade_record(symbol, signal, option, score, fill_price):
+    """Build a trade record using the actual Alpaca fill price (never a yfinance estimate)."""
+    entry_price = fill_price
+    side = option.get("side", signal.split()[-1])  # "CALL" or "PUT"
     return {
         "underlying": symbol,
-        "signal": signal,
-        "contract": option["contract"],
-        "expiry": option["expiry"],
-        "strike": option["strike"],
-        "entry": entry_price,
-        "target": entry_price * (1 + PROFIT_TARGET_PCT),
-        "stop":   entry_price * (1 - STOP_LOSS_PCT),
-        "score": score,
-        "opened_at": datetime.now(central),
-        "status": "OPEN",
+        "signal":     signal,
+        "side":       side,
+        "contract":   option["contract"],
+        "expiry":     option["expiry"],
+        "strike":     option["strike"],
+        "entry":      entry_price,
+        "target":     entry_price * (1 + PROFIT_TARGET_PCT),
+        "stop":       entry_price * (1 - STOP_LOSS_PCT),
+        "score":      score,
+        "opened_at":  datetime.now(central),
+        "status":     "OPEN",
     }
 
 
 def get_current_option_price(trade):
-    """Re-pull the bid/last for an open contract from yfinance."""
+    """Get live mid/bid price for an open contract from Alpaca (no yfinance)."""
+    if _option_client is None:
+        return None
     try:
-        ticker = yf.Ticker(trade["underlying"])
-        chain = ticker.option_chain(trade["expiry"])
+        contract_sym = trade["contract"]
+        req = OptionLatestQuoteRequest(symbol_or_symbols=contract_sym)
+        quotes = _option_client.get_option_latest_quote(req)
+        q = quotes.get(contract_sym)
+        if q is None:
+            return None
+        bid = float(q.bid_price or 0)
+        ask = float(q.ask_price or 0)
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2  # mid-price for accurate PnL tracking
+        return bid if bid > 0 else None
     except Exception as e:
         log(f"[{trade['underlying']}] Price check failed for {trade['contract']}: {e}")
         return None
-
-    options = chain.calls if "C" in trade["contract"].split(trade["underlying"], 1)[-1] else chain.puts
-    row = options[options["contractSymbol"] == trade["contract"]]
-    if row.empty:
-        return None
-
-    bid  = float(row.iloc[0]["bid"]) if not pd.isna(row.iloc[0]["bid"]) else 0
-    last = float(row.iloc[0]["lastPrice"]) if not pd.isna(row.iloc[0]["lastPrice"]) else 0
-    return bid if bid > 0 else (last if last > 0 else None)
 
 
 def track_open_trades():
@@ -548,6 +623,14 @@ def close_trade(trade, exit_price, reason, pnl_pct):
         log(f"CSV write failed: {e}")
 
     _open_trades.pop(trade["contract"], None)
+
+    # 30-minute cooldown before the same (symbol, side) can re-alert.
+    # Prevents same-day whipsaw but allows re-entry after the lockout expires.
+    alert_key = (trade["underlying"], trade.get("side", trade["signal"].split()[-1]))
+    _alert_cooldowns[alert_key] = datetime.now(central) + timedelta(minutes=30)
+    # Keep alert_key in _alerted_today so run_symbol suppresses until cooldown clears.
+    _alerted_today["keys"].add(alert_key)
+
     log(f"[{trade['underlying']}] Closed {trade['contract']} ({reason}, {pnl_pct * 100:+.2f}%)")
 
 
@@ -556,35 +639,40 @@ def try_open_paper_trade(symbol, side, option, data):
     if not ENABLE_ALPACA_PAPER_TRADING:
         return False
     if len(_open_trades) >= MAX_OPEN_TRADES:
-        log(f"[{symbol}] Paper-trade capacity full ({len(_open_trades)}/{MAX_OPEN_TRADES}) \u2014 alert only.")
+        log(f"[{symbol}] Paper-trade capacity full ({len(_open_trades)}/{MAX_OPEN_TRADES}) — alert only.")
         return False
     if option["contract"] in _open_trades:
-        log(f"[{symbol}] Already long {option['contract']} \u2014 not stacking.")
+        log(f"[{symbol}] Already long {option['contract']} — not stacking.")
+        return False
+    if _trading_client is None:
         return False
 
     score = data["bull_score"] if side == "CALL" else data["bear_score"]
     signal_label = f"STRONG {side}"
 
-    if _trading_client is not None:
-        try:
-            place_paper_entry(option)
-        except Exception as e:
-            log(f"[{symbol}] Paper entry submit failed: {e} \u2014 not tracking trade.")
-            return False
+    try:
+        _, fill_price = place_paper_entry(option)
+    except Exception as e:
+        log(f"[{symbol}] Paper entry submit failed: {e} — not tracking trade.")
+        return False
 
-    trade = open_trade_record(symbol, signal_label, option, score)
+    if fill_price is None:
+        log(f"[{symbol}] Order submitted but no fill confirmed within 5s — not tracking trade.")
+        return False
+
+    trade = open_trade_record(symbol, signal_label, option, score, fill_price)
     _open_trades[trade["contract"]] = trade
 
     send_discord(
-        f"\U0001f4b0 **{symbol} {signal_label} \u2014 PAPER TRADE OPENED**\n\n"
+        f"💰 **{symbol} {signal_label} — PAPER TRADE OPENED**\n\n"
         f"Contract: `{trade['contract']}`\n"
         f"Expiry: `{trade['expiry']}`  Strike: `{trade['strike']}`\n\n"
-        f"Entry: `{trade['entry']:.2f}`\n"
+        f"Entry (filled): `{trade['entry']:.2f}`\n"
         f"Target: `{trade['target']:.2f}`  (+{PROFIT_TARGET_PCT * 100:.0f}%)\n"
         f"Stop:   `{trade['stop']:.2f}`  (-{STOP_LOSS_PCT * 100:.0f}%)\n\n"
         f"Score: `{score}`  Qty: `{POSITION_QTY}`"
     )
-    log(f"[{symbol}] Paper trade opened: {trade['contract']} entry ${trade['entry']:.2f} "
+    log(f"[{symbol}] Paper trade opened: {trade['contract']} fill ${trade['entry']:.2f} "
         f"target ${trade['target']:.2f} stop ${trade['stop']:.2f}")
     return True
 
@@ -647,10 +735,17 @@ def run_symbol(client, symbol):
         return
 
     # One STRONG CALL alert and one STRONG PUT alert max per (symbol, side) per day.
+    # After a trade closes, a 30-min cooldown allows the same setup to re-trigger.
     alert_key = (symbol, side)
+    now_ct = datetime.now(central)
     if alert_key in _alerted_today["keys"]:
-        log(f"[{symbol}] Already alerted {side} today \u2014 suppressed.")
-        return
+        if alert_key in _alert_cooldowns and now_ct >= _alert_cooldowns[alert_key]:
+            # Cooldown expired — clear and allow re-alert.
+            _alerted_today["keys"].discard(alert_key)
+            _alert_cooldowns.pop(alert_key, None)
+        else:
+            log(f"[{symbol}] Already alerted {side} today — suppressed.")
+            return
 
     # Trend-ignition filter: only fire when the move is *just starting*, not mid- or late-trend.
     if IGNITION_REQUIRED:
@@ -686,6 +781,10 @@ def run_symbol(client, symbol):
             f"[{symbol}] \U0001f680 Ignition confirmed: {side} score {past_score} \u2192 {now_score} "
             f"(\u0394 +{delta}) over last {IGNITION_LOOKBACK_S}s."
         )
+
+    # Lock this (symbol, side) NOW — before the option fetch — so a failed or
+    # rate-limited fetch doesn't cause ignition to re-fire every 30 seconds.
+    _alerted_today["keys"].add(alert_key)
 
     option = get_option_contract(symbol, side, data["price"])
     if not option:
@@ -741,7 +840,6 @@ Volume: `{int(data['volume'])}` | Avg: `{int(data['vol_avg'])}`
 Alert only \u2014 verify chart before taking play.
 """
     send_discord(message)
-    _alerted_today["keys"].add(alert_key)
     log(f"[{symbol}] Alert sent: {data['signal']} {option['contract']} (BULL {data['bull_score']} / BEAR {data['bear_score']})")
 
     # Open a paper trade (if enabled + capacity).
@@ -759,7 +857,9 @@ def main():
 
     client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-    global _trading_client
+    global _trading_client, _option_client
+    _option_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    log("OptionHistoricalDataClient initialized — live Alpaca option data (no yfinance).")
     if ENABLE_ALPACA_PAPER_TRADING:
         _trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
         log("Paper trading ENABLED — Alpaca paper TradingClient initialized.")
