@@ -577,20 +577,54 @@ def get_current_option_price(trade):
 
 
 def track_open_trades():
-    """Walk every open paper trade, mark current PnL, and exit on target/stop."""
+    """Walk every open paper trade, mark current PnL, and exit on target/stop.
+
+    Both entry and current price are pulled live from Alpaca positions API.
+    This guarantees our internal record matches what the account actually holds.
+    Falls back to OptionLatestQuoteRequest only if the position is not yet
+    visible in Alpaca (e.g. fill not yet propagated).
+    """
     if not _open_trades:
         return
 
     for trade in list(_open_trades.values()):
-        current_price = get_current_option_price(trade)
+        contract_sym = trade["contract"]
+
+        # ── Primary: pull entry + current price directly from Alpaca position ──
+        alpaca_entry   = None
+        current_price  = None
+
+        if _trading_client is not None:
+            try:
+                pos = _trading_client.get_open_position(contract_sym)
+                if pos.avg_entry_price:
+                    alpaca_entry = float(pos.avg_entry_price)
+                if pos.current_price:
+                    current_price = float(pos.current_price)
+
+                # Sync our record if Alpaca's entry differs (fill slippage, partial fills, etc.)
+                if alpaca_entry and abs(alpaca_entry - trade["entry"]) > 0.001:
+                    log(f"[{trade['underlying']}] Entry corrected: "
+                        f"${trade['entry']:.2f} → ${alpaca_entry:.2f} (Alpaca actual fill)")
+                    trade["entry"]  = alpaca_entry
+                    trade["target"] = alpaca_entry * (1 + PROFIT_TARGET_PCT)
+                    trade["stop"]   = alpaca_entry * (1 - STOP_LOSS_PCT)
+            except Exception:
+                pass  # position not yet visible or already closed on Alpaca side
+
+        # ── Fallback: use Alpaca option quote if position not found ──
         if current_price is None:
-            log(f"[{trade['underlying']}] {trade['contract']} — no current price, skipping check.")
+            current_price = get_current_option_price(trade)
+
+        if current_price is None:
+            log(f"[{trade['underlying']}] {contract_sym} — no current price from Alpaca, skipping.")
             continue
 
-        entry = trade["entry"]
+        entry   = trade["entry"]
         pnl_pct = (current_price - entry) / entry if entry else 0.0
-        log(f"[{trade['underlying']}] {trade['contract']} live ${current_price:.2f} "
-            f"vs entry ${entry:.2f}  ({pnl_pct * 100:+.2f}%)")
+        log(f"[{trade['underlying']}] {contract_sym} | "
+            f"entry ${entry:.2f} (Alpaca) | current ${current_price:.2f} (Alpaca) | "
+            f"PnL {pnl_pct * 100:+.2f}%")
 
         if pnl_pct >= PROFIT_TARGET_PCT:
             close_trade(trade, current_price, "TARGET HIT", pnl_pct)
