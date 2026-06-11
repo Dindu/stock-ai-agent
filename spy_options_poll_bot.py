@@ -508,14 +508,31 @@ def place_paper_entry(option_contract):
 
 
 def place_paper_exit(contract_symbol):
-    """Submit a paper-account market SELL to close the position."""
-    order = MarketOrderRequest(
+    """Submit a paper SELL and poll up to 5s for the actual fill price.
+
+    Returns (order, fill_price).  fill_price is None if not filled in time.
+    Market SELL fills at the bid (not mid), so this is the real exit price.
+    """
+    order_req = MarketOrderRequest(
         symbol=contract_symbol,
         qty=POSITION_QTY,
         side=OrderSide.SELL,
         time_in_force=TimeInForce.DAY,
     )
-    return _trading_client.submit_order(order)
+    order = _trading_client.submit_order(order_req)
+
+    fill_price = None
+    for _ in range(10):
+        time.sleep(0.5)
+        try:
+            filled = _trading_client.get_order_by_id(str(order.id))
+            if filled.status.value in ("filled", "partially_filled") and filled.filled_avg_price:
+                fill_price = float(filled.filled_avg_price)
+                break
+        except Exception:
+            pass
+
+    return order, fill_price
 
 
 def open_trade_record(symbol, signal, option, score, fill_price):
@@ -582,10 +599,23 @@ def track_open_trades():
 
 
 def close_trade(trade, exit_price, reason, pnl_pct):
-    """Submit a paper exit (if enabled), Discord the result, and append to CSV."""
+    """Submit a paper exit (if enabled), Discord the result, and append to CSV.
+
+    exit_price is the mid-price trigger used to detect target/stop.  After
+    submitting the market SELL we replace it with the actual Alpaca fill price
+    so Discord and the CSV reflect what the account really received (bid-side).
+    """
     if ENABLE_ALPACA_PAPER_TRADING and _trading_client is not None:
         try:
-            place_paper_exit(trade["contract"])
+            _, fill_price = place_paper_exit(trade["contract"])
+            if fill_price is not None:
+                # Recalculate PnL using the real fill, not the mid-price estimate.
+                actual_exit = fill_price
+                actual_pnl  = (actual_exit - trade["entry"]) / trade["entry"]
+                log(f"[{trade['underlying']}] Exit fill ${actual_exit:.2f} "
+                    f"(mid was ${exit_price:.2f}, diff ${actual_exit - exit_price:+.2f})")
+                exit_price = actual_exit
+                pnl_pct    = actual_pnl
         except Exception as e:
             log(f"[{trade['underlying']}] Paper exit submit failed: {e}")
 
