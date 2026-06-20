@@ -380,8 +380,8 @@ def get_option_contract(symbol, signal, underlying_price):
             expiration_date_gte=min_exp,
             expiration_date_lte=max_exp,
             type=option_type,
-            strike_price_gte=underlying_price * 0.97,
-            strike_price_lte=underlying_price * 1.03,
+            strike_price_gte=str(round(underlying_price * 0.97, 2)),
+            strike_price_lte=str(round(underlying_price * 1.03, 2)),
             limit=50,
         )
         result = _trading_client.get_option_contracts(req)
