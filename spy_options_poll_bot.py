@@ -49,7 +49,7 @@ BAR_MINUTES = 5
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index options
 LOOKBACK_BARS = 120
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
-MIN_DTE = 1
+MIN_DTE = 2  # avoid same-day / next-day expiry — too much theta risk
 MAX_DTE = 7
 VOLUME_MULTIPLIER = 1.5
 
@@ -439,7 +439,9 @@ def get_option_contract(symbol, signal, underlying_price):
             "side":          signal,  # stored so close_trade can build the alert_key
         }
     except Exception as e:
-        print(f"[{symbol}] Option contract fetch failed: {e}", flush=True)
+        msg = f"[{symbol}] Option contract fetch failed: {type(e).__name__}: {e}"
+        print(msg, flush=True)
+        send_discord(f"⚠️ **Option fetch error** — `{symbol}`\n```{msg}```")
         return None
 
 
@@ -702,6 +704,13 @@ def try_open_paper_trade(symbol, side, option, data):
     """Open a paper trade if trading is enabled and we have capacity. Returns True if opened."""
     if not ENABLE_ALPACA_PAPER_TRADING:
         return False
+
+    # No new entries after 13:30 CT (14:30 ET) — theta decay too high on short-DTE options.
+    now_ct = datetime.now(central)
+    if now_ct.hour > 13 or (now_ct.hour == 13 and now_ct.minute >= 30):
+        log(f"[{symbol}] After 13:30 CT — no new paper trade entries (theta risk). Alert only.")
+        return False
+
     if len(_open_trades) >= MAX_OPEN_TRADES:
         log(f"[{symbol}] Paper-trade capacity full ({len(_open_trades)}/{MAX_OPEN_TRADES}) — alert only.")
         return False
