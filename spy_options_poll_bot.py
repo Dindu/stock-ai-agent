@@ -73,7 +73,7 @@ IGNITION_LOOKBACK_S = int(os.getenv("IGNITION_LOOKBACK_S", "300"))  # how far ba
 # Set to 0 to keep the bot in pure alert mode (no orders submitted, no tracking).
 ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "1"
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))
-STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.20"))
+STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.15"))
 MAX_OPEN_TRADES   = int(os.getenv("MAX_OPEN_TRADES",   "1"))
 POSITION_QTY      = int(os.getenv("POSITION_QTY",      "1"))
 TRADE_LOG_FILE    = os.getenv("TRADE_LOG_FILE", "trade_results.csv")
