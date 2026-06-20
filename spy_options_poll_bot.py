@@ -367,7 +367,7 @@ def analyze(df, client, symbol):
 def get_option_contract(symbol, signal, underlying_price):
     """Fetch the nearest 1-7 DTE ATM option contract from Alpaca (live data, no yfinance)."""
     if _option_client is None or _trading_client is None:
-        print(f"[{symbol}] Option client not initialised.", flush=True)
+        print(f"[{symbol}] Option/trading client not initialised — cannot fetch contracts.", flush=True)
         return None
     try:
         today = date.today()
@@ -852,7 +852,20 @@ def run_symbol(client, symbol):
 
     option = get_option_contract(symbol, side, data["price"])
     if not option:
-        log(f"[{symbol}] {data['signal']} setup detected, but no valid 1DTE+ option found.")
+        log(f"[{symbol}] {data['signal']} setup detected, but no valid 1DTE+ option found — sending alert-only Discord.")
+        emoji = "\U0001f7e2" if side == "CALL" else "\U0001f534"
+        breakdown = data["bull_breakdown"] if side == "CALL" else data["bear_breakdown"]
+        checklist = "\n".join(f"\u2705 {k} (+{v})" for k, v in breakdown.items()) or "(no positive components)"
+        send_discord(
+            f"\U0001f6a8 {emoji} **{symbol} {data['signal']}** _(no option contract found — alert only)_\n\n"
+            f"**{symbol}:** `{data['price']:.2f}`\n"
+            f"**Bull Score:** `{data['bull_score']}/100`   |   **Bear Score:** `{data['bear_score']}/100`\n"
+            f"**Sentiment:** `{data['sentiment']}`\n\n"
+            f"**Score Components**\n{checklist}\n\n"
+            f"**Levels**\n"
+            f"VWAP: `{data['vwap']:.2f}` | EMA20: `{data['ema20']:.2f}` | EMA50: `{data['ema50']:.2f}`\n"
+            f"PDH: `{data['pdh']:.2f}` | PDL: `{data['pdl']:.2f}`"
+        )
         return
 
     emoji = "\U0001f7e2" if side == "CALL" else "\U0001f534"
@@ -924,11 +937,13 @@ def main():
     global _trading_client, _option_client
     _option_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
     log("OptionHistoricalDataClient initialized — live Alpaca option data (no yfinance).")
+    # Always init TradingClient — needed for GetOptionContractsRequest even when paper
+    # trading is disabled.  Order submission is gated separately by ENABLE_ALPACA_PAPER_TRADING.
+    _trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
     if ENABLE_ALPACA_PAPER_TRADING:
-        _trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
         log("Paper trading ENABLED — Alpaca paper TradingClient initialized.")
     else:
-        log("Paper trading DISABLED — alerts only, no orders will be submitted.")
+        log("Paper trading DISABLED — alerts only, no orders will be submitted (TradingClient used for option contract lookup only).")
 
     log(f"Options Alert Bot started. Symbols={','.join(SYMBOLS)} "
         f"Polling every {POLL_SECONDS}s. Feed={FEED}.")
