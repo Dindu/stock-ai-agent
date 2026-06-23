@@ -423,18 +423,45 @@ def get_option_contract(symbol, signal, underlying_price):
         # Fetch live bid/ask/last/volume via a single Alpaca snapshot call.
         snap_req = OptionSnapshotRequest(symbol_or_symbols=contract_sym)
         snaps = _option_client.get_option_snapshot(snap_req)
-        snap = snaps.get(contract_sym)
+        snap = snaps.get(contract_sym) if isinstance(snaps, dict) else snaps
 
-        bid = ask = last = vol = oi = 0
+        def _safe_float(v, default=0.0):
+            try:
+                return float(v)
+            except Exception:
+                return default
+
+        def _safe_int(v, default=0):
+            try:
+                return int(float(v))
+            except Exception:
+                return default
+
+        bid = ask = last = 0.0
+        vol = oi = 0
         if snap:
-            if snap.latest_quote:
-                bid = float(snap.latest_quote.bid_price or 0)
-                ask = float(snap.latest_quote.ask_price or 0)
-            if snap.latest_trade:
-                last = float(snap.latest_trade.price or 0)
-            if snap.day:
-                vol = int(snap.day.volume or 0)
-            oi = int(float(snap.open_interest or 0))
+            q = getattr(snap, "latest_quote", None) or getattr(snap, "quote", None)
+            t = getattr(snap, "latest_trade", None) or getattr(snap, "trade", None)
+            bar = (
+                getattr(snap, "daily_bar", None)
+                or getattr(snap, "day_bar", None)
+                or getattr(snap, "day", None)
+            )
+
+            if q is not None:
+                bid = _safe_float(getattr(q, "bid_price", 0.0), 0.0)
+                ask = _safe_float(getattr(q, "ask_price", 0.0), 0.0)
+            if t is not None:
+                last = _safe_float(getattr(t, "price", 0.0), 0.0)
+            if bar is not None:
+                vol = _safe_int(getattr(bar, "volume", 0), 0)
+
+            oi = _safe_int(
+                getattr(snap, "open_interest", None)
+                or getattr(snap, "openInterest", None)
+                or 0,
+                0,
+            )
 
         dte = (exp_date - today).days
         return {
