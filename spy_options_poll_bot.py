@@ -49,7 +49,7 @@ BAR_MINUTES = 5
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index options
 LOOKBACK_BARS = 120
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
-MIN_DTE = 2  # avoid same-day / next-day expiry — too much theta risk
+MIN_DTE = 1  # include next-day expiry; theta risk is acceptable for strong signals
 MAX_DTE = 7
 VOLUME_MULTIPLIER = 1.5
 
@@ -380,8 +380,8 @@ def get_option_contract(symbol, signal, underlying_price):
             expiration_date_gte=min_exp,
             expiration_date_lte=max_exp,
             type=option_type,
-            strike_price_gte=str(round(underlying_price * 0.97, 2)),
-            strike_price_lte=str(round(underlying_price * 1.03, 2)),
+            strike_price_gte=str(round(underlying_price * 0.95, 2)),
+            strike_price_lte=str(round(underlying_price * 1.05, 2)),
             limit=50,
         )
         result = _trading_client.get_option_contracts(req)
@@ -398,16 +398,27 @@ def get_option_contract(symbol, signal, underlying_price):
             print(f"[{symbol}] No option contracts found ({option_type}, {min_exp}–{max_exp}).", flush=True)
             return None
 
+        print(f"[{symbol}] {len(contracts)} contract(s) returned by Alpaca for {option_type} {min_exp}–{max_exp}.", flush=True)
+
+        def _exp_date(c):
+            """Normalise expiration_date to a date object regardless of what Alpaca returns."""
+            d = c.expiration_date
+            if hasattr(d, "date"):          # datetime → date
+                return d.date()
+            return d                        # already a date
+
         # Nearest expiry first, then closest strike.
         contracts = sorted(
             contracts,
             key=lambda c: (
-                (c.expiration_date - today).days,
+                (_exp_date(c) - today).days,
                 abs(float(c.strike_price) - underlying_price),
             ),
         )
         best = contracts[0]
         contract_sym = best.symbol
+        exp_date = _exp_date(best)
+        print(f"[{symbol}] Best contract: {contract_sym}  strike={best.strike_price}  expiry={exp_date}", flush=True)
 
         # Fetch live bid/ask/last/volume via a single Alpaca snapshot call.
         snap_req = OptionSnapshotRequest(symbol_or_symbols=contract_sym)
@@ -425,10 +436,10 @@ def get_option_contract(symbol, signal, underlying_price):
                 vol = int(snap.day.volume or 0)
             oi = int(float(snap.open_interest or 0))
 
-        dte = (best.expiration_date - today).days
+        dte = (exp_date - today).days
         return {
             "contract":      contract_sym,
-            "expiry":        best.expiration_date.strftime("%Y-%m-%d"),
+            "expiry":        exp_date.strftime("%Y-%m-%d"),
             "dte":           dte,
             "strike":        float(best.strike_price),
             "bid":           bid,
