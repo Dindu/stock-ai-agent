@@ -70,6 +70,17 @@ IGNITION_MIN_DELTA  = int(os.getenv("IGNITION_MIN_DELTA",  "25"))  # Raised: req
 IGNITION_PRIOR_MAX  = int(os.getenv("IGNITION_PRIOR_MAX",  "50"))  # Tightened: only fire when move starts from a neutral base
 IGNITION_LOOKBACK_S = int(os.getenv("IGNITION_LOOKBACK_S", "300"))  # how far back to compare (default 5 min)
 
+# RSI exhaustion filter: don't buy CALLs when RSI is overbought or PUTs when oversold.
+# Set RSI_FILTER=0 to disable.
+RSI_FILTER         = os.getenv("RSI_FILTER", "1") == "1"
+RSI_OVERBOUGHT     = int(os.getenv("RSI_OVERBOUGHT", "70"))  # block CALL entries above this
+RSI_OVERSOLD       = int(os.getenv("RSI_OVERSOLD",   "30"))  # block PUT entries below this
+
+# Macro alignment: for non-SPY symbols, only take CALL when SPY is above its VWAP,
+# only take PUT when SPY is below its VWAP.  Prevents counter-trend entries.
+# Set SPY_MACRO_ALIGN=0 to disable.
+SPY_MACRO_ALIGN    = os.getenv("SPY_MACRO_ALIGN", "1") == "1"
+
 # Paper-trading execution. When ENABLE_ALPACA_PAPER_TRADING=1 the bot will
 # submit a paper-account market BUY when a STRONG signal fires, then poll the
 # option price each cycle and submit a paper-account market SELL at +20% / -20%.
@@ -111,6 +122,8 @@ _option_client: "OptionHistoricalDataClient | None" = None
 _alert_cooldowns: "dict[tuple, datetime]" = {}
 # Authorized gspread Spreadsheet object (None if not configured / failed).
 _gsheet: "gspread.Spreadsheet | None" = None
+# Last known SPY VWAP side: 'bull', 'bear', or None (populated by run_symbol each cycle).
+_spy_vwap_cache: "dict" = {"side": None, "updated_at": None}
 
 # Column headers for the two Google Sheets tabs.
 _ALERTS_HEADERS = [
@@ -298,6 +311,15 @@ def market_open_now():
     return start <= now <= end
 
 
+def _spy_vwap_side():
+    """Return the current SPY macro side: 'bull' if SPY > VWAP, 'bear' if SPY < VWAP.
+
+    Uses the cached value written by run_symbol('SPY', ...) each cycle.
+    Returns None if SPY hasn't been evaluated yet this cycle.
+    """
+    return _spy_vwap_cache.get("side")
+
+
 def get_previous_day_levels(client, symbol):
     """Return previous trading day's high/low for ``symbol`` using Alpaca daily bars.
 
@@ -338,11 +360,23 @@ def get_previous_day_levels(client, symbol):
     return pdh, pdl
 
 
+def calculate_rsi(series, period=14):
+    """Wilder RSI on a price series."""
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    return 100 - (100 / (1 + rs))
+
+
 def calculate_indicators(df):
     df = df.copy()
     df["EMA20"] = df["close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["close"].ewm(span=50, adjust=False).mean()
     df["VOL_AVG"] = df["volume"].rolling(20).mean()
+    df["RSI14"] = calculate_rsi(df["close"], period=14)
 
     typical = (df["high"] + df["low"] + df["close"]) / 3
 
@@ -395,6 +429,8 @@ def analyze(df, client, symbol):
 
     if pd.isna(vol_avg):
         return "NO TRADE", None
+
+    rsi = float(latest["RSI14"]) if not pd.isna(latest["RSI14"]) else 50.0
 
     # EMA20 slope: compare current EMA20 to EMA20 a few bars back.
     ema20_back = float(df["EMA20"].iloc[-5]) if len(df) >= 5 else float(df["EMA20"].iloc[0])
@@ -510,6 +546,7 @@ def analyze(df, client, symbol):
         "vwap": vwap,
         "ema20": ema20,
         "ema50": ema50,
+        "rsi": rsi,
         "volume": volume,
         "vol_avg": vol_avg,
         "pdh": pdh,
@@ -1020,6 +1057,10 @@ def run_symbol(client, symbol):
             f"[{symbol}] {data['price']:.2f} | {data['signal']} | "
             f"BULL {data['bull_score']} BEAR {data['bear_score']} ({data['sentiment']}){trend_5m}"
         )
+        # Keep SPY VWAP macro cache fresh for the alignment filter used by QQQ/IWM.
+        if symbol == "SPY":
+            _spy_vwap_cache["side"] = "bull" if data["price"] > data["vwap"] else "bear"
+            _spy_vwap_cache["updated_at"] = datetime.now(central)
 
     if side == "NO TRADE":
         return
@@ -1078,6 +1119,31 @@ def run_symbol(client, symbol):
             f"[{symbol}] \U0001f680 Ignition confirmed: {side} score {past_score} \u2192 {now_score} "
             f"(\u0394 +{delta}) over last {IGNITION_LOOKBACK_S}s."
         )
+
+    # ── RSI exhaustion filter ─────────────────────────────────────────────────
+    # Don't enter CALLs when RSI is already overbought (move likely exhausted),
+    # or PUTs when RSI is already oversold.
+    if RSI_FILTER:
+        rsi = data.get("rsi", 50.0)
+        if side == "CALL" and rsi >= RSI_OVERBOUGHT:
+            log(f"[{symbol}] RSI filter: CALL blocked — RSI {rsi:.1f} >= {RSI_OVERBOUGHT} (overbought, late entry).")
+            return
+        if side == "PUT" and rsi <= RSI_OVERSOLD:
+            log(f"[{symbol}] RSI filter: PUT blocked — RSI {rsi:.1f} <= {RSI_OVERSOLD} (oversold, late entry).")
+            return
+
+    # ── Macro alignment filter ────────────────────────────────────────────────
+    # For non-SPY symbols, only take a CALL when SPY is above its own VWAP
+    # (bull macro), and only take a PUT when SPY is below its VWAP (bear macro).
+    # This prevents counter-trend IWM/QQQ entries against the broader market.
+    if SPY_MACRO_ALIGN and symbol != "SPY" and "SPY" in SYMBOLS:
+        spy_vwap_side = _spy_vwap_side()
+        if side == "CALL" and spy_vwap_side != "bull":
+            log(f"[{symbol}] Macro filter: CALL blocked — SPY is not above its VWAP (spy_side={spy_vwap_side}).")
+            return
+        if side == "PUT" and spy_vwap_side != "bear":
+            log(f"[{symbol}] Macro filter: PUT blocked — SPY is not below its VWAP (spy_side={spy_vwap_side}).")
+            return
 
     # Lock this (symbol, side) NOW — before the option fetch — so a failed or
     # rate-limited fetch doesn't cause ignition to re-fire every 30 seconds.
