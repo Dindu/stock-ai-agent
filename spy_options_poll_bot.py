@@ -108,8 +108,10 @@ TRADE_LOG_FILE    = os.getenv("TRADE_LOG_FILE", "trade_results.csv")
 
 # Google Sheets tracking — bot creates/finds a spreadsheet by name automatically.
 GOOGLE_SPREADSHEET_NAME   = os.getenv("GOOGLE_SPREADSHEET_NAME", "SPY Options Bot Log")
+GOOGLE_SPREADSHEET_ID     = os.getenv("GOOGLE_SPREADSHEET_ID", "")  # paste sheet ID from URL to use existing sheet
 GOOGLE_SERVICE_ACCOUNT_EMAIL = os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL", "")
 GOOGLE_PRIVATE_KEY        = os.getenv("GOOGLE_PRIVATE_KEY", "").replace("\\n", "\n")
+OWNER_EMAIL               = os.getenv("OWNER_EMAIL", "")  # your Gmail — sheet is shared to this on startup
 
 # Per-symbol score-trend history (one reading per cycle).
 # At POLL_SECONDS=30s, capacity 24 = 12 minutes of history.
@@ -182,17 +184,30 @@ def init_google_sheets():
         )
         gc = gspread.authorize(creds)
 
-        # Find existing spreadsheet by name, or create a new one.
-        try:
-            _gsheet = gc.open(GOOGLE_SPREADSHEET_NAME)
-            log(f"Opened existing Google Sheet: '{GOOGLE_SPREADSHEET_NAME}'")
-        except gspread.exceptions.SpreadsheetNotFound:
-            _gsheet = gc.create(GOOGLE_SPREADSHEET_NAME)
-            # Make it accessible to anyone with the link (read+write).
-            _gsheet.share(None, perm_type="anyone", role="writer")
-            log(f"✅ Created new Google Sheet: '{GOOGLE_SPREADSHEET_NAME}'")
+        # Open by ID (existing sheet) if provided, otherwise find/create by name.
+        if GOOGLE_SPREADSHEET_ID:
+            _gsheet = gc.open_by_key(GOOGLE_SPREADSHEET_ID)
+            log(f"Opened existing Google Sheet by ID: '{_gsheet.title}'")
+        else:
+            # Find existing spreadsheet by name, or create a new one.
+            try:
+                _gsheet = gc.open(GOOGLE_SPREADSHEET_NAME)
+                log(f"Opened existing Google Sheet: '{GOOGLE_SPREADSHEET_NAME}'")
+            except gspread.exceptions.SpreadsheetNotFound:
+                _gsheet = gc.create(GOOGLE_SPREADSHEET_NAME)
+                # Make it accessible to anyone with the link (read+write).
+                _gsheet.share(None, perm_type="anyone", role="writer")
+                log(f"✅ Created new Google Sheet: '{GOOGLE_SPREADSHEET_NAME}'")
 
         log(f"🔗 Sheet URL: https://docs.google.com/spreadsheets/d/{_gsheet.id}")
+
+        # Share to owner's personal Google account so it shows up in their Sheets.
+        if OWNER_EMAIL:
+            try:
+                _gsheet.share(OWNER_EMAIL, perm_type="user", role="writer", notify=False)
+                log(f"Sheet shared to {OWNER_EMAIL}")
+            except Exception as share_err:
+                log(f"Could not share sheet to {OWNER_EMAIL}: {share_err}")
 
         # Ensure Alerts tab exists with headers.
         try:
