@@ -52,8 +52,8 @@ BAR_MINUTES = 5
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index options
 LOOKBACK_BARS = 120
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
-MIN_DTE = 2  # 2DTE minimum — 1DTE has extreme theta decay that burns value before stop can fire
-MAX_DTE = 7
+MIN_DTE = 0  # 0DTE — SPY/QQQ/IWM have daily expirations with tight spreads; high gamma amplifies momentum moves
+MAX_DTE = 1  # Cap at 1DTE so we stay in high-gamma territory; spread guard filters illiquid contracts
 VOLUME_MULTIPLIER = 1.5
 
 # Scoring thresholds (0-100)
@@ -966,10 +966,10 @@ def try_open_paper_trade(symbol, side, option, data):
     if not ENABLE_ALPACA_PAPER_TRADING:
         return False
 
-    # No new entries after 13:30 CT (14:30 ET) — theta decay too high on short-DTE options.
+    # No new entries after 13:00 CT (14:00 ET) — on 0DTE need at least 55 min before 14:55 close.
     now_ct = datetime.now(central)
-    if now_ct.hour > 13 or (now_ct.hour == 13 and now_ct.minute >= 30):
-        log(f"[{symbol}] After 13:30 CT — no new paper trade entries (theta risk). Alert only.")
+    if now_ct.hour > 13 or (now_ct.hour == 13 and now_ct.minute >= 0):
+        log(f"[{symbol}] After 13:00 CT — no new paper trade entries (0DTE theta risk). Alert only.")
         return False
 
     if len(_open_trades) >= MAX_OPEN_TRADES:
