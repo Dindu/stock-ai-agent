@@ -1088,12 +1088,6 @@ def try_open_paper_trade(symbol, side, option, data):
     if not ENABLE_ALPACA_PAPER_TRADING:
         return False
 
-    # No new entries after 13:30 CT (14:30 ET) — avoid late-day decay/slippage.
-    now_ct = datetime.now(central)
-    if now_ct.hour > 13 or (now_ct.hour == 13 and now_ct.minute >= 30):
-        log(f"[{symbol}] After 13:30 CT — no new paper trade entries (late-day risk). Alert only.")
-        return False
-
     if len(_open_trades) >= MAX_OPEN_TRADES:
         log(f"[{symbol}] Paper-trade capacity full ({len(_open_trades)}/{MAX_OPEN_TRADES}) — alert only.")
         return False
