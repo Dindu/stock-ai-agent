@@ -658,8 +658,8 @@ def get_option_contract(symbol, signal, underlying_price):
 def fetch_bars(client, symbol):
     """Pull the most recent ~LOOKBACK_BARS 5-minute bars for ``symbol`` from Alpaca."""
     end = datetime.now(timezone.utc)
-    # 2 days back is plenty of buffer for ~120 5-min bars + overnight gap.
-    start = end - timedelta(days=2)
+    # 5 days back so a Monday start always captures the previous Friday's bars.
+    start = end - timedelta(days=5)
 
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
