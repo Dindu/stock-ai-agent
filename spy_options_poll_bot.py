@@ -13,6 +13,7 @@ import os
 import sys
 import time
 import traceback
+import uuid
 from collections import deque
 from datetime import datetime, date, timedelta, timezone
 
@@ -152,10 +153,9 @@ _ALERTS_HEADERS = [
     "Bar Volume", "Bar Vol Avg",
 ]
 _TRADES_HEADERS = [
-    "Opened At", "Closed At", "Duration (min)",
-    "Symbol", "Contract", "Signal", "Strike", "Expiry", "Qty",
-    "Entry ($)", "Target ($)", "Stop ($)",
-    "Exit ($)", "PnL (%)", "PnL ($)", "Max PnL (%)", "Reason", "Score", "Status",
+    "Trade ID", "Symbol", "Entry Price", "Exit Price", "Strike", "Direction",
+    "Entry Time", "Exit Time", "Exit Reason", "Status", "Options Expiration",
+    "Alpaca Order ID", "P&L", "P&L %", "Duration", "Created At", "Updated At",
 ]
 
 
@@ -219,11 +219,19 @@ def init_google_sheets():
 
         # Ensure Trades tab exists with headers.
         try:
-            _gsheet.worksheet("Trades")
+            trades_ws = _gsheet.worksheet("Trades")
         except gspread.exceptions.WorksheetNotFound:
-            ws = _gsheet.add_worksheet(title="Trades", rows=2000, cols=len(_TRADES_HEADERS))
-            ws.append_row(_TRADES_HEADERS, value_input_option="USER_ENTERED")
+            trades_ws = _gsheet.add_worksheet(title="Trades", rows=2000, cols=len(_TRADES_HEADERS))
+            trades_ws.append_row(_TRADES_HEADERS, value_input_option="USER_ENTERED")
             log("Created 'Trades' tab in Google Sheets.")
+        
+        # Protect header row (row 1) so it cannot be edited.
+        try:
+            trades_ws = _gsheet.worksheet("Trades")
+            trades_ws.protect_range("A1:Q1", editor_users_can_edit=False, warning_only=False)
+            log("Protected Trades header row (cannot be edited).")
+        except Exception as protect_err:
+            log(f"Warning: Could not protect header row: {protect_err}")
 
     except Exception as e:
         log(f"Google Sheets init failed: {e} — sheet logging disabled.")
@@ -284,34 +292,34 @@ def log_trade_open_to_sheets(trade):
     if _gsheet is None:
         return
     try:
+        trade_id = str(uuid.uuid4())[:8].upper()
+        trade["trade_id"] = trade_id
         opened = trade["opened_at"]
-        qty = int(trade.get("qty", max(BASE_POSITION_QTY, MIN_POSITION_QTY)))
+        
         sheet_row = [
-            opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),
-            "",  # Closed At
-            "",  # Duration
-            trade["underlying"],
-            trade["contract"],
-            trade["signal"],
-            trade.get("strike", ""),
-            trade.get("expiry", ""),
-            qty,
-            round(trade["entry"],  4),
-            round(trade["target"], 4),
-            round(trade["stop"],   4),
-            "",  # Exit
-            "",  # PnL %
-            "",  # PnL $
-            "",  # Max PnL %
-            "",  # Reason
-            trade["score"],
-            "OPEN",
+            trade_id,                                           # Trade ID
+            trade["underlying"],                                # Symbol
+            round(trade["entry"], 4),                           # Entry Price
+            "",                                                 # Exit Price
+            trade.get("strike", ""),                            # Strike
+            trade["signal"],                                    # Direction (CALL/PUT)
+            opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),  # Entry Time
+            "",                                                 # Exit Time
+            "",                                                 # Exit Reason
+            "OPEN",                                             # Status
+            trade.get("expiry", ""),                            # Options Expiration
+            trade.get("order_id", ""),                          # Alpaca Order ID
+            "",                                                 # P&L ($)
+            "",                                                 # P&L %
+            "",                                                 # Duration
+            opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),  # Created At
+            opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),  # Updated At
         ]
         ws = _gsheet.worksheet("Trades")
         ws.append_row(sheet_row, value_input_option="USER_ENTERED")
         # Store the row index so close can update it in-place.
         trade["sheets_row"] = len(ws.get_all_values())
-        log(f"[{trade['underlying']}] Trade opened → Google Sheets row {trade['sheets_row']}.")
+        log(f"[{trade['underlying']}] Trade {trade_id} opened → Google Sheets row {trade['sheets_row']}.")
     except Exception as e:
         log(f"[{trade['underlying']}] Google Sheets open log failed: {e}")
 
@@ -328,41 +336,40 @@ def log_trade_to_sheets(row, trade):
             if isinstance(opened, datetime) and isinstance(closed, datetime)
             else ""
         )
-        qty = int(row.get("qty", max(BASE_POSITION_QTY, MIN_POSITION_QTY)))
-        pnl_dollar = round((row["exit"] - row["entry"]) * 100 * qty, 2)
-        max_pnl = round(float(trade.get("max_pnl_pct", 0.0)) * 100, 2)
+        pnl_dollar = round((row["exit"] - row["entry"]) * 100, 2)
+        pnl_pct = round(row["pnl_pct"], 2)
+        trade_id = trade.get("trade_id", "")
+        now = datetime.now(central).strftime("%Y-%m-%d %H:%M:%S")
 
         full_row = [
-            opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),
-            closed.strftime("%Y-%m-%d %H:%M:%S") if isinstance(closed, datetime) else str(closed),
-            duration,
-            row["underlying"],
-            row["contract"],
-            row["signal"],
-            trade.get("strike", ""),
-            trade.get("expiry", ""),
-            qty,
-            round(row["entry"],  4),
-            round(trade.get("target", 0), 4),
-            round(trade.get("stop",   0), 4),
-            round(row["exit"],   4),
-            round(row["pnl_pct"], 2),
-            pnl_dollar,
-            max_pnl,
-            row["reason"],
-            row["score"],
-            "CLOSED",
+            trade_id,                                           # Trade ID
+            row["underlying"],                                  # Symbol
+            round(row["entry"], 4),                             # Entry Price
+            round(row["exit"],  4),                             # Exit Price
+            trade.get("strike", ""),                            # Strike
+            row["signal"],                                      # Direction (CALL/PUT)
+            opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),  # Entry Time
+            closed.strftime("%Y-%m-%d %H:%M:%S") if isinstance(closed, datetime) else str(closed),  # Exit Time
+            row["reason"],                                      # Exit Reason
+            "CLOSED",                                           # Status
+            trade.get("expiry", ""),                            # Options Expiration
+            trade.get("order_id", ""),                          # Alpaca Order ID
+            pnl_dollar,                                         # P&L ($)
+            pnl_pct,                                            # P&L %
+            duration,                                           # Duration (min)
+            opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),  # Created At
+            now,                                                # Updated At
         ]
 
         ws = _gsheet.worksheet("Trades")
         sheets_row = trade.get("sheets_row")
         if sheets_row:
             ws.update(f"A{sheets_row}", [full_row], value_input_option="USER_ENTERED")
-            log(f"[{row['underlying']}] Trade closed → Google Sheets row {sheets_row} updated.")
+            log(f"[{trade_id}] Trade closed → Google Sheets row {sheets_row} updated.")
         else:
             # Fallback: no open-row was stored, just append.
             ws.append_row(full_row, value_input_option="USER_ENTERED")
-            log(f"[{row['underlying']}] Trade closed → Google Sheets appended (no open row ref).")
+            log(f"[{trade_id}] Trade closed → Google Sheets appended (no open row ref).")
     except Exception as e:
         log(f"[{row['underlying']}] Google Sheets trade close update failed: {e}")
 
