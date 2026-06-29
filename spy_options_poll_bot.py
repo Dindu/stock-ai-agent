@@ -152,7 +152,8 @@ _ALERTS_HEADERS = [
 _TRADES_HEADERS = [
     "Opened At", "Closed At", "Duration (min)",
     "Symbol", "Contract", "Signal", "Strike", "Expiry", "Qty",
-    "Entry ($)", "Exit ($)", "PnL (%)", "PnL ($)", "Reason", "Score",
+    "Entry ($)", "Target ($)", "Stop ($)",
+    "Exit ($)", "PnL (%)", "PnL ($)", "Max PnL (%)", "Reason", "Score", "Status",
 ]
 
 
@@ -263,8 +264,45 @@ def log_alert_to_sheets(symbol, data, option):
         log(f"[{symbol}] Google Sheets alert log failed: {e}")
 
 
+def log_trade_open_to_sheets(trade):
+    """Write a row to the Trades tab the moment a paper trade opens."""
+    if _gsheet is None:
+        return
+    try:
+        opened = trade["opened_at"]
+        qty = int(trade.get("qty", max(BASE_POSITION_QTY, MIN_POSITION_QTY)))
+        sheet_row = [
+            opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),
+            "",  # Closed At
+            "",  # Duration
+            trade["underlying"],
+            trade["contract"],
+            trade["signal"],
+            trade.get("strike", ""),
+            trade.get("expiry", ""),
+            qty,
+            round(trade["entry"],  4),
+            round(trade["target"], 4),
+            round(trade["stop"],   4),
+            "",  # Exit
+            "",  # PnL %
+            "",  # PnL $
+            "",  # Max PnL %
+            "",  # Reason
+            trade["score"],
+            "OPEN",
+        ]
+        ws = _gsheet.worksheet("Trades")
+        ws.append_row(sheet_row, value_input_option="USER_ENTERED")
+        # Store the row index so close can update it in-place.
+        trade["sheets_row"] = len(ws.get_all_values())
+        log(f"[{trade['underlying']}] Trade opened → Google Sheets row {trade['sheets_row']}.")
+    except Exception as e:
+        log(f"[{trade['underlying']}] Google Sheets open log failed: {e}")
+
+
 def log_trade_to_sheets(row, trade):
-    """Append one row to the Trades tab when a paper trade closes."""
+    """Update the existing Trades row (written at open) with exit details."""
     if _gsheet is None:
         return
     try:
@@ -277,8 +315,9 @@ def log_trade_to_sheets(row, trade):
         )
         qty = int(row.get("qty", max(BASE_POSITION_QTY, MIN_POSITION_QTY)))
         pnl_dollar = round((row["exit"] - row["entry"]) * 100 * qty, 2)
+        max_pnl = round(float(trade.get("max_pnl_pct", 0.0)) * 100, 2)
 
-        sheet_row = [
+        full_row = [
             opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),
             closed.strftime("%Y-%m-%d %H:%M:%S") if isinstance(closed, datetime) else str(closed),
             duration,
@@ -288,17 +327,29 @@ def log_trade_to_sheets(row, trade):
             trade.get("strike", ""),
             trade.get("expiry", ""),
             qty,
-            round(row["entry"],   4),
-            round(row["exit"],    4),
+            round(row["entry"],  4),
+            round(trade.get("target", 0), 4),
+            round(trade.get("stop",   0), 4),
+            round(row["exit"],   4),
             round(row["pnl_pct"], 2),
             pnl_dollar,
+            max_pnl,
             row["reason"],
             row["score"],
+            "CLOSED",
         ]
-        _gsheet.worksheet("Trades").append_row(sheet_row, value_input_option="USER_ENTERED")
-        log(f"[{row['underlying']}] Trade logged to Google Sheets.")
+
+        ws = _gsheet.worksheet("Trades")
+        sheets_row = trade.get("sheets_row")
+        if sheets_row:
+            ws.update(f"A{sheets_row}", [full_row], value_input_option="USER_ENTERED")
+            log(f"[{row['underlying']}] Trade closed → Google Sheets row {sheets_row} updated.")
+        else:
+            # Fallback: no open-row was stored, just append.
+            ws.append_row(full_row, value_input_option="USER_ENTERED")
+            log(f"[{row['underlying']}] Trade closed → Google Sheets appended (no open row ref).")
     except Exception as e:
-        log(f"Google Sheets trade log failed: {e}")
+        log(f"[{row['underlying']}] Google Sheets trade close update failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1045,6 +1096,7 @@ def try_open_paper_trade(symbol, side, option, data):
 
     trade = open_trade_record(symbol, signal_label, option, score, fill_price, qty)
     _open_trades[trade["contract"]] = trade
+    log_trade_open_to_sheets(trade)
 
     send_discord(
         f"💰 **{symbol} {signal_label} — PAPER TRADE OPENED**\n\n"
