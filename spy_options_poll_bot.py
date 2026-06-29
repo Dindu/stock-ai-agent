@@ -52,7 +52,7 @@ BAR_MINUTES = 5
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index options
 LOOKBACK_BARS = 120
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
-MIN_DTE = 1  # include next-day expiry; theta risk is acceptable for strong signals
+MIN_DTE = 2  # 2DTE minimum — 1DTE has extreme theta decay that burns value before stop can fire
 MAX_DTE = 7
 VOLUME_MULTIPLIER = 1.5
 
@@ -66,8 +66,8 @@ SCORE_DOMINANCE = int(os.getenv("SCORE_DOMINANCE", "20"))  # bull must lead bear
 # CALL example: 5 minutes ago BULL was below IGNITION_PRIOR_MAX, now it has gained at least IGNITION_MIN_DELTA.
 # Set IGNITION_REQUIRED=0 in env to disable and revert to absolute-score-only firing.
 IGNITION_REQUIRED   = os.getenv("IGNITION_REQUIRED", "1") == "1"
-IGNITION_MIN_DELTA  = int(os.getenv("IGNITION_MIN_DELTA",  "20"))  # BULL/BEAR must have risen at least this much in 5 min
-IGNITION_PRIOR_MAX  = int(os.getenv("IGNITION_PRIOR_MAX",  "65"))  # 5 min ago BULL/BEAR must have been below this
+IGNITION_MIN_DELTA  = int(os.getenv("IGNITION_MIN_DELTA",  "25"))  # Raised: require a stronger burst to confirm real ignition
+IGNITION_PRIOR_MAX  = int(os.getenv("IGNITION_PRIOR_MAX",  "50"))  # Tightened: only fire when move starts from a neutral base
 IGNITION_LOOKBACK_S = int(os.getenv("IGNITION_LOOKBACK_S", "300"))  # how far back to compare (default 5 min)
 
 # Paper-trading execution. When ENABLE_ALPACA_PAPER_TRADING=1 the bot will
@@ -75,8 +75,8 @@ IGNITION_LOOKBACK_S = int(os.getenv("IGNITION_LOOKBACK_S", "300"))  # how far ba
 # option price each cycle and submit a paper-account market SELL at +20% / -20%.
 # Set to 0 to keep the bot in pure alert mode (no orders submitted, no tracking).
 ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "1"
-PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))
-STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.15"))
+PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.30"))  # 30% target — needs room to overcome spread costs
+STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.12"))  # 12% stop → 2.5:1 R:R
 MAX_OPEN_TRADES   = int(os.getenv("MAX_OPEN_TRADES",   "1"))
 POSITION_QTY      = int(os.getenv("POSITION_QTY",      "1"))
 TRADE_LOG_FILE    = os.getenv("TRADE_LOG_FILE", "trade_results.csv")
@@ -633,6 +633,21 @@ def get_option_contract(symbol, signal, underlying_price):
             )
 
         dte = (exp_date - today).days
+
+        # ── Quality filters — skip contracts with terrible economics ──────────
+        MIN_BID      = 0.15   # pennies below this have giant spreads relative to value
+        MAX_SPREAD_PCT = 0.30  # (ask-bid)/mid > 30% means market-order round-trip eats the trade
+
+        if bid < MIN_BID:
+            print(f"[{symbol}] Contract {contract_sym} rejected — bid ${bid:.2f} < ${MIN_BID:.2f} minimum.", flush=True)
+            return None
+
+        mid = (bid + ask) / 2 if (bid + ask) > 0 else 0.01
+        spread_pct = (ask - bid) / mid
+        if spread_pct > MAX_SPREAD_PCT:
+            print(f"[{symbol}] Contract {contract_sym} rejected — spread {spread_pct*100:.1f}% > {MAX_SPREAD_PCT*100:.0f}% max.", flush=True)
+            return None
+
         return {
             "contract":      contract_sym,
             "expiry":        exp_date.strftime("%Y-%m-%d"),
