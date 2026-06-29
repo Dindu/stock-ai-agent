@@ -4,3 +4,5 @@ yfinance
 alpaca-py
 pandas
 pytz
+gspread
+google-auth
