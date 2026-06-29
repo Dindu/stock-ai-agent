@@ -81,6 +81,12 @@ RSI_OVERSOLD       = int(os.getenv("RSI_OVERSOLD",   "30"))  # block PUT entries
 # Set SPY_MACRO_ALIGN=0 to disable.
 SPY_MACRO_ALIGN    = os.getenv("SPY_MACRO_ALIGN", "1") == "1"
 
+# Anti-chase entry filters: avoid entering when price is too stretched from VWAP,
+# or when the latest candle already flipped against the intended side.
+ANTI_CHASE_FILTER  = os.getenv("ANTI_CHASE_FILTER", "1") == "1"
+MAX_EXT_FROM_VWAP  = float(os.getenv("MAX_EXT_FROM_VWAP", "0.012"))  # 1.2%
+CANDLE_CONFIRMATION = os.getenv("CANDLE_CONFIRMATION", "1") == "1"
+
 # Paper-trading execution. When ENABLE_ALPACA_PAPER_TRADING=1 the bot will
 # submit a paper-account market BUY when a STRONG signal fires, then poll the
 # option price each cycle and submit a paper-account market SELL at +20% / -20%.
@@ -560,6 +566,7 @@ def analyze(df, client, symbol):
 
     data = {
         "price": price,
+        "open": open_,
         "vwap": vwap,
         "ema20": ema20,
         "ema50": ema50,
@@ -572,6 +579,9 @@ def analyze(df, client, symbol):
         "recent_low": recent_low,
         "vwap_distance_now": vwap_distance_now,
         "vwap_distance_prev": vwap_distance_prev,
+        "vwap_extension_pct": (abs(vwap_distance_now) / vwap) if vwap else 0.0,
+        "bullish_candle": bullish_candle,
+        "bearish_candle": bearish_candle,
         "bull_score": bull_score,
         "bear_score": bear_score,
         "bull_breakdown": bull_breakdown,
@@ -1166,6 +1176,26 @@ def run_symbol(client, symbol):
             return
         if side == "PUT" and spy_vwap_side != "bear":
             log(f"[{symbol}] Macro filter: PUT blocked — SPY is not below its VWAP (spy_side={spy_vwap_side}).")
+            return
+
+    # ── Anti-chase filters ───────────────────────────────────────────────────
+    # Avoid buying when price is already too extended away from VWAP, and avoid
+    # entering when the latest candle already flipped against our side.
+    if ANTI_CHASE_FILTER:
+        ext_pct = float(data.get("vwap_extension_pct", 0.0))
+        if ext_pct > MAX_EXT_FROM_VWAP:
+            log(
+                f"[{symbol}] Anti-chase: {side} blocked — price is {ext_pct*100:.2f}% from VWAP "
+                f"(max {MAX_EXT_FROM_VWAP*100:.2f}%)."
+            )
+            return
+
+    if CANDLE_CONFIRMATION:
+        if side == "CALL" and not data.get("bullish_candle", False):
+            log(f"[{symbol}] Candle filter: CALL blocked — latest candle is not bullish.")
+            return
+        if side == "PUT" and not data.get("bearish_candle", False):
+            log(f"[{symbol}] Candle filter: PUT blocked — latest candle is not bearish.")
             return
 
     # Lock this (symbol, side) NOW — before the option fetch — so a failed or
