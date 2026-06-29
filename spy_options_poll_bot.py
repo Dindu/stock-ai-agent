@@ -52,8 +52,8 @@ BAR_MINUTES = 5
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index options
 LOOKBACK_BARS = 120
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
-MIN_DTE = 0  # 0DTE — SPY/QQQ/IWM have daily expirations with tight spreads; high gamma amplifies momentum moves
-MAX_DTE = 1  # Cap at 1DTE so we stay in high-gamma territory; spread guard filters illiquid contracts
+MIN_DTE = 1  # Force 1DTE only
+MAX_DTE = 1  # Force 1DTE only
 VOLUME_MULTIPLIER = 1.5
 
 # Scoring thresholds (0-100)
@@ -89,7 +89,11 @@ ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.30"))  # 30% target — needs room to overcome spread costs
 STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.12"))  # 12% stop → 2.5:1 R:R
 MAX_OPEN_TRADES   = int(os.getenv("MAX_OPEN_TRADES",   "1"))
-POSITION_QTY      = int(os.getenv("POSITION_QTY",      "1"))
+BASE_POSITION_QTY = int(os.getenv("POSITION_QTY",      "1"))
+MIN_POSITION_QTY  = int(os.getenv("MIN_POSITION_QTY",  "5"))
+MAX_POSITION_QTY  = int(os.getenv("MAX_POSITION_QTY",  "10"))
+CONFIDENCE_POSITIONING = os.getenv("CONFIDENCE_POSITIONING", "1") == "1"
+CONFIDENCE_STEP_SCORE  = int(os.getenv("CONFIDENCE_STEP_SCORE", "5"))
 TRADE_LOG_FILE    = os.getenv("TRADE_LOG_FILE", "trade_results.csv")
 
 # Google Sheets tracking — bot creates/finds a spreadsheet by name automatically.
@@ -137,7 +141,7 @@ _ALERTS_HEADERS = [
 ]
 _TRADES_HEADERS = [
     "Opened At", "Closed At", "Duration (min)",
-    "Symbol", "Contract", "Signal", "Strike", "Expiry",
+    "Symbol", "Contract", "Signal", "Strike", "Expiry", "Qty",
     "Entry ($)", "Exit ($)", "PnL (%)", "PnL ($)", "Reason", "Score",
 ]
 
@@ -261,7 +265,8 @@ def log_trade_to_sheets(row, trade):
             if isinstance(opened, datetime) and isinstance(closed, datetime)
             else ""
         )
-        pnl_dollar = round((row["exit"] - row["entry"]) * 100 * POSITION_QTY, 2)
+        qty = int(row.get("qty", max(BASE_POSITION_QTY, MIN_POSITION_QTY)))
+        pnl_dollar = round((row["exit"] - row["entry"]) * 100 * qty, 2)
 
         sheet_row = [
             opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),
@@ -272,6 +277,7 @@ def log_trade_to_sheets(row, trade):
             row["signal"],
             trade.get("strike", ""),
             trade.get("expiry", ""),
+            qty,
             round(row["entry"],   4),
             round(row["exit"],    4),
             round(row["pnl_pct"], 2),
@@ -318,6 +324,17 @@ def _spy_vwap_side():
     Returns None if SPY hasn't been evaluated yet this cycle.
     """
     return _spy_vwap_cache.get("side")
+
+
+def position_qty_from_score(score):
+    """Return position size based on confidence score with a hard floor."""
+    base_qty = max(BASE_POSITION_QTY, MIN_POSITION_QTY)
+    if not CONFIDENCE_POSITIONING:
+        return base_qty
+
+    step = max(1, CONFIDENCE_STEP_SCORE)
+    extra_steps = max(0, (int(score) - SCORE_STRONG) // step)
+    return max(base_qty, min(MAX_POSITION_QTY, base_qty + extra_steps))
 
 
 def get_previous_day_levels(client, symbol):
@@ -740,7 +757,7 @@ def log(msg):
 # ---------------------------------------------------------------------------
 # Paper-trading execution + position tracking
 # ---------------------------------------------------------------------------
-def place_paper_entry(option_contract):
+def place_paper_entry(option_contract, qty):
     """Submit a paper BUY and poll up to 5s for the actual fill price.
 
     Returns (order, fill_price).  fill_price is None if the order did not fill
@@ -748,7 +765,7 @@ def place_paper_entry(option_contract):
     """
     order_req = MarketOrderRequest(
         symbol=option_contract["contract"],
-        qty=POSITION_QTY,
+        qty=qty,
         side=OrderSide.BUY,
         time_in_force=TimeInForce.DAY,
     )
@@ -768,7 +785,7 @@ def place_paper_entry(option_contract):
     return order, fill_price
 
 
-def place_paper_exit(contract_symbol):
+def place_paper_exit(contract_symbol, qty):
     """Submit a paper SELL and poll up to 5s for the actual fill price.
 
     Returns (order, fill_price).  fill_price is None if not filled in time.
@@ -776,7 +793,7 @@ def place_paper_exit(contract_symbol):
     """
     order_req = MarketOrderRequest(
         symbol=contract_symbol,
-        qty=POSITION_QTY,
+        qty=qty,
         side=OrderSide.SELL,
         time_in_force=TimeInForce.DAY,
     )
@@ -796,7 +813,7 @@ def place_paper_exit(contract_symbol):
     return order, fill_price
 
 
-def open_trade_record(symbol, signal, option, score, fill_price):
+def open_trade_record(symbol, signal, option, score, fill_price, qty):
     """Build a trade record using the actual Alpaca fill price (never a yfinance estimate)."""
     entry_price = fill_price
     side = option.get("side", signal.split()[-1])  # "CALL" or "PUT"
@@ -808,6 +825,7 @@ def open_trade_record(symbol, signal, option, score, fill_price):
         "expiry":     option["expiry"],
         "strike":     option["strike"],
         "entry":      entry_price,
+        "qty":        int(qty),
         "target":     entry_price * (1 + PROFIT_TARGET_PCT),
         "stop":       entry_price * (1 - STOP_LOSS_PCT),
         "score":      score,
@@ -902,7 +920,10 @@ def close_trade(trade, exit_price, reason, pnl_pct):
     """
     if ENABLE_ALPACA_PAPER_TRADING and _trading_client is not None:
         try:
-            _, fill_price = place_paper_exit(trade["contract"])
+            _, fill_price = place_paper_exit(
+                trade["contract"],
+                int(trade.get("qty", max(BASE_POSITION_QTY, MIN_POSITION_QTY))),
+            )
             if fill_price is not None:
                 # Recalculate PnL using the real fill, not the mid-price estimate.
                 actual_exit = fill_price
@@ -931,6 +952,7 @@ def close_trade(trade, exit_price, reason, pnl_pct):
         "underlying": trade["underlying"],
         "contract":   trade["contract"],
         "signal":     trade["signal"],
+        "qty":        int(trade.get("qty", max(BASE_POSITION_QTY, MIN_POSITION_QTY))),
         "entry":      trade["entry"],
         "exit":       exit_price,
         "pnl_pct":    pnl_pct * 100,
@@ -966,10 +988,10 @@ def try_open_paper_trade(symbol, side, option, data):
     if not ENABLE_ALPACA_PAPER_TRADING:
         return False
 
-    # No new entries after 13:00 CT (14:00 ET) — on 0DTE need at least 55 min before 14:55 close.
+    # No new entries after 13:30 CT (14:30 ET) — avoid late-day decay/slippage.
     now_ct = datetime.now(central)
-    if now_ct.hour > 13 or (now_ct.hour == 13 and now_ct.minute >= 0):
-        log(f"[{symbol}] After 13:00 CT — no new paper trade entries (0DTE theta risk). Alert only.")
+    if now_ct.hour > 13 or (now_ct.hour == 13 and now_ct.minute >= 30):
+        log(f"[{symbol}] After 13:30 CT — no new paper trade entries (late-day risk). Alert only.")
         return False
 
     if len(_open_trades) >= MAX_OPEN_TRADES:
@@ -982,10 +1004,11 @@ def try_open_paper_trade(symbol, side, option, data):
         return False
 
     score = data["bull_score"] if side == "CALL" else data["bear_score"]
+    qty = position_qty_from_score(score)
     signal_label = f"STRONG {side}"
 
     try:
-        _, fill_price = place_paper_entry(option)
+        _, fill_price = place_paper_entry(option, qty)
     except Exception as e:
         log(f"[{symbol}] Paper entry submit failed: {e} — not tracking trade.")
         return False
@@ -994,7 +1017,7 @@ def try_open_paper_trade(symbol, side, option, data):
         log(f"[{symbol}] Order submitted but no fill confirmed within 5s — not tracking trade.")
         return False
 
-    trade = open_trade_record(symbol, signal_label, option, score, fill_price)
+    trade = open_trade_record(symbol, signal_label, option, score, fill_price, qty)
     _open_trades[trade["contract"]] = trade
 
     send_discord(
@@ -1004,7 +1027,7 @@ def try_open_paper_trade(symbol, side, option, data):
         f"Entry (filled): `{trade['entry']:.2f}`\n"
         f"Target: `{trade['target']:.2f}`  (+{PROFIT_TARGET_PCT * 100:.0f}%)\n"
         f"Stop:   `{trade['stop']:.2f}`  (-{STOP_LOSS_PCT * 100:.0f}%)\n\n"
-        f"Score: `{score}`  Qty: `{POSITION_QTY}`"
+        f"Score: `{score}`  Qty: `{trade['qty']}`"
     )
     log(f"[{symbol}] Paper trade opened: {trade['contract']} fill ${trade['entry']:.2f} "
         f"target ${trade['target']:.2f} stop ${trade['stop']:.2f}")
