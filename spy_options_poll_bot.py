@@ -68,7 +68,7 @@ SCORE_DOMINANCE = int(os.getenv("SCORE_DOMINANCE", "20"))  # bull must lead bear
 # Set IGNITION_REQUIRED=0 in env to disable and revert to absolute-score-only firing.
 IGNITION_REQUIRED   = os.getenv("IGNITION_REQUIRED", "1") == "1"
 IGNITION_MIN_DELTA  = int(os.getenv("IGNITION_MIN_DELTA",  "25"))  # Raised: require a stronger burst to confirm real ignition
-IGNITION_PRIOR_MAX  = int(os.getenv("IGNITION_PRIOR_MAX",  "50"))  # Tightened: only fire when move starts from a neutral base
+IGNITION_PRIOR_MAX  = int(os.getenv("IGNITION_PRIOR_MAX",  "74"))  # Block only if already at STRONG level (≥75); allows breakouts from 70
 IGNITION_LOOKBACK_S = int(os.getenv("IGNITION_LOOKBACK_S", "300"))  # how far back to compare (default 5 min)
 
 # RSI exhaustion filter: don't buy CALLs when RSI is overbought or PUTs when oversold.
@@ -1076,8 +1076,9 @@ def close_trade(trade, exit_price, reason, pnl_pct):
     # Prevents same-day whipsaw but allows re-entry after the lockout expires.
     alert_key = (trade["underlying"], trade.get("side", trade["signal"].split()[-1]))
     _alert_cooldowns[alert_key] = datetime.now(central) + timedelta(minutes=30)
-    # Keep alert_key in _alerted_today so run_symbol suppresses until cooldown clears.
-    _alerted_today["keys"].add(alert_key)
+    # Clear the alert lock so the symbol can re-alert after cooldown.
+    # The ignition gate prevents immediate re-chasing — no need to block all day.
+    _alerted_today["keys"].discard(alert_key)
 
     log(f"[{trade['underlying']}] Closed {trade['contract']} ({reason}, {pnl_pct * 100:+.2f}%)")
 
@@ -1225,13 +1226,19 @@ def run_symbol(client, symbol):
             return
 
         delta = now_score - past_score
-        if past_score >= IGNITION_PRIOR_MAX:
+        # Perfect-score override: score ≥ 90 fires regardless of prior level.
+        if now_score >= 90:
+            log(
+                f"[{symbol}] \U0001f525 Perfect-score override: {side} score {now_score} \u2265 90 "
+                "\u2014 ignition gate bypassed."
+            )
+        elif past_score >= IGNITION_PRIOR_MAX:
             log(
                 f"[{symbol}] Ignition gate: {side} 5m ago was already {past_score} "
                 f"(>= {IGNITION_PRIOR_MAX}) \u2014 mid/late trend, no alert."
             )
             return
-        if delta < IGNITION_MIN_DELTA:
+        if now_score < 90 and delta < IGNITION_MIN_DELTA:
             log(
                 f"[{symbol}] Ignition gate: {side} delta only +{delta} (need +{IGNITION_MIN_DELTA}) "
                 f"\u2014 trend not igniting, no alert."
