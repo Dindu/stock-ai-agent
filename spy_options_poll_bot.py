@@ -16,6 +16,9 @@ import traceback
 from collections import deque
 from datetime import datetime, date, timedelta, timezone
 
+import gspread
+from google.oauth2.service_account import Credentials as GCredentials
+
 import pandas as pd
 import pytz
 import requests
@@ -78,6 +81,11 @@ MAX_OPEN_TRADES   = int(os.getenv("MAX_OPEN_TRADES",   "1"))
 POSITION_QTY      = int(os.getenv("POSITION_QTY",      "1"))
 TRADE_LOG_FILE    = os.getenv("TRADE_LOG_FILE", "trade_results.csv")
 
+# Google Sheets tracking — bot creates/finds a spreadsheet by name automatically.
+GOOGLE_SPREADSHEET_NAME   = os.getenv("GOOGLE_SPREADSHEET_NAME", "SPY Options Bot Log")
+GOOGLE_SERVICE_ACCOUNT_EMAIL = os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL", "")
+GOOGLE_PRIVATE_KEY        = os.getenv("GOOGLE_PRIVATE_KEY", "").replace("\\n", "\n")
+
 # Per-symbol score-trend history (one reading per cycle).
 # At POLL_SECONDS=30s, capacity 24 = 12 minutes of history.
 _SCORE_HISTORY_CAP = 24
@@ -101,6 +109,167 @@ _trading_client: "TradingClient | None" = None
 _option_client: "OptionHistoricalDataClient | None" = None
 # (symbol, side) -> datetime after which re-alerting is allowed (post-trade cooldown).
 _alert_cooldowns: "dict[tuple, datetime]" = {}
+# Authorized gspread Spreadsheet object (None if not configured / failed).
+_gsheet: "gspread.Spreadsheet | None" = None
+
+# Column headers for the two Google Sheets tabs.
+_ALERTS_HEADERS = [
+    "Timestamp (CT)", "Symbol", "Signal", "Side", "Price",
+    "Bull Score", "Bear Score", "Sentiment", "Ignition Delta",
+    "Contract", "Expiry", "DTE", "Strike", "Bid", "Ask", "Last",
+    "Option Volume", "Open Interest",
+    "Score Components",
+    "VWAP", "EMA20", "EMA50", "PDH", "PDL", "Recent High", "Recent Low",
+    "Bar Volume", "Bar Vol Avg",
+]
+_TRADES_HEADERS = [
+    "Opened At", "Closed At", "Duration (min)",
+    "Symbol", "Contract", "Signal", "Strike", "Expiry",
+    "Entry ($)", "Exit ($)", "PnL (%)", "PnL ($)", "Reason", "Score",
+]
+
+
+# ---------------------------------------------------------------------------
+# Google Sheets integration
+# ---------------------------------------------------------------------------
+def init_google_sheets():
+    """Create (or re-open) the bot's spreadsheet by name, then ensure Alerts + Trades tabs exist."""
+    global _gsheet
+    if not GOOGLE_SERVICE_ACCOUNT_EMAIL or not GOOGLE_PRIVATE_KEY:
+        log("Google Sheets credentials not configured — sheet logging disabled.")
+        return
+    try:
+        creds = GCredentials.from_service_account_info(
+            {
+                "type": "service_account",
+                "project_id": "linear-catalyst-468901-g0",
+                "private_key": GOOGLE_PRIVATE_KEY,
+                "client_email": GOOGLE_SERVICE_ACCOUNT_EMAIL,
+                "token_uri": "https://oauth2.googleapis.com/token",
+            },
+            scopes=[
+                "https://spreadsheets.google.com/feeds",
+                "https://www.googleapis.com/auth/drive",
+            ],
+        )
+        gc = gspread.authorize(creds)
+
+        # Find existing spreadsheet by name, or create a new one.
+        try:
+            _gsheet = gc.open(GOOGLE_SPREADSHEET_NAME)
+            log(f"Opened existing Google Sheet: '{GOOGLE_SPREADSHEET_NAME}'")
+        except gspread.exceptions.SpreadsheetNotFound:
+            _gsheet = gc.create(GOOGLE_SPREADSHEET_NAME)
+            # Make it accessible to anyone with the link (read+write).
+            _gsheet.share(None, perm_type="anyone", role="writer")
+            log(f"✅ Created new Google Sheet: '{GOOGLE_SPREADSHEET_NAME}'")
+
+        log(f"🔗 Sheet URL: https://docs.google.com/spreadsheets/d/{_gsheet.id}")
+
+        # Ensure Alerts tab exists with headers.
+        try:
+            _gsheet.worksheet("Alerts")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = _gsheet.add_worksheet(title="Alerts", rows=5000, cols=len(_ALERTS_HEADERS))
+            ws.append_row(_ALERTS_HEADERS, value_input_option="USER_ENTERED")
+            log("Created 'Alerts' tab in Google Sheets.")
+
+        # Ensure Trades tab exists with headers.
+        try:
+            _gsheet.worksheet("Trades")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = _gsheet.add_worksheet(title="Trades", rows=2000, cols=len(_TRADES_HEADERS))
+            ws.append_row(_TRADES_HEADERS, value_input_option="USER_ENTERED")
+            log("Created 'Trades' tab in Google Sheets.")
+
+    except Exception as e:
+        log(f"Google Sheets init failed: {e} — sheet logging disabled.")
+        _gsheet = None
+
+
+def log_alert_to_sheets(symbol, data, option):
+    """Append one row to the Alerts tab for every STRONG signal that fires."""
+    if _gsheet is None:
+        return
+    try:
+        breakdown = data["bull_breakdown"] if data["side"] == "CALL" else data["bear_breakdown"]
+        components = ", ".join(f"{k} (+{v})" for k, v in breakdown.items())
+
+        if data["side"] == "CALL":
+            delta = (data["bull_score"] - data["bull_5m"]) if data["bull_5m"] is not None else ""
+        else:
+            delta = (data["bear_score"] - data["bear_5m"]) if data["bear_5m"] is not None else ""
+
+        row = [
+            datetime.now(central).strftime("%Y-%m-%d %H:%M:%S"),
+            symbol,
+            data["signal"],
+            data["side"],
+            round(data["price"], 2),
+            data["bull_score"],
+            data["bear_score"],
+            data["sentiment"],
+            delta,
+            option["contract"]      if option else "",
+            option["expiry"]        if option else "",
+            option["dte"]           if option else "",
+            option["strike"]        if option else "",
+            option["bid"]           if option else "",
+            option["ask"]           if option else "",
+            option["last"]          if option else "",
+            option["volume"]        if option else "",
+            option["open_interest"] if option else "",
+            components,
+            round(data["vwap"],        2),
+            round(data["ema20"],       2),
+            round(data["ema50"],       2),
+            round(data["pdh"],         2),
+            round(data["pdl"],         2),
+            round(data["recent_high"], 2),
+            round(data["recent_low"],  2),
+            int(data["volume"]),
+            int(data["vol_avg"]),
+        ]
+        _gsheet.worksheet("Alerts").append_row(row, value_input_option="USER_ENTERED")
+        log(f"[{symbol}] Alert logged to Google Sheets.")
+    except Exception as e:
+        log(f"[{symbol}] Google Sheets alert log failed: {e}")
+
+
+def log_trade_to_sheets(row, trade):
+    """Append one row to the Trades tab when a paper trade closes."""
+    if _gsheet is None:
+        return
+    try:
+        opened = row["opened_at"]
+        closed = row["closed_at"]
+        duration = (
+            round((closed - opened).total_seconds() / 60, 1)
+            if isinstance(opened, datetime) and isinstance(closed, datetime)
+            else ""
+        )
+        pnl_dollar = round((row["exit"] - row["entry"]) * 100 * POSITION_QTY, 2)
+
+        sheet_row = [
+            opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),
+            closed.strftime("%Y-%m-%d %H:%M:%S") if isinstance(closed, datetime) else str(closed),
+            duration,
+            row["underlying"],
+            row["contract"],
+            row["signal"],
+            trade.get("strike", ""),
+            trade.get("expiry", ""),
+            round(row["entry"],   4),
+            round(row["exit"],    4),
+            round(row["pnl_pct"], 2),
+            pnl_dollar,
+            row["reason"],
+            row["score"],
+        ]
+        _gsheet.worksheet("Trades").append_row(sheet_row, value_input_option="USER_ENTERED")
+        log(f"[{row['underlying']}] Trade logged to Google Sheets.")
+    except Exception as e:
+        log(f"Google Sheets trade log failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +895,8 @@ def close_trade(trade, exit_price, reason, pnl_pct):
     except Exception as e:
         log(f"CSV write failed: {e}")
 
+    log_trade_to_sheets(row, trade)
+
     _open_trades.pop(trade["contract"], None)
 
     # 30-minute cooldown before the same (symbol, side) can re-alert.
@@ -913,6 +1084,7 @@ def run_symbol(client, symbol):
             f"VWAP: `{data['vwap']:.2f}` | EMA20: `{data['ema20']:.2f}` | EMA50: `{data['ema50']:.2f}`\n"
             f"PDH: `{data['pdh']:.2f}` | PDL: `{data['pdl']:.2f}`"
         )
+        log_alert_to_sheets(symbol, data, None)
         return
 
     emoji = "\U0001f7e2" if side == "CALL" else "\U0001f534"
@@ -965,6 +1137,7 @@ Alert only \u2014 verify chart before taking play.
 """
     send_discord(message)
     log(f"[{symbol}] Alert sent: {data['signal']} {option['contract']} (BULL {data['bull_score']} / BEAR {data['bear_score']})")
+    log_alert_to_sheets(symbol, data, option)
 
     # Open a paper trade (if enabled + capacity).
     try:
@@ -981,7 +1154,7 @@ def main():
 
     client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-    global _trading_client, _option_client
+    global _trading_client, _option_client, _gsheet
     _option_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
     log("OptionHistoricalDataClient initialized — live Alpaca option data (no yfinance).")
     # Always init TradingClient — needed for GetOptionContractsRequest even when paper
@@ -991,6 +1164,8 @@ def main():
         log("Paper trading ENABLED — Alpaca paper TradingClient initialized.")
     else:
         log("Paper trading DISABLED — alerts only, no orders will be submitted (TradingClient used for option contract lookup only).")
+
+    init_google_sheets()
 
     log(f"Options Alert Bot started. Symbols={','.join(SYMBOLS)} "
         f"Polling every {POLL_SECONDS}s. Feed={FEED}.")
