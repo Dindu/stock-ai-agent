@@ -1249,13 +1249,39 @@ def run_symbol(client, symbol):
             past_score = data["bear_5m"]
 
         if past_score is None:
-            log(
-                f"[{symbol}] Ignition gate: insufficient history (need {IGNITION_LOOKBACK_S}s) \u2014 "
-                "holding alert until trend can be measured."
-            )
-            return
-
-        delta = now_score - past_score
+            history = score_history.get(symbol, deque())
+            if len(history) >= 2:
+                # Cold-start fallback: compare against the oldest sampled score since boot
+                # so we can still capture fast early-session ignitions.
+                _, oldest_bull, oldest_bear = history[0]
+                past_score = oldest_bull if side == "CALL" else oldest_bear
+                delta = now_score - past_score
+                if now_score < 90 and delta < IGNITION_MIN_DELTA:
+                    log(
+                        f"[{symbol}] Ignition gate: warmup history only ({len(history)} samples), "
+                        f"{side} delta +{delta} < +{IGNITION_MIN_DELTA} \u2014 waiting for clearer ignition."
+                    )
+                    return
+                log(
+                    f"[{symbol}] Ignition warmup: using partial history ({len(history)} samples) "
+                    f"{past_score} \u2192 {now_score} (\u0394 +{delta})."
+                )
+            elif now_score >= 90:
+                # Perfect-score cold start: allow instead of waiting 5 minutes.
+                past_score = now_score
+                delta = 0
+                log(
+                    f"[{symbol}] \U0001f525 Perfect-score cold-start override: {side} score {now_score} \u2265 90 "
+                    "\u2014 ignition gate bypassed without full lookback history."
+                )
+            else:
+                log(
+                    f"[{symbol}] Ignition gate: insufficient history (need {IGNITION_LOOKBACK_S}s) \u2014 "
+                    "holding alert until trend can be measured."
+                )
+                return
+        else:
+            delta = now_score - past_score
         # Perfect-score override: score ≥ 90 fires regardless of prior level.
         if now_score >= 90:
             log(
