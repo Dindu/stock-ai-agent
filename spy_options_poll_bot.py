@@ -1278,6 +1278,7 @@ def run_symbol(client, symbol):
                 return
         else:
             delta = now_score - past_score
+        continuation_override = False
         # Perfect-score override: score ≥ 90 fires regardless of prior level.
         if now_score >= 90:
             log(
@@ -1294,13 +1295,14 @@ def run_symbol(client, symbol):
                     f"[{symbol}] Ignition continuation override: {side} remains strong "
                     f"({past_score} -> {now_score}, \u0394 {delta:+d}) \u2014 allowing one continuation entry."
                 )
+                continuation_override = True
             else:
                 log(
                     f"[{symbol}] Ignition gate: {side} 5m ago was already {past_score} "
                     f"(>= {IGNITION_PRIOR_MAX}) \u2014 mid/late trend, no alert."
                 )
                 return
-        if now_score < 90 and delta < IGNITION_MIN_DELTA:
+        if (not continuation_override) and now_score < 90 and delta < IGNITION_MIN_DELTA:
             log(
                 f"[{symbol}] Ignition gate: {side} delta only +{delta} (need +{IGNITION_MIN_DELTA}) "
                 f"\u2014 trend not igniting, no alert."
