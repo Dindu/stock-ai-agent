@@ -110,6 +110,7 @@ TRADE_LOG_FILE    = os.getenv("TRADE_LOG_FILE", "trade_results.csv")
 # Google Sheets tracking — bot creates/finds a spreadsheet by name automatically.
 GOOGLE_SPREADSHEET_NAME   = os.getenv("GOOGLE_SPREADSHEET_NAME", "SPY Options Bot Log")
 GOOGLE_SPREADSHEET_ID     = os.getenv("GOOGLE_SPREADSHEET_ID", "")  # paste sheet ID from URL to use existing sheet
+FORCE_NEW_GOOGLE_SHEET    = os.getenv("FORCE_NEW_GOOGLE_SHEET", "0") == "1"
 GOOGLE_SERVICE_ACCOUNT_EMAIL = os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL", "")
 GOOGLE_PRIVATE_KEY        = os.getenv("GOOGLE_PRIVATE_KEY", "").replace("\\n", "\n")
 OWNER_EMAIL               = os.getenv("OWNER_EMAIL", "")  # your Gmail — sheet is shared to this on startup
@@ -184,8 +185,14 @@ def init_google_sheets():
         )
         gc = gspread.authorize(creds)
 
+        # Force-create mode: always create a fresh sheet with a timestamped name.
+        if FORCE_NEW_GOOGLE_SHEET:
+            fresh_name = f"{GOOGLE_SPREADSHEET_NAME} {datetime.now(central).strftime('%Y-%m-%d %H%M%S')}"
+            _gsheet = gc.create(fresh_name)
+            _gsheet.share(None, perm_type="anyone", role="writer")
+            log(f"✅ Force-created new Google Sheet: '{fresh_name}'")
         # Open by ID (existing sheet) if provided, otherwise find/create by name.
-        if GOOGLE_SPREADSHEET_ID:
+        elif GOOGLE_SPREADSHEET_ID:
             _gsheet = gc.open_by_key(GOOGLE_SPREADSHEET_ID)
             log(f"Opened existing Google Sheet by ID: '{_gsheet.title}'")
         else:
