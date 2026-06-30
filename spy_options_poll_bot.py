@@ -1304,15 +1304,8 @@ def run_cycle(client):
         _alerted_today["date"] = today
         _alerted_today["keys"] = set()
 
-    # Manage any open paper trade first so target/stop can fire even when
-    # no new signal is forming this cycle.
-    try:
-        track_open_trades()
-    except Exception:
-        log("track_open_trades error:")
-        traceback.print_exc()
-        sys.stdout.flush()
-
+    # Entry scan first (symbol loop), then exit management in the same cycle.
+    # This keeps the flow aligned with: entry -> check exit -> exit.
     for symbol in SYMBOLS:
         try:
             run_symbol(client, symbol)
@@ -1320,6 +1313,13 @@ def run_cycle(client):
             log(f"[{symbol}] Cycle error:")
             traceback.print_exc()
             sys.stdout.flush()
+
+    try:
+        track_open_trades()
+    except Exception:
+        log("track_open_trades error:")
+        traceback.print_exc()
+        sys.stdout.flush()
 
 
 def run_symbol(client, symbol):
