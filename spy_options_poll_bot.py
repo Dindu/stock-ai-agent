@@ -127,6 +127,7 @@ FORCE_NEW_GOOGLE_SHEET    = os.getenv("FORCE_NEW_GOOGLE_SHEET", "0") == "1"
 GOOGLE_SERVICE_ACCOUNT_EMAIL = os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL", "")
 GOOGLE_PRIVATE_KEY        = os.getenv("GOOGLE_PRIVATE_KEY", "").replace("\\n", "\n")
 OWNER_EMAIL               = os.getenv("OWNER_EMAIL", "")  # your Gmail — sheet is shared to this on startup
+GSHEET_RETRY_SECONDS      = int(os.getenv("GSHEET_RETRY_SECONDS", "60"))
 
 # Per-symbol score-trend history (one reading per cycle).
 # At POLL_SECONDS=30s, capacity 24 = 12 minutes of history.
@@ -153,6 +154,7 @@ _option_client: "OptionHistoricalDataClient | None" = None
 _alert_cooldowns: "dict[tuple, datetime]" = {}
 # Authorized gspread Spreadsheet object (None if not configured / failed).
 _gsheet: "gspread.Spreadsheet | None" = None
+_last_gsheet_init_attempt: "datetime | None" = None
 # Last known SPY VWAP side: 'bull', 'bear', or None (populated by run_symbol each cycle).
 _spy_vwap_cache: "dict" = {"side": None, "updated_at": None}
 
@@ -178,7 +180,8 @@ _TRADES_HEADERS = [
 # ---------------------------------------------------------------------------
 def init_google_sheets():
     """Create (or re-open) the bot's spreadsheet by name, then ensure Alerts + Trades tabs exist."""
-    global _gsheet
+    global _gsheet, _last_gsheet_init_attempt
+    _last_gsheet_init_attempt = datetime.now(central)
     if not GOOGLE_SERVICE_ACCOUNT_EMAIL or not GOOGLE_PRIVATE_KEY:
         log("Google Sheets credentials not configured — sheet logging disabled.")
         return
@@ -269,13 +272,34 @@ def init_google_sheets():
             log(f"Warning: Could not protect header row: {protect_err}")
 
     except Exception as e:
-        log(f"Google Sheets init failed: {e} — sheet logging disabled.")
+        log(
+            f"Google Sheets init failed: {type(e).__name__}: {e!r} "
+            "— sheet logging disabled."
+        )
         _gsheet = None
+
+
+def ensure_google_sheets_ready():
+    """Retry Google Sheets init periodically if it is currently unavailable."""
+    if _gsheet is not None:
+        return True
+    if not GOOGLE_SERVICE_ACCOUNT_EMAIL or not GOOGLE_PRIVATE_KEY:
+        return False
+
+    now = datetime.now(central)
+    if _last_gsheet_init_attempt is not None:
+        elapsed = (now - _last_gsheet_init_attempt).total_seconds()
+        if elapsed < GSHEET_RETRY_SECONDS:
+            return False
+
+    log("Google Sheets unavailable — retrying initialization.")
+    init_google_sheets()
+    return _gsheet is not None
 
 
 def log_alert_to_sheets(symbol, data, option):
     """Append one row to the Alerts tab for every STRONG signal that fires."""
-    if _gsheet is None:
+    if _gsheet is None and not ensure_google_sheets_ready():
         return
     try:
         breakdown = data["bull_breakdown"] if data["side"] == "CALL" else data["bear_breakdown"]
@@ -324,7 +348,7 @@ def log_alert_to_sheets(symbol, data, option):
 
 def log_trade_open_to_sheets(trade):
     """Write a row to the Trades tab the moment a paper trade opens."""
-    if _gsheet is None:
+    if _gsheet is None and not ensure_google_sheets_ready():
         log(f"[{trade.get('underlying', 'UNKNOWN')}] Trades write skipped: Google Sheets not initialized.")
         return
     try:
@@ -362,7 +386,7 @@ def log_trade_open_to_sheets(trade):
 
 def log_trade_to_sheets(row, trade):
     """Update the existing Trades row (written at open) with exit details."""
-    if _gsheet is None:
+    if _gsheet is None and not ensure_google_sheets_ready():
         log(f"[{row.get('underlying', 'UNKNOWN')}] Trades close write skipped: Google Sheets not initialized.")
         return
     try:
