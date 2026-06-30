@@ -1035,12 +1035,22 @@ def close_trade(trade, exit_price, reason, pnl_pct):
             log(f"[{trade['underlying']}] Paper exit submit failed: {e}")
 
     emoji = "\u2705" if pnl_pct > 0 else "\u274c"
+    outcome_label = "PROFIT" if pnl_pct > 0 else "LOSS"
     closed_at = datetime.now(central)
+    duration_min = max(1, int((closed_at - trade["opened_at"]).total_seconds() // 60))
+    entry_px = float(trade["entry"])
+    exit_px = float(exit_price)
+    grade = "A" if pnl_pct >= 0.20 else "B" if pnl_pct >= 0.10 else "C" if pnl_pct >= -0.10 else "D"
+
     send_discord(
-        f"{emoji} **{reason}** \u2014 {trade['underlying']} {trade['signal']}\n\n"
-        f"Contract: `{trade['contract']}`\n"
-        f"Entry: `{trade['entry']:.2f}`  Exit: `{exit_price:.2f}`\n"
-        f"PnL: `{pnl_pct * 100:+.2f}%`  Score: `{trade['score']}`\n"
+        f"\U0001f534 **EXIT ALERT**\n\n"
+        f"{emoji} **{outcome_label}** — {trade['contract']} | `{pnl_pct * 100:+.2f}%`\n"
+        f"------------------------------\n"
+        f"\U0001f4ca **Trade:** `${entry_px:.2f} -> ${exit_px:.2f}` | `{duration_min}m`\n"
+        f"\U0001f4c9 **Result:** `{reason}`\n"
+        f"\U0001f9e0 **Summary:** `{trade['underlying']} {trade['side']} closed by rules`\n"
+        f"\U0001f3c6 **Grade:** `{grade}`\n\n"
+        f"\U0001f4cc **Outcome:** `{outcome_label} (RULES FOLLOWED)`\n"
         f"Opened: `{trade['opened_at']:%Y-%m-%d %H:%M:%S %Z}`\n"
         f"Closed: `{closed_at:%Y-%m-%d %H:%M:%S %Z}`"
     )
@@ -1113,16 +1123,27 @@ def try_open_paper_trade(symbol, side, option, data):
 
     trade = open_trade_record(symbol, signal_label, option, score, fill_price, qty)
     _open_trades[trade["contract"]] = trade
+
+    # Persist both ALERTS and TRADES records as part of the same entry flow.
+    log_alert_to_sheets(symbol, data, option)
     log_trade_open_to_sheets(trade)
 
+    setup = "MOMENTUM BREAKOUT" if score >= 90 else "TREND CONTINUATION"
+    ai_label = "HIGH" if score >= 90 else "MEDIUM" if score >= 80 else "LOW"
+    grade = "A" if score >= 90 else "B" if score >= 80 else "C"
+    stop_pct = STOP_LOSS_PCT * 100
+    target_1 = trade['entry'] * 1.25
+    target_2 = trade['entry'] * 1.50
+
     send_discord(
-        f"💰 **{symbol} {signal_label} — PAPER TRADE OPENED**\n\n"
-        f"Contract: `{trade['contract']}`\n"
-        f"Expiry: `{trade['expiry']}`  Strike: `{trade['strike']}`\n\n"
-        f"Entry (filled): `{trade['entry']:.2f}`\n"
-        f"Target: `{trade['target']:.2f}`  (+{PROFIT_TARGET_PCT * 100:.0f}%)\n"
-        f"Stop:   `{trade['stop']:.2f}`  (-{STOP_LOSS_PCT * 100:.0f}%)\n\n"
-        f"Score: `{score}`  Qty: `{trade['qty']}`"
+        f"\U0001f680 **ENTRY ALERT**\n\n"
+        f"\U0001f680 **{trade['contract']} | ${trade['entry']:.2f} | {trade['expiry']}**\n"
+        f"------------------------------\n"
+        f"\U0001f4ca **Setup:** `{setup}` | Score: `{score}/100` ({grade})\n"
+        f"\U0001f3af **Plan:** Entry `${trade['entry']:.2f}` | Target `${target_1:.2f}` / `${target_2:.2f}` | Stop `-{stop_pct:.0f}%`\n"
+        f"\U0001f6d1 **Invalidation:** VWAP loss / hard stop hit\n"
+        f"\U0001f916 **AI:** \U0001f7e1 **{ai_label}** — balanced setup with rules-aligned confirmation\n\n"
+        f"\U0001f4cc **Action:** ENTERED (`{trade['qty']}` contract{'s' if trade['qty'] != 1 else ''})"
     )
     log(f"[{symbol}] Paper trade opened: {trade['contract']} fill ${trade['entry']:.2f} "
         f"target ${trade['target']:.2f} stop ${trade['stop']:.2f}")
@@ -1360,17 +1381,27 @@ Volume: `{int(data['volume'])}` | Avg: `{int(data['vol_avg'])}`
 
 Alert only \u2014 verify chart before taking play.
 """
-    send_discord(message)
-    log(f"[{symbol}] Alert sent: {data['signal']} {option['contract']} (BULL {data['bull_score']} / BEAR {data['bear_score']})")
-    log_alert_to_sheets(symbol, data, option)
+    if ENABLE_ALPACA_PAPER_TRADING:
+        # Execution path: place order + log sheets + send a single entry alert.
+        try:
+            opened = try_open_paper_trade(symbol, side, option, data)
+        except Exception:
+            log(f"[{symbol}] try_open_paper_trade error:")
+            traceback.print_exc()
+            sys.stdout.flush()
+            opened = False
 
-    # Open a paper trade (if enabled + capacity).
-    try:
-        try_open_paper_trade(symbol, side, option, data)
-    except Exception:
-        log(f"[{symbol}] try_open_paper_trade error:")
-        traceback.print_exc()
-        sys.stdout.flush()
+        if not opened:
+            # Fall back to one setup alert when execution is not possible.
+            send_discord(message)
+            log(f"[{symbol}] Alert sent (execution unavailable): {data['signal']} {option['contract']} "
+                f"(BULL {data['bull_score']} / BEAR {data['bear_score']})")
+            log_alert_to_sheets(symbol, data, option)
+    else:
+        # Alert-only mode when paper trading is disabled.
+        send_discord(message)
+        log(f"[{symbol}] Alert sent: {data['signal']} {option['contract']} (BULL {data['bull_score']} / BEAR {data['bear_score']})")
+        log_alert_to_sheets(symbol, data, option)
 
 
 def main():
