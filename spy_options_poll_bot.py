@@ -10,6 +10,7 @@ No WebSocket -> no Alpaca connection-limit issues.
 """
 
 import os
+import re
 import sys
 import time
 import traceback
@@ -108,6 +109,8 @@ PROFIT_PROTECT_ARM_PCT = float(os.getenv("PROFIT_PROTECT_ARM_PCT", "0.04"))
 PROFIT_PROTECT_FLOOR_PCT = float(os.getenv("PROFIT_PROTECT_FLOOR_PCT", "0.00"))
 PROFIT_PROTECT_DRAWDOWN_PCT = float(os.getenv("PROFIT_PROTECT_DRAWDOWN_PCT", "0.08"))
 MAX_OPEN_TRADES   = int(os.getenv("MAX_OPEN_TRADES",   "5"))
+# Block stacking multiple strikes on the same symbol+side while one is open.
+SINGLE_POSITION_PER_SYMBOL = os.getenv("SINGLE_POSITION_PER_SYMBOL", "1") == "1"
 BASE_POSITION_QTY = int(os.getenv("POSITION_QTY",      "1"))
 MIN_POSITION_QTY  = int(os.getenv("MIN_POSITION_QTY",  "5"))
 MAX_POSITION_QTY  = int(os.getenv("MAX_POSITION_QTY",  "10"))
@@ -937,6 +940,45 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty):
     }
 
 
+def _option_side_from_contract(contract_symbol):
+    """Infer CALL/PUT from an OCC option symbol; returns None if unknown."""
+    m = re.search(r"([CP])\d{8}$", str(contract_symbol or ""))
+    if not m:
+        return None
+    return "CALL" if m.group(1) == "C" else "PUT"
+
+
+def has_open_underlying_position(symbol, side):
+    """Return (True, detail) when an open position already exists for symbol+side."""
+    for t in _open_trades.values():
+        if t.get("underlying") != symbol:
+            continue
+        if side == t.get("side"):
+            return True, f"local:{t.get('contract', 'unknown')}"
+
+    if _trading_client is None:
+        return False, ""
+
+    try:
+        for pos in _trading_client.get_all_positions():
+            pos_symbol = str(getattr(pos, "symbol", "") or "")
+            if not pos_symbol.startswith(symbol):
+                continue
+
+            asset_class = str(getattr(pos, "asset_class", "") or "").lower()
+            if asset_class and asset_class not in ("option", "us_option"):
+                continue
+
+            pos_side = _option_side_from_contract(pos_symbol)
+            # If side cannot be inferred, block conservatively to avoid duplicate stacking.
+            if pos_side is None or pos_side == side:
+                return True, f"alpaca:{pos_symbol}"
+    except Exception as e:
+        log(f"[{symbol}] Position guard warning: {e}")
+
+    return False, ""
+
+
 def get_current_option_price(trade):
     """Get live mid/bid price for an open contract from Alpaca (no yfinance)."""
     if _option_client is None:
@@ -1106,6 +1148,11 @@ def try_open_paper_trade(symbol, side, option, data):
     if len(_open_trades) >= MAX_OPEN_TRADES:
         log(f"[{symbol}] Paper-trade capacity full ({len(_open_trades)}/{MAX_OPEN_TRADES}) — alert only.")
         return False
+    if SINGLE_POSITION_PER_SYMBOL:
+        already_open, detail = has_open_underlying_position(symbol, side)
+        if already_open:
+            log(f"[{symbol}] Existing {side} position detected ({detail}) — not opening another strike.")
+            return False
     if option["contract"] in _open_trades:
         log(f"[{symbol}] Already long {option['contract']} — not stacking.")
         return False
