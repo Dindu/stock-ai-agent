@@ -234,19 +234,31 @@ def init_google_sheets():
 
         # Ensure Alerts tab exists with headers.
         try:
-            _gsheet.worksheet("Alerts")
+            alerts_ws = _gsheet.worksheet("Alerts")
         except gspread.exceptions.WorksheetNotFound:
-            ws = _gsheet.add_worksheet(title="Alerts", rows=5000, cols=len(_ALERTS_HEADERS))
-            ws.append_row(_ALERTS_HEADERS, value_input_option="USER_ENTERED")
+            alerts_ws = _gsheet.add_worksheet(title="Alerts", rows=5000, cols=len(_ALERTS_HEADERS))
             log("Created 'Alerts' tab in Google Sheets.")
+        try:
+            existing_alert_headers = alerts_ws.row_values(1)
+            if existing_alert_headers != _ALERTS_HEADERS:
+                alerts_ws.update("A1", [_ALERTS_HEADERS], value_input_option="USER_ENTERED")
+                log("Ensured 'Alerts' header row in Google Sheets.")
+        except Exception as header_err:
+            log(f"Warning: Could not verify/set Alerts headers: {header_err}")
 
         # Ensure Trades tab exists with headers.
         try:
             trades_ws = _gsheet.worksheet("Trades")
         except gspread.exceptions.WorksheetNotFound:
             trades_ws = _gsheet.add_worksheet(title="Trades", rows=2000, cols=len(_TRADES_HEADERS))
-            trades_ws.append_row(_TRADES_HEADERS, value_input_option="USER_ENTERED")
             log("Created 'Trades' tab in Google Sheets.")
+        try:
+            existing_trade_headers = trades_ws.row_values(1)
+            if existing_trade_headers != _TRADES_HEADERS:
+                trades_ws.update("A1", [_TRADES_HEADERS], value_input_option="USER_ENTERED")
+                log("Ensured 'Trades' header row in Google Sheets.")
+        except Exception as header_err:
+            log(f"Warning: Could not verify/set Trades headers: {header_err}")
         
         # Protect header row (row 1) so it cannot be edited.
         try:
