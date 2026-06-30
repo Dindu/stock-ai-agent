@@ -998,13 +998,22 @@ def _underlying_from_contract(contract_symbol):
 
 
 def sync_open_trades_from_alpaca():
-    """Populate _open_trades from live Alpaca option positions not yet tracked in memory."""
+    """Mirror _open_trades from live Alpaca option positions.
+
+    Alpaca is the source of truth: each sync rebuilds local tracking from the
+    current broker snapshot, preserving only local metadata when available.
+    """
     if _trading_client is None:
         return
 
     recovered = 0
+    scanned_total = 0
+    scanned_option = 0
+    current_positions = []
+    previous = dict(_open_trades)
     try:
         for pos in _trading_client.get_all_positions():
+            scanned_total += 1
             contract_sym = str(getattr(pos, "symbol", "") or "")
             if not contract_sym:
                 continue
@@ -1012,9 +1021,7 @@ def sync_open_trades_from_alpaca():
             asset_class = str(getattr(pos, "asset_class", "") or "").lower()
             if asset_class and asset_class not in ("option", "us_option"):
                 continue
-
-            if contract_sym in _open_trades:
-                continue
+            scanned_option += 1
 
             underlying = _underlying_from_contract(contract_sym)
             side = _option_side_from_contract(contract_sym)
@@ -1036,6 +1043,11 @@ def sync_open_trades_from_alpaca():
                 continue
 
             try:
+                current_px = float(getattr(pos, "current_price", 0) or 0)
+            except Exception:
+                current_px = 0.0
+
+            try:
                 strike_val = float(getattr(pos, "strike_price", 0) or 0)
             except Exception:
                 strike_val = 0.0
@@ -1043,39 +1055,59 @@ def sync_open_trades_from_alpaca():
 
             expiry = str(getattr(pos, "expiration_date", "") or "")
 
-            _open_trades[contract_sym] = {
-                "underlying": underlying,
-                "signal": f"RECOVERED {side}",
-                "side": side,
+            current_positions.append({
                 "contract": contract_sym,
+                "underlying": underlying,
+                "side": side,
                 "expiry": expiry,
                 "strike": strike,
                 "entry": entry,
                 "qty": qty,
-                "target": entry * (1 + PROFIT_TARGET_PCT),
-                "stop": entry * (1 - STOP_LOSS_PCT),
-                "score": 0,
-                "max_pnl_pct": 0.0,
-                "opened_at": datetime.now(central),
-                "status": "OPEN",
-            }
-            recovered += 1
+                "current_price": current_px,
+            })
     except Exception as e:
         log(f"Alpaca position recovery failed: {e}")
         return
 
+    # Rebuild local map from broker snapshot (source of truth), preserving metadata.
+    _open_trades.clear()
+    for p in current_positions:
+        contract_sym = p["contract"]
+        prev = previous.get(contract_sym)
+        if prev is None:
+            recovered += 1
+        _open_trades[contract_sym] = {
+            "underlying": p["underlying"],
+            "signal": prev.get("signal", f"RECOVERED {p['side']}") if prev else f"RECOVERED {p['side']}",
+            "side": p["side"],
+            "contract": contract_sym,
+            "expiry": p["expiry"],
+            "strike": p["strike"],
+            "entry": p["entry"],
+            "qty": p["qty"],
+            "current_price": p["current_price"],
+            "target": p["entry"] * (1 + PROFIT_TARGET_PCT),
+            "stop": p["entry"] * (1 - STOP_LOSS_PCT),
+            "score": prev.get("score", 0) if prev else 0,
+            "max_pnl_pct": prev.get("max_pnl_pct", 0.0) if prev else 0.0,
+            "opened_at": prev.get("opened_at", datetime.now(central)) if prev else datetime.now(central),
+            "status": "OPEN",
+            "trade_id": prev.get("trade_id") if prev else None,
+            "sheets_row": prev.get("sheets_row") if prev else None,
+        }
+
     if recovered:
         log(f"Recovered {recovered} open option position(s) from Alpaca for exit tracking.")
+    else:
+        log(
+            f"Alpaca position sync: scanned {scanned_total} total position(s), "
+            f"{scanned_option} option position(s), recovered 0 new trade(s), "
+            f"tracking {len(_open_trades)} open trade(s)."
+        )
 
 
 def has_open_underlying_position(symbol, side):
     """Return (True, detail) when an open position already exists for symbol+side."""
-    for t in _open_trades.values():
-        if t.get("underlying") != symbol:
-            continue
-        if side == t.get("side"):
-            return True, f"local:{t.get('contract', 'unknown')}"
-
     if _trading_client is None:
         return False, ""
 
@@ -1141,7 +1173,9 @@ def track_open_trades():
 
         # ── Primary: pull entry + current price directly from Alpaca position ──
         alpaca_entry   = None
-        current_price  = None
+        current_price  = float(trade.get("current_price", 0) or 0)
+        if current_price <= 0:
+            current_price = None
 
         if _trading_client is not None:
             try:
@@ -1269,6 +1303,9 @@ def try_open_paper_trade(symbol, side, option, data):
     """Open a paper trade if trading is enabled and we have capacity. Returns True if opened."""
     if not ENABLE_ALPACA_PAPER_TRADING:
         return False
+
+    # Refresh from Alpaca first so capacity/duplicate checks use broker truth.
+    sync_open_trades_from_alpaca()
 
     if len(_open_trades) >= MAX_OPEN_TRADES:
         log(f"[{symbol}] Paper-trade capacity full ({len(_open_trades)}/{MAX_OPEN_TRADES}) — alert only.")
