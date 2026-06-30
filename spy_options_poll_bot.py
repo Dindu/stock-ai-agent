@@ -100,9 +100,10 @@ CANDLE_CONFIRMATION = os.getenv("CANDLE_CONFIRMATION", "1") == "1"
 # option price each cycle and submit a paper-account market SELL at +20% / -20%.
 # Set to 0 to keep the bot in pure alert mode (no orders submitted, no tracking).
 ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "1"
-PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.30"))  # 30% target — needs room to overcome spread costs
-STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.12"))  # 12% stop → 2.5:1 R:R
-# Profit-protection: once a trade has been meaningfully green, don't allow full giveback.
+PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))  # take-profit at +20%
+STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.20"))  # stop-loss at -20%
+# Legacy profit-protection env vars are retained for backward compatibility,
+# but are intentionally not used in exit logic.
 PROFIT_PROTECT_ARM_PCT = float(os.getenv("PROFIT_PROTECT_ARM_PCT", "0.04"))
 PROFIT_PROTECT_FLOOR_PCT = float(os.getenv("PROFIT_PROTECT_FLOOR_PCT", "0.00"))
 PROFIT_PROTECT_DRAWDOWN_PCT = float(os.getenv("PROFIT_PROTECT_DRAWDOWN_PCT", "0.08"))
@@ -1004,19 +1005,9 @@ def track_open_trades():
         entry   = trade["entry"]
         pnl_pct = (current_price - entry) / entry if entry else 0.0
         trade["max_pnl_pct"] = max(float(trade.get("max_pnl_pct", 0.0)), pnl_pct)
-        peak_pnl = float(trade.get("max_pnl_pct", 0.0))
         log(f"[{trade['underlying']}] {contract_sym} | "
             f"entry ${entry:.2f} (Alpaca) | current ${current_price:.2f} (Alpaca) | "
             f"PnL {pnl_pct * 100:+.2f}%")
-
-        # Profit protection: after a trade gets green enough, prevent full round-trip loss.
-        if peak_pnl >= PROFIT_PROTECT_ARM_PCT:
-            if pnl_pct <= PROFIT_PROTECT_FLOOR_PCT:
-                close_trade(trade, current_price, "PROFIT PROTECT", pnl_pct)
-                continue
-            if (peak_pnl - pnl_pct) >= PROFIT_PROTECT_DRAWDOWN_PCT:
-                close_trade(trade, current_price, "TRAIL PROTECT", pnl_pct)
-                continue
 
         if pnl_pct >= PROFIT_TARGET_PCT:
             close_trade(trade, current_price, "TARGET HIT", pnl_pct)
