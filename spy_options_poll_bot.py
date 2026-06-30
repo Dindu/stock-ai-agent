@@ -1128,11 +1128,13 @@ def track_open_trades():
     Falls back to OptionLatestQuoteRequest only if the position is not yet
     visible in Alpaca (e.g. fill not yet propagated).
     """
+    # Always re-sync with Alpaca so restart/redeploy never leaves exits unmanaged.
+    if RECOVER_OPEN_POSITIONS:
+        sync_open_trades_from_alpaca()
+
     if not _open_trades:
-        if RECOVER_OPEN_POSITIONS:
-            sync_open_trades_from_alpaca()
-        if not _open_trades:
-            return
+        log("Exit monitor: no open trades to check.")
+        return
 
     for trade in list(_open_trades.values()):
         contract_sym = trade["contract"]
