@@ -1128,6 +1128,29 @@ def has_open_underlying_position(symbol, side):
     except Exception as e:
         log(f"[{symbol}] Position guard warning: {e}")
 
+    # Also block when there is a pending option BUY order for this symbol+side.
+    # This prevents duplicate entries before the first order becomes a position.
+    try:
+        orders = _trading_client.get_orders()
+        for order in orders:
+            ord_symbol = str(getattr(order, "symbol", "") or "")
+            if not ord_symbol.startswith(symbol):
+                continue
+
+            ord_side = str(getattr(order, "side", "") or "").lower()
+            if ord_side != "buy":
+                continue
+
+            status = str(getattr(order, "status", "") or "").lower()
+            if status in ("filled", "canceled", "expired", "rejected"):
+                continue
+
+            opt_side = _option_side_from_contract(ord_symbol)
+            if opt_side is None or opt_side == side:
+                return True, f"pending-order:{ord_symbol}:{status}"
+    except Exception as e:
+        log(f"[{symbol}] Order guard warning: {e}")
+
     return False, ""
 
 
