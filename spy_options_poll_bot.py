@@ -77,10 +77,12 @@ RSI_FILTER         = os.getenv("RSI_FILTER", "1") == "1"
 RSI_OVERBOUGHT     = int(os.getenv("RSI_OVERBOUGHT", "70"))  # block CALL entries above this
 RSI_OVERSOLD       = int(os.getenv("RSI_OVERSOLD",   "30"))  # block PUT entries below this
 
-# Macro alignment: for non-SPY symbols, only take CALL when SPY is above its VWAP,
-# only take PUT when SPY is below its VWAP.  Prevents counter-trend entries.
-# Set SPY_MACRO_ALIGN=0 to disable.
-SPY_MACRO_ALIGN    = os.getenv("SPY_MACRO_ALIGN", "1") == "1"
+# Macro alignment for non-SPY symbols.
+# Default behavior is confidence adjustment (penalty), not a hard veto.
+# Set SPY_MACRO_HARD_BLOCK=1 to restore strict blocking behavior.
+SPY_MACRO_ALIGN         = os.getenv("SPY_MACRO_ALIGN", "1") == "1"
+SPY_MACRO_SCORE_PENALTY = int(os.getenv("SPY_MACRO_SCORE_PENALTY", "10"))
+SPY_MACRO_HARD_BLOCK    = os.getenv("SPY_MACRO_HARD_BLOCK", "0") == "1"
 
 # Anti-chase entry filters: avoid entering when price is too stretched from VWAP,
 # or when the latest candle already flipped against the intended side.
@@ -1114,7 +1116,9 @@ def try_open_paper_trade(symbol, side, option, data):
     if _trading_client is None:
         return False
 
-    score = data["bull_score"] if side == "CALL" else data["bear_score"]
+    score = int(data.get("effective_score", data["bull_score"] if side == "CALL" else data["bear_score"]))
+    raw_score = int(data.get("raw_entry_score", score))
+    macro_penalty = int(data.get("macro_penalty", 0))
     qty = position_qty_from_score(score)
     signal_label = f"STRONG {side}"
 
@@ -1142,11 +1146,15 @@ def try_open_paper_trade(symbol, side, option, data):
     target_1 = trade['entry'] * 1.25
     target_2 = trade['entry'] * 1.50
 
+    score_line = f"{score}/100"
+    if macro_penalty > 0:
+        score_line = f"{score}/100 (raw {raw_score}, macro -{macro_penalty})"
+
     send_discord(
         f"\U0001f680 **ENTRY ALERT**\n\n"
         f"\U0001f680 **{trade['contract']} | ${trade['entry']:.2f} | {trade['expiry']}**\n"
         f"------------------------------\n"
-        f"\U0001f4ca **Setup:** `{setup}` | Score: `{score}/100` ({grade})\n"
+        f"\U0001f4ca **Setup:** `{setup}` | Score: `{score_line}` ({grade})\n"
         f"\U0001f3af **Plan:** Entry `${trade['entry']:.2f}` | Target `${target_1:.2f}` / `${target_2:.2f}` | Stop `-{stop_pct:.0f}%`\n"
         f"\U0001f6d1 **Invalidation:** VWAP loss / hard stop hit\n"
         f"\U0001f916 **AI:** \U0001f7e1 **{ai_label}** — balanced setup with rules-aligned confirmation\n\n"
@@ -1284,18 +1292,29 @@ def run_symbol(client, symbol):
             log(f"[{symbol}] RSI filter: PUT blocked — RSI {rsi:.1f} <= {RSI_OVERSOLD} (oversold, late entry).")
             return
 
-    # ── Macro alignment filter ────────────────────────────────────────────────
-    # For non-SPY symbols, only take a CALL when SPY is above its own VWAP
-    # (bull macro), and only take a PUT when SPY is below its VWAP (bear macro).
-    # This prevents counter-trend IWM/QQQ entries against the broader market.
+    # ── Macro alignment context (penalty by default, optional hard block) ───
+    macro_penalty = 0
     if SPY_MACRO_ALIGN and symbol != "SPY" and "SPY" in SYMBOLS:
         spy_vwap_side = _spy_vwap_side()
-        if side == "CALL" and spy_vwap_side != "bull":
-            log(f"[{symbol}] Macro filter: CALL blocked — SPY is not above its VWAP (spy_side={spy_vwap_side}).")
-            return
-        if side == "PUT" and spy_vwap_side != "bear":
-            log(f"[{symbol}] Macro filter: PUT blocked — SPY is not below its VWAP (spy_side={spy_vwap_side}).")
-            return
+        misaligned = (side == "CALL" and spy_vwap_side != "bull") or (side == "PUT" and spy_vwap_side != "bear")
+        if misaligned:
+            if SPY_MACRO_HARD_BLOCK:
+                log(
+                    f"[{symbol}] Macro filter: {side} blocked — SPY VWAP side mismatch "
+                    f"(spy_side={spy_vwap_side})."
+                )
+                return
+            macro_penalty = max(0, SPY_MACRO_SCORE_PENALTY)
+            log(
+                f"[{symbol}] Macro context: {side} misaligned with SPY VWAP "
+                f"(spy_side={spy_vwap_side}) — applying -{macro_penalty} confidence penalty (no veto)."
+            )
+
+    raw_score = data["bull_score"] if side == "CALL" else data["bear_score"]
+    effective_score = max(0, raw_score - macro_penalty)
+    data["raw_entry_score"] = raw_score
+    data["macro_penalty"] = macro_penalty
+    data["effective_score"] = effective_score
 
     # ── Anti-chase filters ───────────────────────────────────────────────────
     # Avoid buying when price is already too extended away from VWAP, and avoid
