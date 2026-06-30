@@ -70,6 +70,11 @@ IGNITION_REQUIRED   = os.getenv("IGNITION_REQUIRED", "1") == "1"
 IGNITION_MIN_DELTA  = int(os.getenv("IGNITION_MIN_DELTA",  "25"))  # Raised: require a stronger burst to confirm real ignition
 IGNITION_PRIOR_MAX  = int(os.getenv("IGNITION_PRIOR_MAX",  "74"))  # Block only if already at STRONG level (≥75); allows breakouts from 70
 IGNITION_LOOKBACK_S = int(os.getenv("IGNITION_LOOKBACK_S", "300"))  # how far back to compare (default 5 min)
+# Continuation override: allow one strong alert even if the trend is already hot,
+# as long as score remains very strong and has not faded over lookback.
+IGNITION_CONTINUATION_ENABLED = os.getenv("IGNITION_CONTINUATION_ENABLED", "1") == "1"
+IGNITION_CONTINUATION_MIN_SCORE = int(os.getenv("IGNITION_CONTINUATION_MIN_SCORE", "85"))
+IGNITION_CONTINUATION_MIN_DELTA = int(os.getenv("IGNITION_CONTINUATION_MIN_DELTA", "0"))
 
 # RSI exhaustion filter: don't buy CALLs when RSI is overbought or PUTs when oversold.
 # Set RSI_FILTER=0 to disable.
@@ -1289,11 +1294,21 @@ def run_symbol(client, symbol):
                 "\u2014 ignition gate bypassed."
             )
         elif past_score >= IGNITION_PRIOR_MAX:
-            log(
-                f"[{symbol}] Ignition gate: {side} 5m ago was already {past_score} "
-                f"(>= {IGNITION_PRIOR_MAX}) \u2014 mid/late trend, no alert."
-            )
-            return
+            if (
+                IGNITION_CONTINUATION_ENABLED
+                and now_score >= IGNITION_CONTINUATION_MIN_SCORE
+                and delta >= IGNITION_CONTINUATION_MIN_DELTA
+            ):
+                log(
+                    f"[{symbol}] Ignition continuation override: {side} remains strong "
+                    f"({past_score} -> {now_score}, \u0394 {delta:+d}) \u2014 allowing one continuation entry."
+                )
+            else:
+                log(
+                    f"[{symbol}] Ignition gate: {side} 5m ago was already {past_score} "
+                    f"(>= {IGNITION_PRIOR_MAX}) \u2014 mid/late trend, no alert."
+                )
+                return
         if now_score < 90 and delta < IGNITION_MIN_DELTA:
             log(
                 f"[{symbol}] Ignition gate: {side} delta only +{delta} (need +{IGNITION_MIN_DELTA}) "
