@@ -997,6 +997,20 @@ def _underlying_from_contract(contract_symbol):
     return m.group(1) if m else None
 
 
+def _is_option_asset_class(asset_class_val):
+    """Return True when Alpaca asset_class represents an option position."""
+    if asset_class_val is None:
+        return False
+
+    raw = str(asset_class_val).strip().lower()
+    if not raw:
+        return False
+
+    # Handles forms like: 'us_option', 'option', 'options', 'AssetClass.US_OPTION'
+    token = raw.split(".")[-1]
+    return token in ("option", "options", "us_option")
+
+
 def sync_open_trades_from_alpaca():
     """Mirror _open_trades from live Alpaca option positions.
 
@@ -1018,8 +1032,8 @@ def sync_open_trades_from_alpaca():
             if not contract_sym:
                 continue
 
-            asset_class = str(getattr(pos, "asset_class", "") or "").lower()
-            if asset_class and asset_class not in ("option", "us_option"):
+            asset_class = getattr(pos, "asset_class", None)
+            if not _is_option_asset_class(asset_class):
                 continue
             scanned_option += 1
 
@@ -1117,8 +1131,8 @@ def has_open_underlying_position(symbol, side):
             if not pos_symbol.startswith(symbol):
                 continue
 
-            asset_class = str(getattr(pos, "asset_class", "") or "").lower()
-            if asset_class and asset_class not in ("option", "us_option"):
+            asset_class = getattr(pos, "asset_class", None)
+            if not _is_option_asset_class(asset_class):
                 continue
 
             pos_side = _option_side_from_contract(pos_symbol)
@@ -1459,12 +1473,18 @@ def run_symbol(client, symbol):
     alert_key = (symbol, side)
     now_ct = datetime.now(central)
     if alert_key in _alerted_today["keys"]:
-        if alert_key in _alert_cooldowns and now_ct >= _alert_cooldowns[alert_key]:
+        # If no live/pending Alpaca trade exists, this is a stale lock — clear it.
+        live_exists, live_detail = has_open_underlying_position(symbol, side)
+        if not live_exists:
+            _alerted_today["keys"].discard(alert_key)
+            _alert_cooldowns.pop(alert_key, None)
+            log(f"[{symbol}] Cleared stale alert lock for {side} (no live Alpaca trade found).")
+        elif alert_key in _alert_cooldowns and now_ct >= _alert_cooldowns[alert_key]:
             # Cooldown expired — clear and allow re-alert.
             _alerted_today["keys"].discard(alert_key)
             _alert_cooldowns.pop(alert_key, None)
         else:
-            log(f"[{symbol}] Already alerted {side} today — suppressed.")
+            log(f"[{symbol}] Already alerted {side} today ({live_detail}) — suppressed.")
             return
 
     # Trend-ignition filter: only fire when the move is *just starting*, not mid- or late-trend.
