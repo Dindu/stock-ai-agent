@@ -111,6 +111,8 @@ PROFIT_PROTECT_DRAWDOWN_PCT = float(os.getenv("PROFIT_PROTECT_DRAWDOWN_PCT", "0.
 MAX_OPEN_TRADES   = int(os.getenv("MAX_OPEN_TRADES",   "5"))
 # Block stacking multiple strikes on the same symbol+side while one is open.
 SINGLE_POSITION_PER_SYMBOL = os.getenv("SINGLE_POSITION_PER_SYMBOL", "1") == "1"
+# Rehydrate in-memory trade tracking from Alpaca open positions after restarts.
+RECOVER_OPEN_POSITIONS = os.getenv("RECOVER_OPEN_POSITIONS", "1") == "1"
 BASE_POSITION_QTY = int(os.getenv("POSITION_QTY",      "1"))
 MIN_POSITION_QTY  = int(os.getenv("MIN_POSITION_QTY",  "5"))
 MAX_POSITION_QTY  = int(os.getenv("MAX_POSITION_QTY",  "10"))
@@ -948,6 +950,83 @@ def _option_side_from_contract(contract_symbol):
     return "CALL" if m.group(1) == "C" else "PUT"
 
 
+def _underlying_from_contract(contract_symbol):
+    """Infer underlying ticker from OCC option symbol; returns None if unknown."""
+    m = re.match(r"^([A-Z]+)\d{6}[CP]\d{8}$", str(contract_symbol or ""))
+    return m.group(1) if m else None
+
+
+def sync_open_trades_from_alpaca():
+    """Populate _open_trades from live Alpaca option positions not yet tracked in memory."""
+    if _trading_client is None:
+        return
+
+    recovered = 0
+    try:
+        for pos in _trading_client.get_all_positions():
+            contract_sym = str(getattr(pos, "symbol", "") or "")
+            if not contract_sym:
+                continue
+
+            asset_class = str(getattr(pos, "asset_class", "") or "").lower()
+            if asset_class and asset_class not in ("option", "us_option"):
+                continue
+
+            if contract_sym in _open_trades:
+                continue
+
+            underlying = _underlying_from_contract(contract_sym)
+            side = _option_side_from_contract(contract_sym)
+            if not underlying or side not in ("CALL", "PUT"):
+                continue
+
+            try:
+                qty = abs(int(float(getattr(pos, "qty", 0) or 0)))
+            except Exception:
+                qty = 0
+            if qty <= 0:
+                continue
+
+            try:
+                entry = float(getattr(pos, "avg_entry_price", 0) or 0)
+            except Exception:
+                entry = 0.0
+            if entry <= 0:
+                continue
+
+            try:
+                strike_val = float(getattr(pos, "strike_price", 0) or 0)
+            except Exception:
+                strike_val = 0.0
+            strike = int(strike_val) if strike_val else 0
+
+            expiry = str(getattr(pos, "expiration_date", "") or "")
+
+            _open_trades[contract_sym] = {
+                "underlying": underlying,
+                "signal": f"RECOVERED {side}",
+                "side": side,
+                "contract": contract_sym,
+                "expiry": expiry,
+                "strike": strike,
+                "entry": entry,
+                "qty": qty,
+                "target": entry * (1 + PROFIT_TARGET_PCT),
+                "stop": entry * (1 - STOP_LOSS_PCT),
+                "score": 0,
+                "max_pnl_pct": 0.0,
+                "opened_at": datetime.now(central),
+                "status": "OPEN",
+            }
+            recovered += 1
+    except Exception as e:
+        log(f"Alpaca position recovery failed: {e}")
+        return
+
+    if recovered:
+        log(f"Recovered {recovered} open option position(s) from Alpaca for exit tracking.")
+
+
 def has_open_underlying_position(symbol, side):
     """Return (True, detail) when an open position already exists for symbol+side."""
     for t in _open_trades.values():
@@ -1009,7 +1088,10 @@ def track_open_trades():
     visible in Alpaca (e.g. fill not yet propagated).
     """
     if not _open_trades:
-        return
+        if RECOVER_OPEN_POSITIONS:
+            sync_open_trades_from_alpaca()
+        if not _open_trades:
+            return
 
     for trade in list(_open_trades.values()):
         contract_sym = trade["contract"]
@@ -1529,6 +1611,9 @@ def main():
         log("Paper trading DISABLED — alerts only, no orders will be submitted (TradingClient used for option contract lookup only).")
 
     init_google_sheets()
+
+    if RECOVER_OPEN_POSITIONS:
+        sync_open_trades_from_alpaca()
 
     log(f"Options Alert Bot started. Symbols={','.join(SYMBOLS)} "
         f"Polling every {POLL_SECONDS}s. Feed={FEED}.")
