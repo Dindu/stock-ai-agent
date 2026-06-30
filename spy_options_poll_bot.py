@@ -185,6 +185,7 @@ def init_google_sheets():
     if not GOOGLE_SERVICE_ACCOUNT_EMAIL or not GOOGLE_PRIVATE_KEY:
         log("Google Sheets credentials not configured — sheet logging disabled.")
         return
+    step = "build credentials"
     try:
         creds = GCredentials.from_service_account_info(
             {
@@ -199,17 +200,20 @@ def init_google_sheets():
                 "https://www.googleapis.com/auth/drive",
             ],
         )
+        step = "authorize gspread client"
         gc = gspread.authorize(creds)
 
         # Prefer explicit sheet ID when provided (stable target across restarts).
         # This avoids accidental sheet churn if FORCE_NEW_GOOGLE_SHEET is left enabled.
         if GOOGLE_SPREADSHEET_ID:
+            step = f"open spreadsheet by id {GOOGLE_SPREADSHEET_ID[:8]}..."
             if FORCE_NEW_GOOGLE_SHEET:
                 log("FORCE_NEW_GOOGLE_SHEET=1 ignored because GOOGLE_SPREADSHEET_ID is set.")
             _gsheet = gc.open_by_key(GOOGLE_SPREADSHEET_ID)
             log(f"Opened existing Google Sheet by ID: '{_gsheet.title}'")
         # Force-create mode: always create a fresh sheet with a timestamped name.
         elif FORCE_NEW_GOOGLE_SHEET:
+            step = "create new spreadsheet (force mode)"
             fresh_name = f"{GOOGLE_SPREADSHEET_NAME} {datetime.now(central).strftime('%Y-%m-%d %H%M%S')}"
             _gsheet = gc.create(fresh_name)
             _gsheet.share(None, perm_type="anyone", role="writer")
@@ -217,9 +221,11 @@ def init_google_sheets():
         else:
             # Find existing spreadsheet by name, or create a new one.
             try:
+                step = f"open spreadsheet by name '{GOOGLE_SPREADSHEET_NAME}'"
                 _gsheet = gc.open(GOOGLE_SPREADSHEET_NAME)
                 log(f"Opened existing Google Sheet: '{GOOGLE_SPREADSHEET_NAME}'")
             except gspread.exceptions.SpreadsheetNotFound:
+                step = f"create spreadsheet by name '{GOOGLE_SPREADSHEET_NAME}'"
                 _gsheet = gc.create(GOOGLE_SPREADSHEET_NAME)
                 # Make it accessible to anyone with the link (read+write).
                 _gsheet.share(None, perm_type="anyone", role="writer")
@@ -273,9 +279,15 @@ def init_google_sheets():
 
     except Exception as e:
         log(
-            f"Google Sheets init failed: {type(e).__name__}: {e!r} "
+            f"Google Sheets init failed at '{step}': {type(e).__name__}: {e!r} "
             "— sheet logging disabled."
         )
+        if GOOGLE_SPREADSHEET_ID:
+            log(
+                "Sheets hint: ensure this service account has Editor access to the target sheet "
+                f"and Drive API is enabled. service_account={GOOGLE_SERVICE_ACCOUNT_EMAIL} "
+                f"sheet_id={GOOGLE_SPREADSHEET_ID}"
+            )
         _gsheet = None
 
 
