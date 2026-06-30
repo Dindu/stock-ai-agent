@@ -198,16 +198,19 @@ def init_google_sheets():
         )
         gc = gspread.authorize(creds)
 
+        # Prefer explicit sheet ID when provided (stable target across restarts).
+        # This avoids accidental sheet churn if FORCE_NEW_GOOGLE_SHEET is left enabled.
+        if GOOGLE_SPREADSHEET_ID:
+            if FORCE_NEW_GOOGLE_SHEET:
+                log("FORCE_NEW_GOOGLE_SHEET=1 ignored because GOOGLE_SPREADSHEET_ID is set.")
+            _gsheet = gc.open_by_key(GOOGLE_SPREADSHEET_ID)
+            log(f"Opened existing Google Sheet by ID: '{_gsheet.title}'")
         # Force-create mode: always create a fresh sheet with a timestamped name.
-        if FORCE_NEW_GOOGLE_SHEET:
+        elif FORCE_NEW_GOOGLE_SHEET:
             fresh_name = f"{GOOGLE_SPREADSHEET_NAME} {datetime.now(central).strftime('%Y-%m-%d %H%M%S')}"
             _gsheet = gc.create(fresh_name)
             _gsheet.share(None, perm_type="anyone", role="writer")
             log(f"✅ Force-created new Google Sheet: '{fresh_name}'")
-        # Open by ID (existing sheet) if provided, otherwise find/create by name.
-        elif GOOGLE_SPREADSHEET_ID:
-            _gsheet = gc.open_by_key(GOOGLE_SPREADSHEET_ID)
-            log(f"Opened existing Google Sheet by ID: '{_gsheet.title}'")
         else:
             # Find existing spreadsheet by name, or create a new one.
             try:
@@ -310,6 +313,7 @@ def log_alert_to_sheets(symbol, data, option):
 def log_trade_open_to_sheets(trade):
     """Write a row to the Trades tab the moment a paper trade opens."""
     if _gsheet is None:
+        log(f"[{trade.get('underlying', 'UNKNOWN')}] Trades write skipped: Google Sheets not initialized.")
         return
     try:
         trade_id = str(uuid.uuid4())[:8].upper()
@@ -347,6 +351,7 @@ def log_trade_open_to_sheets(trade):
 def log_trade_to_sheets(row, trade):
     """Update the existing Trades row (written at open) with exit details."""
     if _gsheet is None:
+        log(f"[{row.get('underlying', 'UNKNOWN')}] Trades close write skipped: Google Sheets not initialized.")
         return
     try:
         opened = row["opened_at"]
