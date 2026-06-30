@@ -108,7 +108,7 @@ STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.20"))  # stop-loss a
 PROFIT_PROTECT_ARM_PCT = float(os.getenv("PROFIT_PROTECT_ARM_PCT", "0.04"))
 PROFIT_PROTECT_FLOOR_PCT = float(os.getenv("PROFIT_PROTECT_FLOOR_PCT", "0.00"))
 PROFIT_PROTECT_DRAWDOWN_PCT = float(os.getenv("PROFIT_PROTECT_DRAWDOWN_PCT", "0.08"))
-MAX_OPEN_TRADES   = int(os.getenv("MAX_OPEN_TRADES",   "5"))
+MAX_OPEN_TRADES   = int(os.getenv("MAX_OPEN_TRADES",   "25"))
 # Block stacking multiple strikes on the same symbol+side while one is open.
 SINGLE_POSITION_PER_SYMBOL = os.getenv("SINGLE_POSITION_PER_SYMBOL", "1") == "1"
 # Rehydrate in-memory trade tracking from Alpaca open positions after restarts.
