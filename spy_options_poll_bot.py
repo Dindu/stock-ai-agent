@@ -48,8 +48,17 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK")
 FEED = os.getenv("ALPACA_FEED", "iex").lower()
 
-# Symbols to scan, in order. Override via env: SYMBOLS="SPY,QQQ,IWM"
-SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "SPY,QQQ,IWM").split(",") if s.strip()]
+# Symbols to scan, in order. Override via env.
+ETF_SYMBOLS = {"SPY", "QQQ", "IWM"}
+TOP_STOCK_SYMBOLS = {
+    "AAPL", "NVDA", "MSFT", "AMZN", "META",
+    "TSLA", "AMD", "PLTR", "NFLX", "GOOGL",
+    "AVGO", "SMCI", "MU", "COIN", "QCOM",
+    "INTC", "CRM", "ORCL", "SHOP", "AMD",
+}
+AGGRESSIVE_STOCK_SYMBOLS = {"TSLA", "AMD", "PLTR", "SMCI", "COIN", "SHOP", "UBER"}
+DEFAULT_SYMBOLS = "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,META,TSLA,AMD,PLTR,NFLX,GOOGL,AVGO,SMCI,MU,COIN,QCOM,INTC,CRM,ORCL,SHOP,UBER"
+SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
 BAR_MINUTES = 5
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index options
 LOOKBACK_BARS = 120
@@ -499,6 +508,34 @@ def _spy_vwap_side():
     Returns None if SPY hasn't been evaluated yet this cycle.
     """
     return _spy_vwap_cache.get("side")
+
+
+def symbol_profile(symbol):
+    """Return per-symbol entry tuning so single stocks use stricter filters than ETFs."""
+    profile = {
+        "ignition_min_delta": IGNITION_MIN_DELTA,
+        "rsi_overbought": RSI_OVERBOUGHT,
+        "rsi_oversold": RSI_OVERSOLD,
+        "max_ext_from_vwap": MAX_EXT_FROM_VWAP,
+    }
+    if symbol in ETF_SYMBOLS:
+        return profile
+    if symbol in AGGRESSIVE_STOCK_SYMBOLS:
+        profile.update({
+            "ignition_min_delta": IGNITION_MIN_DELTA + 10,
+            "rsi_overbought": max(55, RSI_OVERBOUGHT - 2),
+            "rsi_oversold": min(45, RSI_OVERSOLD + 2),
+            "max_ext_from_vwap": min(MAX_EXT_FROM_VWAP, 0.009),
+        })
+        return profile
+    if symbol in TOP_STOCK_SYMBOLS:
+        profile.update({
+            "ignition_min_delta": IGNITION_MIN_DELTA + 5,
+            "rsi_overbought": max(55, RSI_OVERBOUGHT - 1),
+            "rsi_oversold": min(45, RSI_OVERSOLD + 1),
+            "max_ext_from_vwap": min(MAX_EXT_FROM_VWAP, 0.010),
+        })
+    return profile
 
 
 def position_qty_from_score(score):
@@ -1479,6 +1516,12 @@ def run_symbol(client, symbol):
         log(f"[{symbol}] Bars: {len(bars)}/55 — warming up.")
         return
 
+    profile = symbol_profile(symbol)
+    ignition_min_delta = int(profile["ignition_min_delta"])
+    rsi_overbought = int(profile["rsi_overbought"])
+    rsi_oversold = int(profile["rsi_oversold"])
+    max_ext_from_vwap = float(profile["max_ext_from_vwap"])
+
     side, data = analyze(bars, client, symbol)
     if data:
         trend_5m = f" | 5m\u0394 BULL {data['bull_score'] - data['bull_5m']:+d}" if data['bull_5m'] is not None else ""
@@ -1537,10 +1580,10 @@ def run_symbol(client, symbol):
                 _, oldest_bull, oldest_bear = history[0]
                 past_score = oldest_bull if side == "CALL" else oldest_bear
                 delta = now_score - past_score
-                if now_score < 90 and delta < IGNITION_MIN_DELTA:
+                if now_score < 90 and delta < ignition_min_delta:
                     log(
                         f"[{symbol}] Ignition gate: warmup history only ({len(history)} samples), "
-                        f"{side} delta +{delta} < +{IGNITION_MIN_DELTA} \u2014 waiting for clearer ignition."
+                        f"{side} delta +{delta} < +{ignition_min_delta} \u2014 waiting for clearer ignition."
                     )
                     return
                 log(
@@ -1587,9 +1630,9 @@ def run_symbol(client, symbol):
                     f"(>= {IGNITION_PRIOR_MAX}) \u2014 mid/late trend, no alert."
                 )
                 return
-        if (not continuation_override) and now_score < 90 and delta < IGNITION_MIN_DELTA:
+        if (not continuation_override) and now_score < 90 and delta < ignition_min_delta:
             log(
-                f"[{symbol}] Ignition gate: {side} delta only +{delta} (need +{IGNITION_MIN_DELTA}) "
+                f"[{symbol}] Ignition gate: {side} delta only +{delta} (need +{ignition_min_delta}) "
                 f"\u2014 trend not igniting, no alert."
             )
             return
@@ -1604,11 +1647,11 @@ def run_symbol(client, symbol):
     # or PUTs when RSI is already oversold.
     if RSI_FILTER:
         rsi = data.get("rsi", 50.0)
-        if side == "CALL" and rsi >= RSI_OVERBOUGHT:
-            log(f"[{symbol}] RSI filter: CALL blocked — RSI {rsi:.1f} >= {RSI_OVERBOUGHT} (overbought, late entry).")
+        if side == "CALL" and rsi >= rsi_overbought:
+            log(f"[{symbol}] RSI filter: CALL blocked — RSI {rsi:.1f} >= {rsi_overbought} (overbought, late entry).")
             return
-        if side == "PUT" and rsi <= RSI_OVERSOLD:
-            log(f"[{symbol}] RSI filter: PUT blocked — RSI {rsi:.1f} <= {RSI_OVERSOLD} (oversold, late entry).")
+        if side == "PUT" and rsi <= rsi_oversold:
+            log(f"[{symbol}] RSI filter: PUT blocked — RSI {rsi:.1f} <= {rsi_oversold} (oversold, late entry).")
             return
 
     # ── Macro alignment context (penalty by default, optional hard block) ───
@@ -1640,10 +1683,10 @@ def run_symbol(client, symbol):
     # entering when the latest candle already flipped against our side.
     if ANTI_CHASE_FILTER:
         ext_pct = float(data.get("vwap_extension_pct", 0.0))
-        if ext_pct > MAX_EXT_FROM_VWAP:
+        if ext_pct > max_ext_from_vwap:
             log(
                 f"[{symbol}] Anti-chase: {side} blocked — price is {ext_pct*100:.2f}% from VWAP "
-                f"(max {MAX_EXT_FROM_VWAP*100:.2f}%)."
+                f"(max {max_ext_from_vwap*100:.2f}%)."
             )
             return
 
