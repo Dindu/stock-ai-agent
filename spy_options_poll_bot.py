@@ -450,14 +450,33 @@ def log_trade_to_sheets(row, trade):
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-def send_discord(message):
+DISCORD_COLOR_CALL = 0x2ECC71
+DISCORD_COLOR_PUT = 0xE74C3C
+DISCORD_COLOR_WARN = 0xF1C40F
+
+
+def send_discord(message, color=None):
     if not DISCORD_WEBHOOK_URL:
         print("Missing Discord webhook.")
         return
-    if len(message) > 1990:
-        message = message[:1987] + "..."
+    payload = None
+    if color is None:
+        if len(message) > 1990:
+            message = message[:1987] + "..."
+        payload = {"content": message}
+    else:
+        if len(message) > 4000:
+            message = message[:3997] + "..."
+        payload = {
+            "embeds": [
+                {
+                    "description": message,
+                    "color": int(color),
+                }
+            ]
+        }
     try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=10)
+        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
         if r.status_code not in (200, 204):
             print(f"Discord post returned {r.status_code}: {r.text[:100]}", flush=True)
     except Exception as e:
@@ -877,7 +896,7 @@ def get_option_contract(symbol, signal, underlying_price):
     except Exception as e:
         msg = f"[{symbol}] Option contract fetch failed: {type(e).__name__}: {e}"
         print(msg, flush=True)
-        send_discord(f"⚠️ **Option fetch error** — `{symbol}`\n```{msg}```")
+        send_discord(f"⚠️ **Option fetch error** — `{symbol}`\n```{msg}```", color=DISCORD_COLOR_WARN)
         return None
 
 
@@ -1307,7 +1326,8 @@ def close_trade(trade, exit_price, reason, pnl_pct):
         f"\U0001f3c6 **Grade:** `{grade}`\n\n"
         f"\U0001f4cc **Outcome:** `{outcome_label} (RULES FOLLOWED)`\n"
         f"Opened: `{trade['opened_at']:%Y-%m-%d %H:%M:%S %Z}`\n"
-        f"Closed: `{closed_at:%Y-%m-%d %H:%M:%S %Z}`"
+        f"Closed: `{closed_at:%Y-%m-%d %H:%M:%S %Z}`",
+        color=DISCORD_COLOR_CALL if pnl_pct > 0 else DISCORD_COLOR_PUT,
     )
 
     row = {
@@ -1412,7 +1432,8 @@ def try_open_paper_trade(symbol, side, option, data):
         f"\U0001f3af **Plan:** Entry `${trade['entry']:.2f}` | Target `${target_1:.2f}` / `${target_2:.2f}` | Stop `-{stop_pct:.0f}%`\n"
         f"\U0001f6d1 **Invalidation:** VWAP loss / hard stop hit\n"
         f"\U0001f916 **AI:** \U0001f7e1 **{ai_label}** — balanced setup with rules-aligned confirmation\n\n"
-        f"\U0001f4cc **Action:** ENTERED (`{trade['qty']}` contract{'s' if trade['qty'] != 1 else ''})"
+        f"\U0001f4cc **Action:** ENTERED (`{trade['qty']}` contract{'s' if trade['qty'] != 1 else ''})",
+        color=DISCORD_COLOR_CALL if trade['side'] == 'CALL' else DISCORD_COLOR_PUT,
     )
     log(f"[{symbol}] Paper trade opened: {trade['contract']} fill ${trade['entry']:.2f} "
         f"target ${trade['target']:.2f} stop ${trade['stop']:.2f}")
@@ -1652,7 +1673,8 @@ def run_symbol(client, symbol):
             f"**Score Components**\n{checklist}\n\n"
             f"**Levels**\n"
             f"VWAP: `{data['vwap']:.2f}` | EMA20: `{data['ema20']:.2f}` | EMA50: `{data['ema50']:.2f}`\n"
-            f"PDH: `{data['pdh']:.2f}` | PDL: `{data['pdl']:.2f}`"
+            f"PDH: `{data['pdh']:.2f}` | PDL: `{data['pdl']:.2f}`",
+            color=DISCORD_COLOR_CALL if side == "CALL" else DISCORD_COLOR_PUT,
         )
         log_alert_to_sheets(symbol, data, None)
         return
@@ -1717,13 +1739,13 @@ Alert only \u2014 verify chart before taking play.
 
         if not opened:
             # Fall back to one setup alert when execution is not possible.
-            send_discord(message)
+            send_discord(message, color=DISCORD_COLOR_CALL if side == "CALL" else DISCORD_COLOR_PUT)
             log(f"[{symbol}] Alert sent (execution unavailable): {data['signal']} {option['contract']} "
                 f"(BULL {data['bull_score']} / BEAR {data['bear_score']})")
             log_alert_to_sheets(symbol, data, option)
     else:
         # Alert-only mode when paper trading is disabled.
-        send_discord(message)
+        send_discord(message, color=DISCORD_COLOR_CALL if side == "CALL" else DISCORD_COLOR_PUT)
         log(f"[{symbol}] Alert sent: {data['signal']} {option['contract']} (BULL {data['bull_score']} / BEAR {data['bear_score']})")
         log_alert_to_sheets(symbol, data, option)
 
