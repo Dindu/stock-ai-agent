@@ -54,7 +54,7 @@ TOP_STOCK_SYMBOLS = {
     "AAPL", "NVDA", "MSFT", "AMZN", "META",
     "TSLA", "AMD", "PLTR", "NFLX", "GOOGL",
     "AVGO", "SMCI", "MU", "COIN", "QCOM",
-    "INTC", "CRM", "ORCL", "SHOP", "AMD",
+    "INTC", "CRM", "ORCL", "SHOP", "UBER",
 }
 AGGRESSIVE_STOCK_SYMBOLS = {"TSLA", "AMD", "PLTR", "SMCI", "COIN", "SHOP", "UBER"}
 DEFAULT_SYMBOLS = "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,META,TSLA,AMD,PLTR,NFLX,GOOGL,AVGO,SMCI,MU,COIN,QCOM,INTC,CRM,ORCL,SHOP,UBER"
@@ -73,6 +73,8 @@ SCORE_STRONG = int(os.getenv("SCORE_STRONG", "80"))   # STRONG CALL/PUT alert
 SCORE_SIGNAL = int(os.getenv("SCORE_SIGNAL", "65"))   # CALL/PUT alert
 SCORE_WATCH  = int(os.getenv("SCORE_WATCH",  "50"))   # WATCHLIST heads-up
 SCORE_DOMINANCE = int(os.getenv("SCORE_DOMINANCE", "20"))  # bull must lead bear by this much (and vice versa)
+# Stock-only tightening: require a slightly higher effective strong score.
+STOCK_STRONG_SCORE_BONUS = int(os.getenv("STOCK_STRONG_SCORE_BONUS", "5"))
 
 # Trend-ignition filter: only fire when the score is *starting* to rise into the threshold.
 # CALL example: 5 minutes ago BULL was below IGNITION_PRIOR_MAX, now it has gained at least IGNITION_MIN_DELTA.
@@ -129,6 +131,14 @@ MAX_POSITION_QTY  = int(os.getenv("MAX_POSITION_QTY",  "10"))
 CONFIDENCE_POSITIONING = os.getenv("CONFIDENCE_POSITIONING", "1") == "1"
 CONFIDENCE_STEP_SCORE  = int(os.getenv("CONFIDENCE_STEP_SCORE", "5"))
 TRADE_LOG_FILE    = os.getenv("TRADE_LOG_FILE", "trade_results.csv")
+
+# Option quality filters (stock-only tightened defaults; ETFs remain baseline).
+ETF_MIN_OPTION_BID = float(os.getenv("ETF_MIN_OPTION_BID", "0.15"))
+ETF_MAX_OPTION_SPREAD_PCT = float(os.getenv("ETF_MAX_OPTION_SPREAD_PCT", "0.30"))
+STOCK_MIN_OPTION_BID = float(os.getenv("STOCK_MIN_OPTION_BID", "0.20"))
+STOCK_MAX_OPTION_SPREAD_PCT = float(os.getenv("STOCK_MAX_OPTION_SPREAD_PCT", "0.25"))
+STOCK_MIN_OPTION_VOLUME = int(os.getenv("STOCK_MIN_OPTION_VOLUME", "10"))
+STOCK_MIN_OPTION_OPEN_INTEREST = int(os.getenv("STOCK_MIN_OPTION_OPEN_INTEREST", "50"))
 
 # Google Sheets tracking — bot creates/finds a spreadsheet by name automatically.
 GOOGLE_SPREADSHEET_NAME   = os.getenv("GOOGLE_SPREADSHEET_NAME", "SPY Options Bot Log")
@@ -935,18 +945,33 @@ def get_option_contract(symbol, signal, underlying_price):
 
         dte = (exp_date - today).days
 
-        # ── Quality filters — skip contracts with terrible economics ──────────
-        MIN_BID      = 0.15   # pennies below this have giant spreads relative to value
-        MAX_SPREAD_PCT = 0.30  # (ask-bid)/mid > 30% means market-order round-trip eats the trade
+        # ── Quality filters — stock names use tighter option liquidity checks ──
+        is_etf = symbol in ETF_SYMBOLS
+        min_bid = ETF_MIN_OPTION_BID if is_etf else STOCK_MIN_OPTION_BID
+        max_spread_pct = ETF_MAX_OPTION_SPREAD_PCT if is_etf else STOCK_MAX_OPTION_SPREAD_PCT
 
-        if bid < MIN_BID:
-            print(f"[{symbol}] Contract {contract_sym} rejected — bid ${bid:.2f} < ${MIN_BID:.2f} minimum.", flush=True)
+        if bid < min_bid:
+            print(f"[{symbol}] Contract {contract_sym} rejected — bid ${bid:.2f} < ${min_bid:.2f} minimum.", flush=True)
+            return None
+
+        if not is_etf and vol < STOCK_MIN_OPTION_VOLUME:
+            print(
+                f"[{symbol}] Contract {contract_sym} rejected — volume {vol} < {STOCK_MIN_OPTION_VOLUME} minimum.",
+                flush=True,
+            )
+            return None
+
+        if not is_etf and oi < STOCK_MIN_OPTION_OPEN_INTEREST:
+            print(
+                f"[{symbol}] Contract {contract_sym} rejected — OI {oi} < {STOCK_MIN_OPTION_OPEN_INTEREST} minimum.",
+                flush=True,
+            )
             return None
 
         mid = (bid + ask) / 2 if (bid + ask) > 0 else 0.01
         spread_pct = (ask - bid) / mid
-        if spread_pct > MAX_SPREAD_PCT:
-            print(f"[{symbol}] Contract {contract_sym} rejected — spread {spread_pct*100:.1f}% > {MAX_SPREAD_PCT*100:.0f}% max.", flush=True)
+        if spread_pct > max_spread_pct:
+            print(f"[{symbol}] Contract {contract_sym} rejected — spread {spread_pct*100:.1f}% > {max_spread_pct*100:.0f}% max.", flush=True)
             return None
 
         return {
@@ -1574,6 +1599,16 @@ def run_symbol(client, symbol):
         log(f"[{symbol}] {data['signal']} (BULL {data['bull_score']} / BEAR {data['bear_score']}) "
             f"\u2014 below STRONG threshold, no Discord alert.")
         return
+
+    if symbol not in ETF_SYMBOLS:
+        side_score = data["bull_score"] if side == "CALL" else data["bear_score"]
+        required_score = SCORE_STRONG + max(0, STOCK_STRONG_SCORE_BONUS)
+        if side_score < required_score:
+            log(
+                f"[{symbol}] Stock strict score gate: {side} {side_score} < {required_score} "
+                f"(base {SCORE_STRONG} + bonus {STOCK_STRONG_SCORE_BONUS})."
+            )
+            return
 
     opening_block_minutes = opening_no_trade_minutes_remaining()
     if opening_block_minutes > 0:
