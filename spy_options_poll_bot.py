@@ -107,6 +107,7 @@ SPY_MACRO_HARD_BLOCK    = os.getenv("SPY_MACRO_HARD_BLOCK", "0") == "1"
 ANTI_CHASE_FILTER  = os.getenv("ANTI_CHASE_FILTER", "1") == "1"
 MAX_EXT_FROM_VWAP  = float(os.getenv("MAX_EXT_FROM_VWAP", "0.012"))  # 1.2%
 CANDLE_CONFIRMATION = os.getenv("CANDLE_CONFIRMATION", "1") == "1"
+ALERT_ONLY_COOLDOWN_MINUTES = int(os.getenv("ALERT_ONLY_COOLDOWN_MINUTES", "20"))
 
 # Paper-trading execution. When ENABLE_ALPACA_PAPER_TRADING=1 the bot will
 # submit a paper-account market BUY when a STRONG signal fires, then poll the
@@ -1623,6 +1624,15 @@ def run_symbol(client, symbol):
     alert_key = (symbol, side)
     now_ct = datetime.now(central)
     if alert_key in _alerted_today["keys"]:
+        cooldown_until = _alert_cooldowns.get(alert_key)
+        if cooldown_until and now_ct < cooldown_until:
+            mins_left = max(1, int((cooldown_until - now_ct).total_seconds() // 60))
+            log(f"[{symbol}] Already alerted {side} today (cooldown active, {mins_left}m left) — suppressed.")
+            return
+        if cooldown_until and now_ct >= cooldown_until:
+            _alerted_today["keys"].discard(alert_key)
+            _alert_cooldowns.pop(alert_key, None)
+
         # If no live/pending Alpaca trade exists, this is a stale lock — clear it.
         live_exists, live_detail = has_open_underlying_position(symbol, side)
         if not live_exists:
@@ -1778,6 +1788,8 @@ def run_symbol(client, symbol):
 
     option = get_option_contract(symbol, side, data["price"])
     if not option:
+        if ALERT_ONLY_COOLDOWN_MINUTES > 0:
+            _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
         log(f"[{symbol}] {data['signal']} setup detected, but no valid 1DTE+ option found — sending alert-only Discord.")
         emoji = "\U0001f7e2" if side == "CALL" else "\U0001f534"
         breakdown = data["bull_breakdown"] if side == "CALL" else data["bear_breakdown"]
@@ -1855,6 +1867,8 @@ Alert only \u2014 verify chart before taking play.
             opened = False
 
         if not opened:
+            if ALERT_ONLY_COOLDOWN_MINUTES > 0:
+                _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
             # Fall back to one setup alert when execution is not possible.
             send_discord(message, color=DISCORD_COLOR_CALL if side == "CALL" else DISCORD_COLOR_PUT)
             log(f"[{symbol}] Alert sent (execution unavailable): {data['signal']} {option['contract']} "
