@@ -61,6 +61,7 @@ DEFAULT_SYMBOLS = "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,META,TSLA,AMD,PLTR,NFLX,GOOGL
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
 BAR_MINUTES = 5
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index options
+OPENING_NO_TRADE_MINUTES = int(os.getenv("OPENING_NO_TRADE_MINUTES", "15"))
 LOOKBACK_BARS = 120
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
 MIN_DTE = 1  # Force 1DTE only
@@ -259,7 +260,11 @@ def init_google_sheets():
         try:
             existing_alert_headers = alerts_ws.row_values(1)
             if existing_alert_headers != _ALERTS_HEADERS:
-                alerts_ws.update("A1", [_ALERTS_HEADERS], value_input_option="USER_ENTERED")
+                alerts_ws.update(
+                    range_name="A1",
+                    values=[_ALERTS_HEADERS],
+                    value_input_option="USER_ENTERED",
+                )
                 log("Ensured 'Alerts' header row in Google Sheets.")
         except Exception as header_err:
             log(f"Warning: Could not verify/set Alerts headers: {header_err}")
@@ -273,7 +278,11 @@ def init_google_sheets():
         try:
             existing_trade_headers = trades_ws.row_values(1)
             if existing_trade_headers != _TRADES_HEADERS:
-                trades_ws.update("A1", [_TRADES_HEADERS], value_input_option="USER_ENTERED")
+                trades_ws.update(
+                    range_name="A1",
+                    values=[_TRADES_HEADERS],
+                    value_input_option="USER_ENTERED",
+                )
                 log("Ensured 'Trades' header row in Google Sheets.")
         except Exception as header_err:
             log(f"Warning: Could not verify/set Trades headers: {header_err}")
@@ -446,7 +455,11 @@ def log_trade_to_sheets(row, trade):
         ws = _gsheet.worksheet("Trades")
         sheets_row = trade.get("sheets_row")
         if sheets_row:
-            ws.update(f"A{sheets_row}", [full_row], value_input_option="USER_ENTERED")
+            ws.update(
+                range_name=f"A{sheets_row}",
+                values=[full_row],
+                value_input_option="USER_ENTERED",
+            )
             log(f"[{trade_id}] Trade closed → Google Sheets row {sheets_row} updated.")
         else:
             # Fallback: no open-row was stored, just append.
@@ -499,6 +512,24 @@ def market_open_now():
     start = now.replace(hour=8, minute=30, second=0, microsecond=0)
     end = now.replace(hour=14, minute=55, second=0, microsecond=0)
     return start <= now <= end
+
+
+def opening_no_trade_minutes_remaining(now=None):
+    """Return minutes remaining in the post-open no-trade window."""
+    if OPENING_NO_TRADE_MINUTES <= 0:
+        return 0
+
+    now = now or datetime.now(central)
+    if now.weekday() >= 5:
+        return 0
+
+    market_open = now.replace(hour=8, minute=30, second=0, microsecond=0)
+    market_resume = market_open + timedelta(minutes=OPENING_NO_TRADE_MINUTES)
+
+    if now < market_open or now >= market_resume:
+        return 0
+
+    return max(1, int((market_resume - now).total_seconds() // 60))
 
 
 def _spy_vwap_side():
@@ -1542,6 +1573,14 @@ def run_symbol(client, symbol):
     if data["tier"] != "STRONG":
         log(f"[{symbol}] {data['signal']} (BULL {data['bull_score']} / BEAR {data['bear_score']}) "
             f"\u2014 below STRONG threshold, no Discord alert.")
+        return
+
+    opening_block_minutes = opening_no_trade_minutes_remaining()
+    if opening_block_minutes > 0:
+        log(
+            f"[{symbol}] Opening volatility filter: skipping {data['signal']} during first "
+            f"{OPENING_NO_TRADE_MINUTES}m after open ({opening_block_minutes}m remaining)."
+        )
         return
 
     # One STRONG CALL alert and one STRONG PUT alert max per (symbol, side) per day.
