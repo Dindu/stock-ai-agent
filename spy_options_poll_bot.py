@@ -1510,6 +1510,17 @@ def _underlying_from_contract(contract_symbol):
     return m.group(1) if m else None
 
 
+def _strike_from_contract(contract_symbol):
+    """Infer strike from OCC option symbol; returns None if unknown."""
+    m = re.match(r"^[A-Z]+\d{6}[CP](\d{8})$", str(contract_symbol or ""))
+    if not m:
+        return None
+    try:
+        return int(m.group(1)) / 1000.0
+    except Exception:
+        return None
+
+
 def _is_option_asset_class(asset_class_val):
     """Return True when Alpaca asset_class represents an option position."""
     if asset_class_val is None:
@@ -1797,12 +1808,17 @@ def close_trade(trade, exit_price, reason, pnl_pct):
     entry_px = float(trade["entry"])
     exit_px = float(exit_price)
     strike_val = float(trade.get("strike", 0) or 0)
+    if strike_val <= 0:
+        parsed_strike = _strike_from_contract(trade.get("contract", ""))
+        if parsed_strike is not None:
+            strike_val = float(parsed_strike)
     strike_text = str(int(strike_val)) if abs(strike_val - int(strike_val)) < 1e-9 else f"{strike_val:.2f}"
     exit_header = f"{trade['underlying']} strike {strike_text}"
+    exit_type_label = "Profit" if pnl_pct > 0 else "Loss"
     grade = "A" if pnl_pct >= 0.20 else "B" if pnl_pct >= 0.10 else "C" if pnl_pct >= -0.10 else "D"
 
     send_discord(
-        f"\U0001f534 **Profit/loss — {exit_header} | {trade['side']} - {pnl_pct * 100:+.2f}%**\n\n"
+        f"\U0001f534 **{exit_type_label} — {exit_header} | {trade['side']} - {pnl_pct * 100:+.2f}%**\n\n"
         f"------------------------------\n"
         f"\U0001f4b2 **Current Price:** `${exit_px:.2f}`\n"
         f"\U0001f4ca **Trade:** `${entry_px:.2f} -> ${exit_px:.2f}` | `{duration_min}m`\n"
