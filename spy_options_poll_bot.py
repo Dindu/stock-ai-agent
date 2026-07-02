@@ -84,6 +84,7 @@ SYMBOL_NEWS_REFRESH_SECONDS = int(os.getenv("SYMBOL_NEWS_REFRESH_SECONDS", "300"
 BAR_MINUTES = 5
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index options
 OPENING_NO_TRADE_MINUTES = int(os.getenv("OPENING_NO_TRADE_MINUTES", "15"))
+CLOSING_NO_TRADE_MINUTES = int(os.getenv("CLOSING_NO_TRADE_MINUTES", "30"))
 LOOKBACK_BARS = 120
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
 MIN_DTE = int(os.getenv("MIN_DTE", "1"))   # Minimum DTE (exclude 0DTE)
@@ -582,6 +583,24 @@ def opening_no_trade_minutes_remaining(now=None):
         return 0
 
     return max(1, int((market_resume - now).total_seconds() // 60))
+
+
+def closing_no_trade_minutes_remaining(now=None):
+    """Return minutes remaining before session end when new entries are blocked."""
+    if CLOSING_NO_TRADE_MINUTES <= 0:
+        return 0
+
+    now = now or datetime.now(central)
+    if now.weekday() >= 5:
+        return 0
+
+    market_close = now.replace(hour=14, minute=55, second=0, microsecond=0)
+    block_start = market_close - timedelta(minutes=CLOSING_NO_TRADE_MINUTES)
+
+    if now < block_start or now >= market_close:
+        return 0
+
+    return max(1, int((market_close - now).total_seconds() // 60))
 
 
 def _spy_vwap_side():
@@ -2206,6 +2225,14 @@ def run_symbol(client, symbol):
             _spy_vwap_cache["updated_at"] = datetime.now(central)
 
     if side == "NO TRADE":
+        return
+
+    closing_block_minutes = closing_no_trade_minutes_remaining()
+    if closing_block_minutes > 0:
+        log(
+            f"[{symbol}] Closing window filter: skipping {data['signal']} during final "
+            f"{CLOSING_NO_TRADE_MINUTES}m before close ({closing_block_minutes}m remaining)."
+        )
         return
 
     if data.get("tier") == "WATCH" and not EXECUTE_WATCHLIST_SIGNALS:
