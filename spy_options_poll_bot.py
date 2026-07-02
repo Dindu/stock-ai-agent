@@ -91,6 +91,12 @@ SCORE_DOMINANCE = int(os.getenv("SCORE_DOMINANCE", "20"))  # bull must lead bear
 NO_GATING_MODE = os.getenv("NO_GATING_MODE", "1") == "1"
 # Stock-only tightening: require a slightly higher effective strong score.
 STOCK_STRONG_SCORE_BONUS = int(os.getenv("STOCK_STRONG_SCORE_BONUS", "5"))
+# Hard score gate control:
+# - When HARD_SCORE_GATE_ENABLED=0, no hard minimum score is enforced.
+# - When NO_GATING_MODE=1, the hard gate is bypassed by default unless
+#   HARD_SCORE_GATE_IN_NO_GATING_MODE=1.
+HARD_SCORE_GATE_ENABLED = os.getenv("HARD_SCORE_GATE_ENABLED", "1") == "1"
+HARD_SCORE_GATE_IN_NO_GATING_MODE = os.getenv("HARD_SCORE_GATE_IN_NO_GATING_MODE", "0") == "1"
 
 # Trend-ignition filter: only fire when the score is *starting* to rise into the threshold.
 # CALL example: 5 minutes ago BULL was below IGNITION_PRIOR_MAX, now it has gained at least IGNITION_MIN_DELTA.
@@ -1999,18 +2005,22 @@ def run_symbol(client, symbol):
     # Hard minimum score gate with symbol-aware threshold.
     # ETFs keep the base strict gate (> SCORE_STRONG), while single stocks require
     # an extra score buffer (SCORE_STRONG + STOCK_STRONG_SCORE_BONUS).
-    side_score = data["bull_score"] if side == "CALL" else data["bear_score"]
-    min_required_score = (
-        SCORE_STRONG + 1
-        if symbol in ETF_SYMBOLS
-        else SCORE_STRONG + max(0, STOCK_STRONG_SCORE_BONUS)
+    enforce_hard_gate = HARD_SCORE_GATE_ENABLED and (
+        (not NO_GATING_MODE) or HARD_SCORE_GATE_IN_NO_GATING_MODE
     )
-    if side_score < min_required_score:
-        log(
-            f"[{symbol}] Hard score gate: {side} {side_score} < {min_required_score} "
-            f"— skipping (requires >= {min_required_score})."
+    if enforce_hard_gate:
+        side_score = data["bull_score"] if side == "CALL" else data["bear_score"]
+        min_required_score = (
+            SCORE_STRONG + 1
+            if symbol in ETF_SYMBOLS
+            else SCORE_STRONG + max(0, STOCK_STRONG_SCORE_BONUS)
         )
-        return
+        if side_score < min_required_score:
+            log(
+                f"[{symbol}] Hard score gate: {side} {side_score} < {min_required_score} "
+                f"- skipping (requires >= {min_required_score})."
+            )
+            return
 
     # Only send Discord alerts for the perfect setup (STRONG tier) unless no-gating mode is enabled.
     if (not NO_GATING_MODE) and data["tier"] != "STRONG":
@@ -2289,7 +2299,12 @@ def main():
     else:
         log("Paper trading DISABLED — real-trades-only mode, no Discord/Sheets for setups (TradingClient used for option contract lookup only).")
     if NO_GATING_MODE:
-        log("NO_GATING_MODE enabled — bypassing entry gates for both ETFs and stocks.")
+        if HARD_SCORE_GATE_ENABLED and HARD_SCORE_GATE_IN_NO_GATING_MODE:
+            log("NO_GATING_MODE enabled - bypassing soft entry gates, hard score gate remains ON.")
+        elif HARD_SCORE_GATE_ENABLED:
+            log("NO_GATING_MODE enabled - bypassing entry gates, including hard score gate.")
+        else:
+            log("NO_GATING_MODE enabled - bypassing entry gates (hard score gate disabled globally).")
 
     init_google_sheets()
 
