@@ -902,15 +902,6 @@ def get_option_contract(symbol, signal, underlying_price):
                 abs(float(c.strike_price) - underlying_price),
             ),
         )
-        best = contracts[0]
-        contract_sym = best.symbol
-        exp_date = _exp_date(best)
-        print(f"[{symbol}] Best contract: {contract_sym}  strike={best.strike_price}  expiry={exp_date}", flush=True)
-
-        # Fetch live bid/ask/last/volume via a single Alpaca snapshot call.
-        snap_req = OptionSnapshotRequest(symbol_or_symbols=contract_sym)
-        snaps = _option_client.get_option_snapshot(snap_req)
-        snap = snaps.get(contract_sym) if isinstance(snaps, dict) else snaps
 
         def _safe_float(v, default=0.0):
             try:
@@ -924,75 +915,102 @@ def get_option_contract(symbol, signal, underlying_price):
             except Exception:
                 return default
 
-        bid = ask = last = 0.0
-        vol = oi = 0
-        if snap:
-            q = getattr(snap, "latest_quote", None) or getattr(snap, "quote", None)
-            t = getattr(snap, "latest_trade", None) or getattr(snap, "trade", None)
-            bar = (
-                getattr(snap, "daily_bar", None)
-                or getattr(snap, "day_bar", None)
-                or getattr(snap, "day", None)
-            )
-
-            if q is not None:
-                bid = _safe_float(getattr(q, "bid_price", 0.0), 0.0)
-                ask = _safe_float(getattr(q, "ask_price", 0.0), 0.0)
-            if t is not None:
-                last = _safe_float(getattr(t, "price", 0.0), 0.0)
-            if bar is not None:
-                vol = _safe_int(getattr(bar, "volume", 0), 0)
-
-            oi = _safe_int(
-                getattr(snap, "open_interest", None)
-                or getattr(snap, "openInterest", None)
-                or 0,
-                0,
-            )
-
-        dte = (exp_date - today).days
-
         # ── Quality filters — stock names use tighter option liquidity checks ──
         is_etf = symbol in ETF_SYMBOLS
         min_bid = ETF_MIN_OPTION_BID if is_etf else STOCK_MIN_OPTION_BID
         max_spread_pct = ETF_MAX_OPTION_SPREAD_PCT if is_etf else STOCK_MAX_OPTION_SPREAD_PCT
 
-        if bid < min_bid:
-            print(f"[{symbol}] Contract {contract_sym} rejected — bid ${bid:.2f} < ${min_bid:.2f} minimum.", flush=True)
-            return None
+        rejection_total = 0
+        rejection_logged = 0
+        max_rejection_logs = 5
 
-        if not is_etf and vol < STOCK_MIN_OPTION_VOLUME:
+        def _reject(msg):
+            nonlocal rejection_total, rejection_logged
+            rejection_total += 1
+            if rejection_logged < max_rejection_logs:
+                print(msg, flush=True)
+                rejection_logged += 1
+
+        for candidate in contracts:
+            contract_sym = candidate.symbol
+            exp_date = _exp_date(candidate)
+
+            # Fetch live bid/ask/last/volume for each candidate.
+            snap_req = OptionSnapshotRequest(symbol_or_symbols=contract_sym)
+            snaps = _option_client.get_option_snapshot(snap_req)
+            snap = snaps.get(contract_sym) if isinstance(snaps, dict) else snaps
+
+            bid = ask = last = 0.0
+            vol = oi = 0
+            if snap:
+                q = getattr(snap, "latest_quote", None) or getattr(snap, "quote", None)
+                t = getattr(snap, "latest_trade", None) or getattr(snap, "trade", None)
+                bar = (
+                    getattr(snap, "daily_bar", None)
+                    or getattr(snap, "day_bar", None)
+                    or getattr(snap, "day", None)
+                )
+
+                if q is not None:
+                    bid = _safe_float(getattr(q, "bid_price", 0.0), 0.0)
+                    ask = _safe_float(getattr(q, "ask_price", 0.0), 0.0)
+                if t is not None:
+                    last = _safe_float(getattr(t, "price", 0.0), 0.0)
+                if bar is not None:
+                    vol = _safe_int(getattr(bar, "volume", 0), 0)
+
+                oi = _safe_int(
+                    getattr(snap, "open_interest", None)
+                    or getattr(snap, "openInterest", None)
+                    or 0,
+                    0,
+                )
+
+            dte = (exp_date - today).days
+
+            if bid < min_bid:
+                _reject(f"[{symbol}] Contract {contract_sym} rejected — bid ${bid:.2f} < ${min_bid:.2f} minimum.")
+                continue
+
+            if not is_etf:
+                # Accept stock contracts when either intraday volume OR OI passes minimum.
+                if vol < STOCK_MIN_OPTION_VOLUME and oi < STOCK_MIN_OPTION_OPEN_INTEREST:
+                    _reject(
+                        f"[{symbol}] Contract {contract_sym} rejected — volume {vol} < {STOCK_MIN_OPTION_VOLUME} "
+                        f"and OI {oi} < {STOCK_MIN_OPTION_OPEN_INTEREST}."
+                    )
+                    continue
+
+            mid = (bid + ask) / 2 if (bid + ask) > 0 else 0.01
+            spread_pct = (ask - bid) / mid
+            if spread_pct > max_spread_pct:
+                _reject(
+                    f"[{symbol}] Contract {contract_sym} rejected — spread {spread_pct*100:.1f}% > {max_spread_pct*100:.0f}% max."
+                )
+                continue
+
             print(
-                f"[{symbol}] Contract {contract_sym} rejected — volume {vol} < {STOCK_MIN_OPTION_VOLUME} minimum.",
+                f"[{symbol}] Selected contract: {contract_sym}  strike={candidate.strike_price}  "
+                f"expiry={exp_date}  bid={bid:.2f} ask={ask:.2f} vol={vol} oi={oi}",
                 flush=True,
             )
-            return None
+            return {
+                "contract":      contract_sym,
+                "expiry":        exp_date.strftime("%Y-%m-%d"),
+                "dte":           dte,
+                "strike":        float(candidate.strike_price),
+                "bid":           bid,
+                "ask":           ask,
+                "last":          last,
+                "volume":        vol,
+                "open_interest": oi,
+                "side":          signal,  # stored so close_trade can build the alert_key
+            }
 
-        if not is_etf and oi < STOCK_MIN_OPTION_OPEN_INTEREST:
-            print(
-                f"[{symbol}] Contract {contract_sym} rejected — OI {oi} < {STOCK_MIN_OPTION_OPEN_INTEREST} minimum.",
-                flush=True,
-            )
-            return None
-
-        mid = (bid + ask) / 2 if (bid + ask) > 0 else 0.01
-        spread_pct = (ask - bid) / mid
-        if spread_pct > max_spread_pct:
-            print(f"[{symbol}] Contract {contract_sym} rejected — spread {spread_pct*100:.1f}% > {max_spread_pct*100:.0f}% max.", flush=True)
-            return None
-
-        return {
-            "contract":      contract_sym,
-            "expiry":        exp_date.strftime("%Y-%m-%d"),
-            "dte":           dte,
-            "strike":        float(best.strike_price),
-            "bid":           bid,
-            "ask":           ask,
-            "last":          last,
-            "volume":        vol,
-            "open_interest": oi,
-            "side":          signal,  # stored so close_trade can build the alert_key
-        }
+        if rejection_total > rejection_logged:
+            print(f"[{symbol}] ... {rejection_total - rejection_logged} additional contract rejection(s) omitted.", flush=True)
+        print(f"[{symbol}] No contracts passed quality filters ({option_type}, {exp_range}).", flush=True)
+        return None
     except Exception as e:
         msg = f"[{symbol}] Option contract fetch failed: {type(e).__name__}: {e}"
         print(msg, flush=True)
