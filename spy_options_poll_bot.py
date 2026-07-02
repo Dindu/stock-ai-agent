@@ -73,6 +73,9 @@ TRENDING_MIN_BAR_COUNT = int(os.getenv("TRENDING_MIN_BAR_COUNT", "55"))
 TRENDING_MIN_LAST_VOLUME = int(os.getenv("TRENDING_MIN_LAST_VOLUME", "100000"))
 TRENDING_MIN_PRICE = float(os.getenv("TRENDING_MIN_PRICE", "5"))
 TRENDING_EXCLUDE_WARRANTS = os.getenv("TRENDING_EXCLUDE_WARRANTS", "1") == "1"
+ENABLE_SYMBOL_NEWS_CONTEXT = os.getenv("ENABLE_SYMBOL_NEWS_CONTEXT", "1") == "1"
+SYMBOL_NEWS_HEADLINES = int(os.getenv("SYMBOL_NEWS_HEADLINES", "2"))
+SYMBOL_NEWS_REFRESH_SECONDS = int(os.getenv("SYMBOL_NEWS_REFRESH_SECONDS", "300"))
 BAR_MINUTES = 5
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index options
 OPENING_NO_TRADE_MINUTES = int(os.getenv("OPENING_NO_TRADE_MINUTES", "15"))
@@ -97,6 +100,11 @@ STOCK_STRONG_SCORE_BONUS = int(os.getenv("STOCK_STRONG_SCORE_BONUS", "5"))
 #   HARD_SCORE_GATE_IN_NO_GATING_MODE=1.
 HARD_SCORE_GATE_ENABLED = os.getenv("HARD_SCORE_GATE_ENABLED", "1") == "1"
 HARD_SCORE_GATE_IN_NO_GATING_MODE = os.getenv("HARD_SCORE_GATE_IN_NO_GATING_MODE", "0") == "1"
+# Execution behavior controls.
+# Default: do not auto-execute WATCHLIST setups (alerts-only quality).
+EXECUTE_WATCHLIST_SIGNALS = os.getenv("EXECUTE_WATCHLIST_SIGNALS", "0") == "1"
+# Pre-check options buying power before submitting market BUYs.
+OPTIONS_BP_BUFFER_PCT = float(os.getenv("OPTIONS_BP_BUFFER_PCT", "0.05"))
 
 # Trend-ignition filter: only fire when the score is *starting* to rise into the threshold.
 # CALL example: 5 minutes ago BULL was below IGNITION_PRIOR_MAX, now it has gained at least IGNITION_MIN_DELTA.
@@ -202,6 +210,8 @@ _last_gsheet_init_attempt: "datetime | None" = None
 _spy_vwap_cache: "dict" = {"side": None, "updated_at": None}
 # Cached trending stocks and reasons from Alpaca screener/news.
 _trending_cache: "dict" = {"updated_at": None, "symbols": [], "reasons": {}}
+# Cached symbol news context used by entry alerts.
+_symbol_news_cache: "dict" = {"updated_at": {}, "items": {}}
 
 # Column headers for the two Google Sheets tabs.
 _ALERTS_HEADERS = [
@@ -1299,6 +1309,89 @@ def _fetch_trending_news_reason(symbol):
     return " | ".join(titles) if titles else "No recent Alpaca news"
 
 
+def _classify_news_impact(text):
+    """Heuristic impact label from headline text."""
+    txt = str(text or "").lower()
+    if not txt:
+        return "LOW", "no recent headlines"
+
+    high_markers = (
+        "earnings", "guidance", "downgrade", "upgrade", "sec", "lawsuit",
+        "investigation", "fda", "bankruptcy", "acquisition", "merger",
+        "offering", "buyback", "ceo", "cfo", "forecast",
+    )
+    medium_markers = (
+        "analyst", "target", "price target", "partnership", "contract",
+        "launch", "product", "supply", "shortage", "beat", "miss",
+    )
+
+    for marker in high_markers:
+        if marker in txt:
+            return "HIGH", marker
+    for marker in medium_markers:
+        if marker in txt:
+            return "MEDIUM", marker
+    return "LOW", "headline flow"
+
+
+def _trim_text(value, max_len=220):
+    text = str(value or "").replace("`", "'").strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max(0, max_len - 3)] + "..."
+
+
+def _get_symbol_news_context(symbol):
+    """Return cached latest-news + trending context for one symbol."""
+    if not ENABLE_SYMBOL_NEWS_CONTEXT or SYMBOL_NEWS_HEADLINES <= 0:
+        return {
+            "latest_news": "News context disabled",
+            "trending_news": "",
+            "impact_label": "LOW",
+            "impact_reason": "disabled",
+        }
+
+    now = datetime.now(timezone.utc)
+    updated = _symbol_news_cache.get("updated_at", {}).get(symbol)
+    if updated and (now - updated).total_seconds() < max(30, SYMBOL_NEWS_REFRESH_SECONDS):
+        cached = _symbol_news_cache.get("items", {}).get(symbol)
+        if cached:
+            return dict(cached)
+
+    payload = _alpaca_data_get_json(
+        "/v1beta1/news",
+        params={"symbols": symbol, "limit": SYMBOL_NEWS_HEADLINES, "sort": "desc"},
+        timeout=8,
+    )
+    latest_news = "No recent Alpaca news"
+    if payload:
+        articles = payload.get("news") if isinstance(payload, dict) else None
+        if not isinstance(articles, list):
+            articles = payload.get("articles") if isinstance(payload, dict) else None
+        if isinstance(articles, list) and articles:
+            titles = []
+            for art in articles[:SYMBOL_NEWS_HEADLINES]:
+                title = str((art or {}).get("headline") or (art or {}).get("title") or "").strip()
+                if title:
+                    titles.append(title)
+            if titles:
+                latest_news = " | ".join(titles)
+
+    trending_news = str(_trending_cache.get("reasons", {}).get(symbol, "") or "")
+    combined_text = f"{latest_news} {trending_news}".strip()
+    impact_label, impact_reason = _classify_news_impact(combined_text)
+
+    item = {
+        "latest_news": latest_news,
+        "trending_news": trending_news,
+        "impact_label": impact_label,
+        "impact_reason": impact_reason,
+    }
+    _symbol_news_cache.setdefault("updated_at", {})[symbol] = now
+    _symbol_news_cache.setdefault("items", {})[symbol] = item
+    return dict(item)
+
+
 def _is_valid_trending_symbol(sym):
     """Basic filter to keep trending universe to common-stock-like tickers."""
     if not re.fullmatch(r"[A-Z]{1,6}", sym or ""):
@@ -1898,6 +1991,40 @@ def try_open_paper_trade(symbol, side, option, data):
     qty = position_qty_from_score(score, dominance)
     signal_label = f"STRONG {side}"
 
+    # Broker-side buying power guard to reduce avoidable rejected option orders.
+    try:
+        account = _trading_client.get_account()
+        options_bp = float(getattr(account, "options_buying_power", 0) or 0)
+    except Exception:
+        options_bp = 0.0
+
+    est_contract_px = max(
+        float(option.get("ask", 0.0) or 0.0),
+        float(option.get("last", 0.0) or 0.0),
+        float(option.get("bid", 0.0) or 0.0),
+    )
+    est_unit_cost = est_contract_px * 100.0
+    bp_multiplier = 1.0 + max(0.0, OPTIONS_BP_BUFFER_PCT)
+    est_cost = est_unit_cost * float(qty)
+    required_bp = est_cost * bp_multiplier
+    if options_bp > 0 and est_unit_cost > 0 and options_bp < required_bp:
+        max_affordable_qty = int(options_bp // (est_unit_cost * bp_multiplier))
+        if max_affordable_qty >= 1:
+            prev_qty = qty
+            qty = min(qty, max_affordable_qty)
+            est_cost = est_unit_cost * float(qty)
+            required_bp = est_cost * bp_multiplier
+            log(
+                f"[{symbol}] Buying power adjust: qty {prev_qty} -> {qty} "
+                f"to fit options BP ${options_bp:,.2f} (est required ${required_bp:,.2f})."
+            )
+        else:
+            log(
+                f"[{symbol}] Buying power gate: estimated cost ${est_cost:,.2f} "
+                f"(required ${required_bp:,.2f} with buffer) exceeds options BP ${options_bp:,.2f} — skipping entry."
+            )
+            return False
+
     try:
         _, fill_price = place_paper_entry(option, qty)
     except Exception as e:
@@ -1936,11 +2063,24 @@ def try_open_paper_trade(symbol, side, option, data):
     except Exception:
         pass
 
+    news_impact_label = str(data.get("news_impact_label", "LOW") or "LOW")
+    news_impact_reason = str(data.get("news_impact_reason", "headline flow") or "headline flow")
+    latest_news = _trim_text(data.get("latest_news", "No recent Alpaca news"), max_len=260)
+    trending_news = _trim_text(data.get("trending_news", ""), max_len=220)
+    news_context_lines = [
+        f"\U0001f4f0 **News Impact:** `{news_impact_label}` ({news_impact_reason})",
+        f"\U0001f5de **Latest News:** `{latest_news}`",
+    ]
+    if trending_news:
+        news_context_lines.append(f"\U0001f4c8 **Trending Context:** `{trending_news}`")
+    news_context_block = "\n".join(news_context_lines)
+
     send_discord(
         f"\U0001f680 **ENTRY ALERT — {entry_header} | {trade['side']} | ${trade['entry']:.2f} | {expiry_mmdd}**\n\n"
         f"------------------------------\n"
         f"\U0001f4b2 **Current Price:** `${float(data.get('price', 0.0) or 0.0):.2f}`\n"
         f"\U0001f4ca **Setup:** `{setup}` | Score: `{score_line}` ({grade})\n"
+        f"{news_context_block}\n"
         f"\U0001f3af **Plan:** Entry `${trade['entry']:.2f}` | Target `${target_1:.2f}` / `${target_2:.2f}` | Stop `-{stop_pct:.0f}%`\n"
         f"\U0001f6d1 **Invalidation:** VWAP loss / hard stop hit\n"
         f"\U0001f916 **AI:** \U0001f7e1 **{ai_label}** — balanced setup with rules-aligned confirmation\n\n"
@@ -2005,6 +2145,12 @@ def run_symbol(client, symbol):
 
     side, data = analyze(bars, client, symbol)
     if data:
+        news_context = _get_symbol_news_context(symbol)
+        data["latest_news"] = news_context.get("latest_news", "No recent Alpaca news")
+        data["trending_news"] = news_context.get("trending_news", "")
+        data["news_impact_label"] = news_context.get("impact_label", "LOW")
+        data["news_impact_reason"] = news_context.get("impact_reason", "headline flow")
+
         trend_5m = f" | 5m\u0394 BULL {data['bull_score'] - data['bull_5m']:+d}" if data['bull_5m'] is not None else ""
         log(
             f"[{symbol}] {data['price']:.2f} | {data['signal']} | "
@@ -2016,6 +2162,10 @@ def run_symbol(client, symbol):
             _spy_vwap_cache["updated_at"] = datetime.now(central)
 
     if side == "NO TRADE":
+        return
+
+    if data.get("tier") == "WATCH" and not EXECUTE_WATCHLIST_SIGNALS:
+        log(f"[{symbol}] Execution gate: WATCHLIST tier is alerts-only (set EXECUTE_WATCHLIST_SIGNALS=1 to enable entries).")
         return
 
     # Hard minimum score gate with symbol-aware threshold.
