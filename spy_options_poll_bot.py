@@ -594,14 +594,16 @@ def symbol_profile(symbol):
     return profile
 
 
-def position_qty_from_score(score):
-    """Return position size based on confidence score with a hard floor."""
-    base_qty = max(BASE_POSITION_QTY, MIN_POSITION_QTY)
+def position_qty_from_score(score, dominance=0):
+    """Return position size based on score and confidence dominance."""
+    base_qty = max(MIN_POSITION_QTY, min(MAX_POSITION_QTY, BASE_POSITION_QTY))
     if not CONFIDENCE_POSITIONING:
         return base_qty
 
     step = max(1, CONFIDENCE_STEP_SCORE)
-    extra_steps = max(0, (int(score) - SCORE_STRONG) // step)
+    score_boost = max(0, (int(score) - SCORE_STRONG) // step)
+    confidence_boost = max(0, (int(dominance) - SCORE_DOMINANCE) // max(10, step * 2))
+    extra_steps = score_boost + confidence_boost
     return max(base_qty, min(MAX_POSITION_QTY, base_qty + extra_steps))
 
 
@@ -1757,12 +1759,15 @@ def close_trade(trade, exit_price, reason, pnl_pct):
     duration_min = max(1, int((closed_at - trade["opened_at"]).total_seconds() // 60))
     entry_px = float(trade["entry"])
     exit_px = float(exit_price)
+    strike_val = float(trade.get("strike", 0) or 0)
+    strike_text = str(int(strike_val)) if abs(strike_val - int(strike_val)) < 1e-9 else f"{strike_val:.2f}"
+    exit_header = f"{trade['underlying']} strike {strike_text}"
     grade = "A" if pnl_pct >= 0.20 else "B" if pnl_pct >= 0.10 else "C" if pnl_pct >= -0.10 else "D"
 
     send_discord(
-        f"\U0001f534 **EXIT ALERT**\n\n"
-        f"{emoji} **{outcome_label}** — {trade['contract']} | `{pnl_pct * 100:+.2f}%`\n"
+        f"\U0001f534 **Profit/loss — {exit_header} | {trade['side']} - {pnl_pct * 100:+.2f}%**\n\n"
         f"------------------------------\n"
+        f"\U0001f4b2 **Current Price:** `${exit_px:.2f}`\n"
         f"\U0001f4ca **Trade:** `${entry_px:.2f} -> ${exit_px:.2f}` | `{duration_min}m`\n"
         f"\U0001f4c9 **Result:** `{reason}`\n"
         f"\U0001f9e0 **Summary:** `{trade['underlying']} {trade['side']} closed by rules`\n"
@@ -1836,7 +1841,8 @@ def try_open_paper_trade(symbol, side, option, data):
     score = int(data.get("effective_score", data["bull_score"] if side == "CALL" else data["bear_score"]))
     raw_score = int(data.get("raw_entry_score", score))
     macro_penalty = int(data.get("macro_penalty", 0))
-    qty = position_qty_from_score(score)
+    dominance = abs(int(data.get("bull_score", 0)) - int(data.get("bear_score", 0)))
+    qty = position_qty_from_score(score, dominance)
     signal_label = f"STRONG {side}"
 
     try:
@@ -1867,10 +1873,20 @@ def try_open_paper_trade(symbol, side, option, data):
     if macro_penalty > 0:
         score_line = f"{score}/100 (raw {raw_score}, macro -{macro_penalty})"
 
+    strike_val = float(trade.get("strike", 0) or 0)
+    strike_text = str(int(strike_val)) if abs(strike_val - int(strike_val)) < 1e-9 else f"{strike_val:.2f}"
+    entry_header = f"{trade['underlying']} strike {strike_text}"
+    expiry_raw = str(trade.get("expiry", "") or "")
+    expiry_mmdd = expiry_raw
+    try:
+        expiry_mmdd = datetime.strptime(expiry_raw, "%Y-%m-%d").strftime("%m/%d")
+    except Exception:
+        pass
+
     send_discord(
-        f"\U0001f680 **ENTRY ALERT**\n\n"
-        f"\U0001f680 **{trade['contract']} | ${trade['entry']:.2f} | {trade['expiry']}**\n"
+        f"\U0001f680 **ENTRY ALERT — {entry_header} | {trade['side']} | ${trade['entry']:.2f} | {expiry_mmdd}**\n\n"
         f"------------------------------\n"
+        f"\U0001f4b2 **Current Price:** `${float(data.get('price', 0.0) or 0.0):.2f}`\n"
         f"\U0001f4ca **Setup:** `{setup}` | Score: `{score_line}` ({grade})\n"
         f"\U0001f3af **Plan:** Entry `${trade['entry']:.2f}` | Target `${target_1:.2f}` / `${target_2:.2f}` | Stop `-{stop_pct:.0f}%`\n"
         f"\U0001f6d1 **Invalidation:** VWAP loss / hard stop hit\n"
