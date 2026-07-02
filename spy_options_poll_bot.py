@@ -677,16 +677,16 @@ def calculate_indicators(df):
 
 
 def analyze(df, client, symbol):
-    """Compute independent Bull and Bear scores (0-100) from the latest bars.
+    """Compute weighted Bull/Bear scores (0-100) from independent factor groups.
 
-    Components (each side, max 100):
-      Price vs VWAP   : 20
-      Price vs EMA20  : 15
-      Price vs EMA50  : 15
-      EMA20 slope     : 10
-      Volume + candle : 15  (only if volume > 1.5x avg AND candle agrees)
-      Higher high / lower low : 15
-      VWAP direction  : 10
+    Factor weights:
+        Trend Score       : 25%
+        Momentum Score    : 20%
+        Volume Score      : 15%
+        Market Regime     : 15%
+        Relative Strength : 10%
+        Pattern Quality   : 10%
+        Option Liquidity  : 5% (underlying liquidity proxy pre-contract)
     """
     if len(df) < 55:
         return "NO TRADE", None
@@ -729,41 +729,183 @@ def analyze(df, client, symbol):
     recent_high = float(recent_window["high"].max()) if len(recent_window) else price
     recent_low = float(recent_window["low"].min()) if len(recent_window) else price
 
-    # ---------------- Bull score ----------------
-    bull_breakdown = {}
-    bull_score = 0
-    if price > vwap:
-        bull_score += 20; bull_breakdown["Price > VWAP"] = 20
-    if price > ema20:
-        bull_score += 15; bull_breakdown["Price > EMA20"] = 15
-    if price > ema50:
-        bull_score += 15; bull_breakdown["Price > EMA50"] = 15
-    if ema20_rising:
-        bull_score += 10; bull_breakdown["EMA20 rising"] = 10
-    if strong_volume and bullish_candle:
-        bull_score += 15; bull_breakdown["Strong volume + bull candle"] = 15
-    if price > recent_high:
-        bull_score += 15; bull_breakdown["Higher high"] = 15
-    if moving_away_bullish:
-        bull_score += 10; bull_breakdown["VWAP direction bullish"] = 10
+    is_etf = symbol in ETF_SYMBOLS
 
-    # ---------------- Bear score ----------------
-    bear_breakdown = {}
-    bear_score = 0
-    if price < vwap:
-        bear_score += 20; bear_breakdown["Price < VWAP"] = 20
-    if price < ema20:
-        bear_score += 15; bear_breakdown["Price < EMA20"] = 15
-    if price < ema50:
-        bear_score += 15; bear_breakdown["Price < EMA50"] = 15
-    if ema20_falling:
-        bear_score += 10; bear_breakdown["EMA20 falling"] = 10
-    if strong_volume and bearish_candle:
-        bear_score += 15; bear_breakdown["Strong volume + bear candle"] = 15
-    if price < recent_low:
-        bear_score += 15; bear_breakdown["Lower low"] = 15
-    if moving_away_bearish:
-        bear_score += 10; bear_breakdown["VWAP direction bearish"] = 10
+    if is_etf:
+        # ETFs keep the legacy scoring model unchanged.
+        bull_breakdown = {}
+        bull_score = 0
+        if price > vwap:
+            bull_score += 20; bull_breakdown["Price > VWAP"] = 20
+        if price > ema20:
+            bull_score += 15; bull_breakdown["Price > EMA20"] = 15
+        if price > ema50:
+            bull_score += 15; bull_breakdown["Price > EMA50"] = 15
+        if ema20_rising:
+            bull_score += 10; bull_breakdown["EMA20 rising"] = 10
+        if strong_volume and bullish_candle:
+            bull_score += 15; bull_breakdown["Strong volume + bull candle"] = 15
+        if price > recent_high:
+            bull_score += 15; bull_breakdown["Higher high"] = 15
+        if moving_away_bullish:
+            bull_score += 10; bull_breakdown["VWAP direction bullish"] = 10
+
+        bear_breakdown = {}
+        bear_score = 0
+        if price < vwap:
+            bear_score += 20; bear_breakdown["Price < VWAP"] = 20
+        if price < ema20:
+            bear_score += 15; bear_breakdown["Price < EMA20"] = 15
+        if price < ema50:
+            bear_score += 15; bear_breakdown["Price < EMA50"] = 15
+        if ema20_falling:
+            bear_score += 10; bear_breakdown["EMA20 falling"] = 10
+        if strong_volume and bearish_candle:
+            bear_score += 15; bear_breakdown["Strong volume + bear candle"] = 15
+        if price < recent_low:
+            bear_score += 15; bear_breakdown["Lower low"] = 15
+        if moving_away_bearish:
+            bear_score += 10; bear_breakdown["VWAP direction bearish"] = 10
+
+        trend_bull = trend_bear = 0.0
+        momentum_bull = momentum_bear = 0.0
+        volume_bull = volume_bear = 0.0
+        regime_bull = regime_bear = 0.0
+        rel_bull = rel_bear = 0.0
+        pattern_bull = pattern_bear = 0.0
+        option_liq_score = 0.0
+    else:
+        def _clamp01(x):
+            return max(0.0, min(1.0, float(x)))
+
+        def _to_100(x):
+            return _clamp01(x) * 100.0
+
+        # Short-term return proxy for momentum.
+        close_5 = float(df["close"].iloc[-6]) if len(df) >= 6 else price
+        ret_5 = ((price / close_5) - 1.0) if close_5 > 0 else 0.0
+
+        # Underlying liquidity proxy used before contract lookup.
+        dollar_vol_now = price * volume
+        dv_series = (df["close"] * df["volume"]).rolling(20).mean()
+        dollar_vol_avg = float(dv_series.iloc[-1]) if not pd.isna(dv_series.iloc[-1]) else 0.0
+        liq_ratio = (dollar_vol_now / dollar_vol_avg) if dollar_vol_avg > 0 else 1.0
+
+        # Market regime from SPY VWAP side cache (or local SPY side when symbol is SPY).
+        if symbol == "SPY":
+            regime_side = "bull" if price > vwap else "bear"
+        else:
+            regime_side = _spy_vwap_side()
+
+        # ---------------- Category scores (0-100 each side) ----------------
+        trend_bull = _to_100((
+            (1.0 if price > vwap else 0.0)
+            + (1.0 if price > ema20 else 0.0)
+            + (1.0 if price > ema50 else 0.0)
+            + (1.0 if ema20_rising else 0.0)
+        ) / 4.0)
+        trend_bear = _to_100((
+            (1.0 if price < vwap else 0.0)
+            + (1.0 if price < ema20 else 0.0)
+            + (1.0 if price < ema50 else 0.0)
+            + (1.0 if ema20_falling else 0.0)
+        ) / 4.0)
+
+        momentum_bull = _to_100((
+            (_clamp01((rsi - 50.0) / 20.0)) * 0.45
+            + (_clamp01(ret_5 / 0.01)) * 0.35
+            + ((1.0 if moving_away_bullish else 0.0) * 0.20)
+        ))
+        momentum_bear = _to_100((
+            (_clamp01((50.0 - rsi) / 20.0)) * 0.45
+            + (_clamp01((-ret_5) / 0.01)) * 0.35
+            + ((1.0 if moving_away_bearish else 0.0) * 0.20)
+        ))
+
+        vol_ratio = volume / vol_avg if vol_avg > 0 else 1.0
+        volume_bull = _to_100((
+            (_clamp01((vol_ratio - 1.0) / 1.0)) * 0.50
+            + ((1.0 if bullish_candle else 0.0) * 0.25)
+            + ((1.0 if strong_volume else 0.0) * 0.25)
+        ))
+        volume_bear = _to_100((
+            (_clamp01((vol_ratio - 1.0) / 1.0)) * 0.50
+            + ((1.0 if bearish_candle else 0.0) * 0.25)
+            + ((1.0 if strong_volume else 0.0) * 0.25)
+        ))
+
+        if regime_side == "bull":
+            regime_bull, regime_bear = 100.0, 0.0
+        elif regime_side == "bear":
+            regime_bull, regime_bear = 0.0, 100.0
+        else:
+            regime_bull, regime_bear = 50.0, 50.0
+
+        rel_bull = _to_100((
+            ((1.0 if price > pdh else 0.0) * 0.50)
+            + ((1.0 if price > recent_high else 0.0) * 0.30)
+            + ((1.0 if price > ema50 else 0.0) * 0.20)
+        ))
+        rel_bear = _to_100((
+            ((1.0 if price < pdl else 0.0) * 0.50)
+            + ((1.0 if price < recent_low else 0.0) * 0.30)
+            + ((1.0 if price < ema50 else 0.0) * 0.20)
+        ))
+
+        pattern_bull = _to_100((
+            ((1.0 if bullish_candle else 0.0) * 0.35)
+            + ((1.0 if price > recent_high else 0.0) * 0.35)
+            + ((1.0 if moving_away_bullish else 0.0) * 0.30)
+        ))
+        pattern_bear = _to_100((
+            ((1.0 if bearish_candle else 0.0) * 0.35)
+            + ((1.0 if price < recent_low else 0.0) * 0.35)
+            + ((1.0 if moving_away_bearish else 0.0) * 0.30)
+        ))
+
+        option_liq_score = _to_100(_clamp01((liq_ratio - 0.5) / 1.0))
+
+        # ---------------- Weighted final score (0-100) ----------------
+        bull_score_f = (
+            trend_bull * 0.25
+            + momentum_bull * 0.20
+            + volume_bull * 0.15
+            + regime_bull * 0.15
+            + rel_bull * 0.10
+            + pattern_bull * 0.10
+            + option_liq_score * 0.05
+        )
+        bear_score_f = (
+            trend_bear * 0.25
+            + momentum_bear * 0.20
+            + volume_bear * 0.15
+            + regime_bear * 0.15
+            + rel_bear * 0.10
+            + pattern_bear * 0.10
+            + option_liq_score * 0.05
+        )
+
+        bull_score = int(round(bull_score_f))
+        bear_score = int(round(bear_score_f))
+
+        bull_breakdown = {
+            "Trend Score (25%)": round(trend_bull * 0.25, 1),
+            "Momentum Score (20%)": round(momentum_bull * 0.20, 1),
+            "Volume Score (15%)": round(volume_bull * 0.15, 1),
+            "Market Regime (15%)": round(regime_bull * 0.15, 1),
+            "Relative Strength (10%)": round(rel_bull * 0.10, 1),
+            "Pattern Quality (10%)": round(pattern_bull * 0.10, 1),
+            "Option Liquidity (5%)": round(option_liq_score * 0.05, 1),
+        }
+        bear_breakdown = {
+            "Trend Score (25%)": round(trend_bear * 0.25, 1),
+            "Momentum Score (20%)": round(momentum_bear * 0.20, 1),
+            "Volume Score (15%)": round(volume_bear * 0.15, 1),
+            "Market Regime (15%)": round(regime_bear * 0.15, 1),
+            "Relative Strength (10%)": round(rel_bear * 0.10, 1),
+            "Pattern Quality (10%)": round(pattern_bear * 0.10, 1),
+            "Option Liquidity (5%)": round(option_liq_score * 0.05, 1),
+        }
 
     # ---------------- Decision ----------------
     # The dominant side must lead by SCORE_DOMINANCE points; otherwise NO TRADE.
@@ -841,6 +983,19 @@ def analyze(df, client, symbol):
         "bear_score": bear_score,
         "bull_breakdown": bull_breakdown,
         "bear_breakdown": bear_breakdown,
+        "trend_score_bull": trend_bull,
+        "trend_score_bear": trend_bear,
+        "momentum_score_bull": momentum_bull,
+        "momentum_score_bear": momentum_bear,
+        "volume_score_bull": volume_bull,
+        "volume_score_bear": volume_bear,
+        "market_regime_score_bull": regime_bull,
+        "market_regime_score_bear": regime_bear,
+        "relative_strength_score_bull": rel_bull,
+        "relative_strength_score_bear": rel_bear,
+        "pattern_quality_score_bull": pattern_bull,
+        "pattern_quality_score_bear": pattern_bear,
+        "option_liquidity_score": option_liq_score,
         "bull_5m": bull_5m, "bear_5m": bear_5m,
         "bull_10m": bull_10m, "bear_10m": bear_10m,
         "score": score,
@@ -1618,12 +1773,19 @@ def run_symbol(client, symbol):
     if side == "NO TRADE":
         return
 
-    # Hard minimum score gate: only allow entries when side score is strictly above SCORE_STRONG.
+    # Hard minimum score gate with symbol-aware threshold.
+    # ETFs keep the base strict gate (> SCORE_STRONG), while single stocks require
+    # an extra score buffer (SCORE_STRONG + STOCK_STRONG_SCORE_BONUS).
     side_score = data["bull_score"] if side == "CALL" else data["bear_score"]
-    if side_score <= SCORE_STRONG:
+    min_required_score = (
+        SCORE_STRONG + 1
+        if symbol in ETF_SYMBOLS
+        else SCORE_STRONG + max(0, STOCK_STRONG_SCORE_BONUS)
+    )
+    if side_score < min_required_score:
         log(
-            f"[{symbol}] Hard score gate: {side} {side_score} <= {SCORE_STRONG} "
-            "— skipping (requires > 80)."
+            f"[{symbol}] Hard score gate: {side} {side_score} < {min_required_score} "
+            f"— skipping (requires >= {min_required_score})."
         )
         return
 
@@ -1632,15 +1794,6 @@ def run_symbol(client, symbol):
         log(f"[{symbol}] {data['signal']} (BULL {data['bull_score']} / BEAR {data['bear_score']}) "
             f"\u2014 below STRONG threshold, no Discord alert.")
         return
-
-    if (not NO_GATING_MODE) and symbol not in ETF_SYMBOLS:
-        required_score = SCORE_STRONG + max(0, STOCK_STRONG_SCORE_BONUS)
-        if side_score < required_score:
-            log(
-                f"[{symbol}] Stock strict score gate: {side} {side_score} < {required_score} "
-                f"(base {SCORE_STRONG} + bonus {STOCK_STRONG_SCORE_BONUS})."
-            )
-            return
 
     if not NO_GATING_MODE:
         opening_block_minutes = opening_no_trade_minutes_remaining()
