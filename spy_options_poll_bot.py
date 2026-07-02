@@ -73,6 +73,8 @@ SCORE_STRONG = int(os.getenv("SCORE_STRONG", "80"))   # STRONG CALL/PUT alert
 SCORE_SIGNAL = int(os.getenv("SCORE_SIGNAL", "65"))   # CALL/PUT alert
 SCORE_WATCH  = int(os.getenv("SCORE_WATCH",  "50"))   # WATCHLIST heads-up
 SCORE_DOMINANCE = int(os.getenv("SCORE_DOMINANCE", "20"))  # bull must lead bear by this much (and vice versa)
+# Global bypass for all entry gating layers (tier/stock strict/opening/cooldown/ignition/RSI/macro/anti-chase/candle).
+NO_GATING_MODE = os.getenv("NO_GATING_MODE", "1") == "1"
 # Stock-only tightening: require a slightly higher effective strong score.
 STOCK_STRONG_SCORE_BONUS = int(os.getenv("STOCK_STRONG_SCORE_BONUS", "5"))
 
@@ -1593,14 +1595,13 @@ def run_symbol(client, symbol):
     if side == "NO TRADE":
         return
 
-    # Only send Discord alerts for the perfect setup (STRONG tier).
-    # SIGNAL/WATCHLIST tiers are logged but not posted.
-    if data["tier"] != "STRONG":
+    # Only send Discord alerts for the perfect setup (STRONG tier) unless no-gating mode is enabled.
+    if (not NO_GATING_MODE) and data["tier"] != "STRONG":
         log(f"[{symbol}] {data['signal']} (BULL {data['bull_score']} / BEAR {data['bear_score']}) "
             f"\u2014 below STRONG threshold, no Discord alert.")
         return
 
-    if symbol not in ETF_SYMBOLS:
+    if (not NO_GATING_MODE) and symbol not in ETF_SYMBOLS:
         side_score = data["bull_score"] if side == "CALL" else data["bear_score"]
         required_score = SCORE_STRONG + max(0, STOCK_STRONG_SCORE_BONUS)
         if side_score < required_score:
@@ -1610,44 +1611,46 @@ def run_symbol(client, symbol):
             )
             return
 
-    opening_block_minutes = opening_no_trade_minutes_remaining()
-    if opening_block_minutes > 0:
-        log(
-            f"[{symbol}] Opening volatility filter: skipping {data['signal']} during first "
-            f"{OPENING_NO_TRADE_MINUTES}m after open ({opening_block_minutes}m remaining)."
-        )
-        return
+    if not NO_GATING_MODE:
+        opening_block_minutes = opening_no_trade_minutes_remaining()
+        if opening_block_minutes > 0:
+            log(
+                f"[{symbol}] Opening volatility filter: skipping {data['signal']} during first "
+                f"{OPENING_NO_TRADE_MINUTES}m after open ({opening_block_minutes}m remaining)."
+            )
+            return
 
     # One STRONG CALL alert and one STRONG PUT alert max per (symbol, side) per day.
     # After a trade closes, a 30-min cooldown allows the same setup to re-trigger.
     alert_key = (symbol, side)
     now_ct = datetime.now(central)
-    if alert_key in _alerted_today["keys"]:
-        cooldown_until = _alert_cooldowns.get(alert_key)
-        if cooldown_until and now_ct < cooldown_until:
-            mins_left = max(1, int((cooldown_until - now_ct).total_seconds() // 60))
-            log(f"[{symbol}] Already alerted {side} today (cooldown active, {mins_left}m left) — suppressed.")
-            return
-        if cooldown_until and now_ct >= cooldown_until:
-            _alerted_today["keys"].discard(alert_key)
-            _alert_cooldowns.pop(alert_key, None)
+    if not NO_GATING_MODE:
+        if alert_key in _alerted_today["keys"]:
+            cooldown_until = _alert_cooldowns.get(alert_key)
+            if cooldown_until and now_ct < cooldown_until:
+                mins_left = max(1, int((cooldown_until - now_ct).total_seconds() // 60))
+                log(f"[{symbol}] Already alerted {side} today (cooldown active, {mins_left}m left) — suppressed.")
+                return
+            if cooldown_until and now_ct >= cooldown_until:
+                _alerted_today["keys"].discard(alert_key)
+                _alert_cooldowns.pop(alert_key, None)
 
-        # If no live/pending Alpaca trade exists, this is a stale lock — clear it.
-        live_exists, live_detail = has_open_underlying_position(symbol, side)
-        if not live_exists:
-            _alerted_today["keys"].discard(alert_key)
-            _alert_cooldowns.pop(alert_key, None)
-            log(f"[{symbol}] Cleared stale alert lock for {side} (no live Alpaca trade found).")
-        elif alert_key in _alert_cooldowns and now_ct >= _alert_cooldowns[alert_key]:
-            # Cooldown expired — clear and allow re-alert.
-            _alerted_today["keys"].discard(alert_key)
-            _alert_cooldowns.pop(alert_key, None)
-        else:
-            log(f"[{symbol}] Already alerted {side} today ({live_detail}) — suppressed.")
-            return
+            # If no live/pending Alpaca trade exists, this is a stale lock — clear it.
+            live_exists, live_detail = has_open_underlying_position(symbol, side)
+            if not live_exists:
+                _alerted_today["keys"].discard(alert_key)
+                _alert_cooldowns.pop(alert_key, None)
+                log(f"[{symbol}] Cleared stale alert lock for {side} (no live Alpaca trade found).")
+            elif alert_key in _alert_cooldowns and now_ct >= _alert_cooldowns[alert_key]:
+                # Cooldown expired — clear and allow re-alert.
+                _alerted_today["keys"].discard(alert_key)
+                _alert_cooldowns.pop(alert_key, None)
+            else:
+                log(f"[{symbol}] Already alerted {side} today ({live_detail}) — suppressed.")
+                return
 
     # Trend-ignition filter: only fire when the move is *just starting*, not mid- or late-trend.
-    if IGNITION_REQUIRED:
+    if IGNITION_REQUIRED and not NO_GATING_MODE:
         if side == "CALL":
             now_score = data["bull_score"]
             past_score = data["bull_5m"]
@@ -1728,7 +1731,7 @@ def run_symbol(client, symbol):
     # ── RSI exhaustion filter ─────────────────────────────────────────────────
     # Don't enter CALLs when RSI is already overbought (move likely exhausted),
     # or PUTs when RSI is already oversold.
-    if RSI_FILTER:
+    if RSI_FILTER and not NO_GATING_MODE:
         rsi = data.get("rsi", 50.0)
         if side == "CALL" and rsi >= rsi_overbought:
             log(f"[{symbol}] RSI filter: CALL blocked — RSI {rsi:.1f} >= {rsi_overbought} (overbought, late entry).")
@@ -1739,7 +1742,7 @@ def run_symbol(client, symbol):
 
     # ── Macro alignment context (penalty by default, optional hard block) ───
     macro_penalty = 0
-    if SPY_MACRO_ALIGN and symbol != "SPY" and "SPY" in SYMBOLS:
+    if SPY_MACRO_ALIGN and (not NO_GATING_MODE) and symbol != "SPY" and "SPY" in SYMBOLS:
         spy_vwap_side = _spy_vwap_side()
         misaligned = (side == "CALL" and spy_vwap_side != "bull") or (side == "PUT" and spy_vwap_side != "bear")
         if misaligned:
@@ -1764,7 +1767,7 @@ def run_symbol(client, symbol):
     # ── Anti-chase filters ───────────────────────────────────────────────────
     # Avoid buying when price is already too extended away from VWAP, and avoid
     # entering when the latest candle already flipped against our side.
-    if ANTI_CHASE_FILTER:
+    if ANTI_CHASE_FILTER and not NO_GATING_MODE:
         ext_pct = float(data.get("vwap_extension_pct", 0.0))
         if ext_pct > max_ext_from_vwap:
             log(
@@ -1773,7 +1776,7 @@ def run_symbol(client, symbol):
             )
             return
 
-    if CANDLE_CONFIRMATION:
+    if CANDLE_CONFIRMATION and not NO_GATING_MODE:
         if side == "CALL" and not data.get("bullish_candle", False):
             log(f"[{symbol}] Candle filter: CALL blocked — latest candle is not bullish.")
             return
@@ -1783,11 +1786,12 @@ def run_symbol(client, symbol):
 
     # Lock this (symbol, side) NOW — before the option fetch — so a failed or
     # rate-limited fetch doesn't cause ignition to re-fire every 30 seconds.
-    _alerted_today["keys"].add(alert_key)
+    if not NO_GATING_MODE:
+        _alerted_today["keys"].add(alert_key)
 
     option = get_option_contract(symbol, side, data["price"])
     if not option:
-        if ALERT_ONLY_COOLDOWN_MINUTES > 0:
+        if (not NO_GATING_MODE) and ALERT_ONLY_COOLDOWN_MINUTES > 0:
             _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
         log(f"[{symbol}] {data['signal']} setup detected, but no valid 1DTE+ option found — skipping (real trades only).")
         return
@@ -1851,12 +1855,12 @@ Execution required \u2014 real trades only.
             opened = False
 
         if not opened:
-            if ALERT_ONLY_COOLDOWN_MINUTES > 0:
+            if (not NO_GATING_MODE) and ALERT_ONLY_COOLDOWN_MINUTES > 0:
                 _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
             log(f"[{symbol}] Execution unavailable for {data['signal']} {option['contract']} — skipping (real trades only).")
     else:
         # Real-trades-only mode: no alert/sheet output when execution is disabled.
-        if ALERT_ONLY_COOLDOWN_MINUTES > 0:
+        if (not NO_GATING_MODE) and ALERT_ONLY_COOLDOWN_MINUTES > 0:
             _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
         log(f"[{symbol}] Paper trading disabled — skipping {data['signal']} setup (real trades only).")
 
@@ -1877,6 +1881,8 @@ def main():
         log("Paper trading ENABLED — Alpaca paper TradingClient initialized.")
     else:
         log("Paper trading DISABLED — real-trades-only mode, no Discord/Sheets for setups (TradingClient used for option contract lookup only).")
+    if NO_GATING_MODE:
+        log("NO_GATING_MODE enabled — bypassing entry gates for both ETFs and stocks.")
 
     init_google_sheets()
 
