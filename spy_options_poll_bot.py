@@ -908,12 +908,14 @@ def analyze(df, client, symbol):
         }
 
     # ---------------- Decision ----------------
+    # Keep label thresholds aligned with downstream hard-entry gates.
+    strong_threshold = SCORE_STRONG if is_etf else (SCORE_STRONG + max(0, STOCK_STRONG_SCORE_BONUS))
     # The dominant side must lead by SCORE_DOMINANCE points; otherwise NO TRADE.
     diff = bull_score - bear_score
 
-    if bull_score >= SCORE_STRONG and diff >= SCORE_DOMINANCE:
+    if bull_score >= strong_threshold and diff >= SCORE_DOMINANCE:
         side, score, tier, signal = "CALL", bull_score, "STRONG", "STRONG CALL"
-    elif bear_score >= SCORE_STRONG and -diff >= SCORE_DOMINANCE:
+    elif bear_score >= strong_threshold and -diff >= SCORE_DOMINANCE:
         side, score, tier, signal = "PUT", bear_score, "STRONG", "STRONG PUT"
     elif bull_score >= SCORE_SIGNAL and diff >= SCORE_DOMINANCE:
         side, score, tier, signal = "CALL", bull_score, "SIGNAL", "CALL"
