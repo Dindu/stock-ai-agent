@@ -29,7 +29,7 @@ from dotenv import load_dotenv
 from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, OptionLatestQuoteRequest, OptionSnapshotRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-from alpaca.data.enums import DataFeed
+from alpaca.data.enums import DataFeed, OptionsFeed
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOptionContractsRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -47,6 +47,11 @@ ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK")
 FEED = os.getenv("ALPACA_FEED", "iex").lower()
+_options_feed_env = os.getenv("ALPACA_OPTIONS_FEED", "").strip().lower()
+if _options_feed_env in {"opra", "indicative"}:
+    OPTIONS_FEED = OptionsFeed(_options_feed_env)
+else:
+    OPTIONS_FEED = None
 
 # Symbols to scan, in order. Override via env.
 ETF_SYMBOLS = {"SPY", "QQQ", "IWM"}
@@ -936,35 +941,24 @@ def get_option_contract(symbol, signal, underlying_price):
             exp_date = _exp_date(candidate)
 
             # Fetch live bid/ask/last/volume for each candidate.
-            snap_req = OptionSnapshotRequest(symbol_or_symbols=contract_sym)
+            snap_req = OptionSnapshotRequest(symbol_or_symbols=contract_sym, feed=OPTIONS_FEED)
             snaps = _option_client.get_option_snapshot(snap_req)
             snap = snaps.get(contract_sym) if isinstance(snaps, dict) else snaps
 
             bid = ask = last = 0.0
-            vol = oi = 0
+            vol = 0
+            oi = _safe_int(getattr(candidate, "open_interest", 0), 0)
             if snap:
                 q = getattr(snap, "latest_quote", None) or getattr(snap, "quote", None)
                 t = getattr(snap, "latest_trade", None) or getattr(snap, "trade", None)
-                bar = (
-                    getattr(snap, "daily_bar", None)
-                    or getattr(snap, "day_bar", None)
-                    or getattr(snap, "day", None)
-                )
 
                 if q is not None:
                     bid = _safe_float(getattr(q, "bid_price", 0.0), 0.0)
                     ask = _safe_float(getattr(q, "ask_price", 0.0), 0.0)
                 if t is not None:
                     last = _safe_float(getattr(t, "price", 0.0), 0.0)
-                if bar is not None:
-                    vol = _safe_int(getattr(bar, "volume", 0), 0)
-
-                oi = _safe_int(
-                    getattr(snap, "open_interest", None)
-                    or getattr(snap, "openInterest", None)
-                    or 0,
-                    0,
-                )
+                    # Snapshot trade size is not true daily volume, but we keep it for telemetry.
+                    vol = _safe_int(getattr(t, "size", 0), 0)
 
             dte = (exp_date - today).days
 
@@ -973,13 +967,20 @@ def get_option_contract(symbol, signal, underlying_price):
                 continue
 
             if not is_etf:
-                # Accept stock contracts when either intraday volume OR OI passes minimum.
-                if vol < STOCK_MIN_OPTION_VOLUME and oi < STOCK_MIN_OPTION_OPEN_INTEREST:
+                # In strict mode, accept stock contracts when either intraday volume OR OI passes minimum.
+                # In no-gating mode, bypass this liquidity gate and rely on bid/spread checks only.
+                if (not NO_GATING_MODE) and vol < STOCK_MIN_OPTION_VOLUME and oi < STOCK_MIN_OPTION_OPEN_INTEREST:
                     _reject(
                         f"[{symbol}] Contract {contract_sym} rejected — volume {vol} < {STOCK_MIN_OPTION_VOLUME} "
                         f"and OI {oi} < {STOCK_MIN_OPTION_OPEN_INTEREST}."
                     )
                     continue
+                if NO_GATING_MODE and vol < STOCK_MIN_OPTION_VOLUME and oi < STOCK_MIN_OPTION_OPEN_INTEREST:
+                    print(
+                        f"[{symbol}] No-gating override: accepting {contract_sym} despite low volume/OI "
+                        f"(vol={vol}, oi={oi}).",
+                        flush=True,
+                    )
 
             mid = (bid + ask) / 2 if (bid + ask) > 0 else 0.01
             spread_pct = (ask - bid) / mid
@@ -1617,6 +1618,15 @@ def run_symbol(client, symbol):
     if side == "NO TRADE":
         return
 
+    # Hard minimum score gate: only allow entries when side score is strictly above SCORE_STRONG.
+    side_score = data["bull_score"] if side == "CALL" else data["bear_score"]
+    if side_score <= SCORE_STRONG:
+        log(
+            f"[{symbol}] Hard score gate: {side} {side_score} <= {SCORE_STRONG} "
+            "— skipping (requires > 80)."
+        )
+        return
+
     # Only send Discord alerts for the perfect setup (STRONG tier) unless no-gating mode is enabled.
     if (not NO_GATING_MODE) and data["tier"] != "STRONG":
         log(f"[{symbol}] {data['signal']} (BULL {data['bull_score']} / BEAR {data['bear_score']}) "
@@ -1624,7 +1634,6 @@ def run_symbol(client, symbol):
         return
 
     if (not NO_GATING_MODE) and symbol not in ETF_SYMBOLS:
-        side_score = data["bull_score"] if side == "CALL" else data["bear_score"]
         required_score = SCORE_STRONG + max(0, STOCK_STRONG_SCORE_BONUS)
         if side_score < required_score:
             log(
