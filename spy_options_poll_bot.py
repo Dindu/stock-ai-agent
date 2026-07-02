@@ -64,6 +64,11 @@ TOP_STOCK_SYMBOLS = {
 AGGRESSIVE_STOCK_SYMBOLS = {"TSLA", "AMD", "PLTR", "SMCI", "COIN", "SHOP", "UBER"}
 DEFAULT_SYMBOLS = "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,META,TSLA,AMD,PLTR,NFLX,GOOGL,AVGO,SMCI,MU,COIN,QCOM,INTC,CRM,ORCL,SHOP,UBER"
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
+ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")
+ENABLE_TRENDING_STOCKS = os.getenv("ENABLE_TRENDING_STOCKS", "1") == "1"
+TRENDING_STOCK_COUNT = int(os.getenv("TRENDING_STOCK_COUNT", "5"))
+TRENDING_REFRESH_SECONDS = int(os.getenv("TRENDING_REFRESH_SECONDS", "300"))
+TRENDING_NEWS_HEADLINES = int(os.getenv("TRENDING_NEWS_HEADLINES", "2"))
 BAR_MINUTES = 5
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index options
 OPENING_NO_TRADE_MINUTES = int(os.getenv("OPENING_NO_TRADE_MINUTES", "15"))
@@ -185,6 +190,8 @@ _gsheet: "gspread.Spreadsheet | None" = None
 _last_gsheet_init_attempt: "datetime | None" = None
 # Last known SPY VWAP side: 'bull', 'bear', or None (populated by run_symbol each cycle).
 _spy_vwap_cache: "dict" = {"side": None, "updated_at": None}
+# Cached trending stocks and reasons from Alpaca screener/news.
+_trending_cache: "dict" = {"updated_at": None, "symbols": [], "reasons": {}}
 
 # Column headers for the two Google Sheets tabs.
 _ALERTS_HEADERS = [
@@ -1204,6 +1211,167 @@ def fetch_bars(client, symbol):
     return bars
 
 
+def _alpaca_data_headers():
+    return {
+        "APCA-API-KEY-ID": ALPACA_API_KEY or "",
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY or "",
+    }
+
+
+def _alpaca_data_get_json(path, params=None, timeout=8):
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return None
+    url = f"{ALPACA_DATA_BASE_URL.rstrip('/')}{path}"
+    try:
+        r = requests.get(url, headers=_alpaca_data_headers(), params=params or {}, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
+def _safe_float_num(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def _extract_screener_items(payload):
+    """Extract a flat list of symbol-like dicts from Alpaca screener payload variants."""
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    items = []
+    for k in ("gainers", "losers", "most_actives", "actives", "data", "results", "stocks"):
+        v = payload.get(k)
+        if isinstance(v, list):
+            items.extend([x for x in v if isinstance(x, dict)])
+
+    if not items:
+        # Some responses may already be a single stock-like object.
+        if payload.get("symbol") or payload.get("ticker"):
+            items.append(payload)
+    return items
+
+
+def _fetch_trending_news_reason(symbol):
+    """Return short headline-based reason from Alpaca news for one symbol."""
+    if TRENDING_NEWS_HEADLINES <= 0:
+        return "No headline context requested"
+
+    payload = _alpaca_data_get_json(
+        "/v1beta1/news",
+        params={"symbols": symbol, "limit": TRENDING_NEWS_HEADLINES, "sort": "desc"},
+        timeout=8,
+    )
+    if not payload:
+        return "No recent Alpaca news"
+
+    articles = payload.get("news") if isinstance(payload, dict) else None
+    if not isinstance(articles, list):
+        articles = payload.get("articles") if isinstance(payload, dict) else None
+    if not isinstance(articles, list) or not articles:
+        return "No recent Alpaca news"
+
+    titles = []
+    for art in articles[:TRENDING_NEWS_HEADLINES]:
+        title = str((art or {}).get("headline") or (art or {}).get("title") or "").strip()
+        if title:
+            titles.append(title)
+    return " | ".join(titles) if titles else "No recent Alpaca news"
+
+
+def get_trending_symbols(client, base_symbols):
+    """Get trending stock symbols from Alpaca screener, with Alpaca-bars fallback.
+
+    Returns (symbols, reasons) where reasons explains why each symbol is trending.
+    """
+    if not ENABLE_TRENDING_STOCKS or TRENDING_STOCK_COUNT <= 0:
+        return [], {}
+
+    now = datetime.now(timezone.utc)
+    updated_at = _trending_cache.get("updated_at")
+    if updated_at and (now - updated_at).total_seconds() < max(30, TRENDING_REFRESH_SECONDS):
+        return list(_trending_cache.get("symbols", [])), dict(_trending_cache.get("reasons", {}))
+
+    base_set = {s.upper() for s in base_symbols}
+
+    ranked = {}
+    screener_sources = [
+        ("/v1beta1/screener/stocks/movers", {"top": max(10, TRENDING_STOCK_COUNT * 4)}),
+        ("/v1beta1/screener/stocks/most-actives", {"top": max(10, TRENDING_STOCK_COUNT * 4)}),
+    ]
+
+    for path, params in screener_sources:
+        payload = _alpaca_data_get_json(path, params=params, timeout=8)
+        items = _extract_screener_items(payload)
+        for idx, item in enumerate(items):
+            sym = str(item.get("symbol") or item.get("ticker") or "").upper().strip()
+            if not sym or sym in ETF_SYMBOLS or sym in base_set:
+                continue
+
+            pct = _safe_float_num(
+                item.get("percent_change", item.get("change_percent", item.get("change", 0.0))),
+                0.0,
+            )
+            vol = _safe_float_num(item.get("volume", 0.0), 0.0)
+            rank_bonus = max(0.0, 40.0 - (idx * 2.0))
+            score = (abs(pct) * 6.0) + min(vol / 1_000_000.0, 20.0) + rank_bonus
+            reason = f"screener pct={pct:+.2f}% vol={int(vol)}"
+
+            prev = ranked.get(sym)
+            if (prev is None) or (score > prev[0]):
+                ranked[sym] = (score, reason)
+
+    # Fallback: derive trend candidates from Alpaca bars for top liquid stocks.
+    if not ranked:
+        for sym in sorted(TOP_STOCK_SYMBOLS):
+            if sym in ETF_SYMBOLS or sym in base_set:
+                continue
+            try:
+                bars = fetch_bars(client, sym)
+                if len(bars) < 25:
+                    continue
+                c0 = float(bars["close"].iloc[-1])
+                c5 = float(bars["close"].iloc[-6]) if len(bars) >= 6 else c0
+                v0 = float(bars["volume"].iloc[-1])
+                vavg = float(bars["volume"].tail(20).mean())
+                ret5 = ((c0 / c5) - 1.0) * 100.0 if c5 > 0 else 0.0
+                vr = (v0 / vavg) if vavg > 0 else 1.0
+                score = abs(ret5) * 5.0 + min(max(vr - 1.0, 0.0), 4.0) * 10.0
+                ranked[sym] = (score, f"bars 5m={ret5:+.2f}% volx={vr:.2f}")
+            except Exception:
+                continue
+
+    ordered = sorted(ranked.items(), key=lambda kv: kv[1][0], reverse=True)
+    selected = [sym for sym, _ in ordered[:TRENDING_STOCK_COUNT]]
+
+    reasons = {}
+    for sym in selected:
+        base_reason = ranked.get(sym, (0.0, ""))[1]
+        news_reason = _fetch_trending_news_reason(sym)
+        reasons[sym] = f"{base_reason}; news: {news_reason}" if news_reason else base_reason
+
+    _trending_cache["updated_at"] = now
+    _trending_cache["symbols"] = selected
+    _trending_cache["reasons"] = reasons
+
+    if selected:
+        log(f"Trending stocks from Alpaca: {', '.join(selected)}")
+        for sym in selected:
+            why = reasons.get(sym, "")
+            if why:
+                log(f"[TRENDING] {sym} — {why}")
+
+    return selected, reasons
+
+
 def log(msg):
     print(f"[{datetime.now(central):%Y-%m-%d %H:%M:%S} CT] {msg}", flush=True)
 
@@ -1731,7 +1899,13 @@ def run_cycle(client):
 
     # Entry scan first (symbol loop), then exit management in the same cycle.
     # This keeps the flow aligned with: entry -> check exit -> exit.
-    for symbol in SYMBOLS:
+    symbols_to_scan = list(SYMBOLS)
+    trending_symbols, _ = get_trending_symbols(client, SYMBOLS)
+    for sym in trending_symbols:
+        if sym not in symbols_to_scan:
+            symbols_to_scan.append(sym)
+
+    for symbol in symbols_to_scan:
         try:
             run_symbol(client, symbol)
         except Exception:
