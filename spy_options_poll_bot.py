@@ -64,8 +64,8 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index opti
 OPENING_NO_TRADE_MINUTES = int(os.getenv("OPENING_NO_TRADE_MINUTES", "15"))
 LOOKBACK_BARS = 120
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
-MIN_DTE = 1  # Force 1DTE only
-MAX_DTE = 1  # Force 1DTE only
+MIN_DTE = int(os.getenv("MIN_DTE", "1"))   # Minimum DTE (exclude 0DTE)
+MAX_DTE = int(os.getenv("MAX_DTE", "14"))  # Max DTE window; set <=0 for no upper bound
 VOLUME_MULTIPLIER = 1.5
 
 # Scoring thresholds (0-100)
@@ -848,25 +848,28 @@ def analyze(df, client, symbol):
     return side, data
 
 def get_option_contract(symbol, signal, underlying_price):
-    """Fetch the nearest 1-7 DTE ATM option contract from Alpaca (live data, no yfinance)."""
+    """Fetch the nearest available >=MIN_DTE option contract from Alpaca (live data, no yfinance)."""
     if _option_client is None or _trading_client is None:
         print(f"[{symbol}] Option/trading client not initialised — cannot fetch contracts.", flush=True)
         return None
     try:
         today = date.today()
         min_exp = today + timedelta(days=MIN_DTE)
-        max_exp = today + timedelta(days=MAX_DTE)
+        max_exp = today + timedelta(days=MAX_DTE) if MAX_DTE > 0 else None
         option_type = "call" if signal == "CALL" else "put"
 
-        req = GetOptionContractsRequest(
-            underlying_symbols=[symbol],
-            expiration_date_gte=min_exp,
-            expiration_date_lte=max_exp,
-            type=option_type,
-            strike_price_gte=str(round(underlying_price * 0.95, 2)),
-            strike_price_lte=str(round(underlying_price * 1.05, 2)),
-            limit=50,
-        )
+        req_kwargs = {
+            "underlying_symbols": [symbol],
+            "expiration_date_gte": min_exp,
+            "type": option_type,
+            "strike_price_gte": str(round(underlying_price * 0.95, 2)),
+            "strike_price_lte": str(round(underlying_price * 1.05, 2)),
+            "limit": 50,
+        }
+        if max_exp is not None:
+            req_kwargs["expiration_date_lte"] = max_exp
+
+        req = GetOptionContractsRequest(**req_kwargs)
         result = _trading_client.get_option_contracts(req)
         # SDK may return a list directly or a wrapper with .option_contracts / .contracts.
         if isinstance(result, list):
@@ -877,11 +880,12 @@ def get_option_contract(symbol, signal, underlying_price):
                 or getattr(result, "contracts", None)
                 or []
             )
+        exp_range = f"{min_exp}–{max_exp}" if max_exp is not None else f">={min_exp}"
         if not contracts:
-            print(f"[{symbol}] No option contracts found ({option_type}, {min_exp}–{max_exp}).", flush=True)
+            print(f"[{symbol}] No option contracts found ({option_type}, {exp_range}).", flush=True)
             return None
 
-        print(f"[{symbol}] {len(contracts)} contract(s) returned by Alpaca for {option_type} {min_exp}–{max_exp}.", flush=True)
+        print(f"[{symbol}] {len(contracts)} contract(s) returned by Alpaca for {option_type} {exp_range}.", flush=True)
 
         def _exp_date(c):
             """Normalise expiration_date to a date object regardless of what Alpaca returns."""
