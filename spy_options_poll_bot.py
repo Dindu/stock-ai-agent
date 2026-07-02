@@ -990,7 +990,6 @@ def get_option_contract(symbol, signal, underlying_price):
     except Exception as e:
         msg = f"[{symbol}] Option contract fetch failed: {type(e).__name__}: {e}"
         print(msg, flush=True)
-        send_discord(f"⚠️ **Option fetch error** — `{symbol}`\n```{msg}```", color=DISCORD_COLOR_WARN)
         return None
 
 
@@ -1471,7 +1470,7 @@ def try_open_paper_trade(symbol, side, option, data):
     sync_open_trades_from_alpaca()
 
     if len(_open_trades) >= MAX_OPEN_TRADES:
-        log(f"[{symbol}] Paper-trade capacity full ({len(_open_trades)}/{MAX_OPEN_TRADES}) — alert only.")
+        log(f"[{symbol}] Paper-trade capacity full ({len(_open_trades)}/{MAX_OPEN_TRADES}) — skipping.")
         return False
     if SINGLE_POSITION_PER_SYMBOL:
         already_open, detail = has_open_underlying_position(symbol, side)
@@ -1790,22 +1789,7 @@ def run_symbol(client, symbol):
     if not option:
         if ALERT_ONLY_COOLDOWN_MINUTES > 0:
             _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
-        log(f"[{symbol}] {data['signal']} setup detected, but no valid 1DTE+ option found — sending alert-only Discord.")
-        emoji = "\U0001f7e2" if side == "CALL" else "\U0001f534"
-        breakdown = data["bull_breakdown"] if side == "CALL" else data["bear_breakdown"]
-        checklist = "\n".join(f"\u2705 {k} (+{v})" for k, v in breakdown.items()) or "(no positive components)"
-        send_discord(
-            f"\U0001f6a8 {emoji} **{symbol} {data['signal']}** _(no option contract found — alert only)_\n\n"
-            f"**{symbol}:** `{data['price']:.2f}`\n"
-            f"**Bull Score:** `{data['bull_score']}/100`   |   **Bear Score:** `{data['bear_score']}/100`\n"
-            f"**Sentiment:** `{data['sentiment']}`\n\n"
-            f"**Score Components**\n{checklist}\n\n"
-            f"**Levels**\n"
-            f"VWAP: `{data['vwap']:.2f}` | EMA20: `{data['ema20']:.2f}` | EMA50: `{data['ema50']:.2f}`\n"
-            f"PDH: `{data['pdh']:.2f}` | PDL: `{data['pdl']:.2f}`",
-            color=DISCORD_COLOR_CALL if side == "CALL" else DISCORD_COLOR_PUT,
-        )
-        log_alert_to_sheets(symbol, data, None)
+        log(f"[{symbol}] {data['signal']} setup detected, but no valid 1DTE+ option found — skipping (real trades only).")
         return
 
     emoji = "\U0001f7e2" if side == "CALL" else "\U0001f534"
@@ -1854,7 +1838,7 @@ PDH: `{data['pdh']:.2f}` | PDL: `{data['pdl']:.2f}`
 Recent High: `{data['recent_high']:.2f}` | Recent Low: `{data['recent_low']:.2f}`
 Volume: `{int(data['volume'])}` | Avg: `{int(data['vol_avg'])}`
 
-Alert only \u2014 verify chart before taking play.
+Execution required \u2014 real trades only.
 """
     if ENABLE_ALPACA_PAPER_TRADING:
         # Execution path: place order + log sheets + send a single entry alert.
@@ -1869,16 +1853,12 @@ Alert only \u2014 verify chart before taking play.
         if not opened:
             if ALERT_ONLY_COOLDOWN_MINUTES > 0:
                 _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
-            # Fall back to one setup alert when execution is not possible.
-            send_discord(message, color=DISCORD_COLOR_CALL if side == "CALL" else DISCORD_COLOR_PUT)
-            log(f"[{symbol}] Alert sent (execution unavailable): {data['signal']} {option['contract']} "
-                f"(BULL {data['bull_score']} / BEAR {data['bear_score']})")
-            log_alert_to_sheets(symbol, data, option)
+            log(f"[{symbol}] Execution unavailable for {data['signal']} {option['contract']} — skipping (real trades only).")
     else:
-        # Alert-only mode when paper trading is disabled.
-        send_discord(message, color=DISCORD_COLOR_CALL if side == "CALL" else DISCORD_COLOR_PUT)
-        log(f"[{symbol}] Alert sent: {data['signal']} {option['contract']} (BULL {data['bull_score']} / BEAR {data['bear_score']})")
-        log_alert_to_sheets(symbol, data, option)
+        # Real-trades-only mode: no alert/sheet output when execution is disabled.
+        if ALERT_ONLY_COOLDOWN_MINUTES > 0:
+            _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
+        log(f"[{symbol}] Paper trading disabled — skipping {data['signal']} setup (real trades only).")
 
 
 def main():
@@ -1896,7 +1876,7 @@ def main():
     if ENABLE_ALPACA_PAPER_TRADING:
         log("Paper trading ENABLED — Alpaca paper TradingClient initialized.")
     else:
-        log("Paper trading DISABLED — alerts only, no orders will be submitted (TradingClient used for option contract lookup only).")
+        log("Paper trading DISABLED — real-trades-only mode, no Discord/Sheets for setups (TradingClient used for option contract lookup only).")
 
     init_google_sheets()
 
