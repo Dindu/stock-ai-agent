@@ -69,6 +69,10 @@ ENABLE_TRENDING_STOCKS = os.getenv("ENABLE_TRENDING_STOCKS", "1") == "1"
 TRENDING_STOCK_COUNT = int(os.getenv("TRENDING_STOCK_COUNT", "5"))
 TRENDING_REFRESH_SECONDS = int(os.getenv("TRENDING_REFRESH_SECONDS", "300"))
 TRENDING_NEWS_HEADLINES = int(os.getenv("TRENDING_NEWS_HEADLINES", "2"))
+TRENDING_MIN_BAR_COUNT = int(os.getenv("TRENDING_MIN_BAR_COUNT", "55"))
+TRENDING_MIN_LAST_VOLUME = int(os.getenv("TRENDING_MIN_LAST_VOLUME", "100000"))
+TRENDING_MIN_PRICE = float(os.getenv("TRENDING_MIN_PRICE", "5"))
+TRENDING_EXCLUDE_WARRANTS = os.getenv("TRENDING_EXCLUDE_WARRANTS", "1") == "1"
 BAR_MINUTES = 5
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index options
 OPENING_NO_TRADE_MINUTES = int(os.getenv("OPENING_NO_TRADE_MINUTES", "15"))
@@ -1289,6 +1293,19 @@ def _fetch_trending_news_reason(symbol):
     return " | ".join(titles) if titles else "No recent Alpaca news"
 
 
+def _is_valid_trending_symbol(sym):
+    """Basic filter to keep trending universe to common-stock-like tickers."""
+    if not re.fullmatch(r"[A-Z]{1,6}", sym or ""):
+        return False
+    if TRENDING_EXCLUDE_WARRANTS:
+        upper = (sym or "").upper()
+        # Common warrant/right suffixes from screener feeds.
+        suffixes = ("W", "WS", "WT", "WTS", "R", "RT")
+        if len(upper) > 1 and upper.endswith(suffixes):
+            return False
+    return True
+
+
 def get_trending_symbols(client, base_symbols):
     """Get trending stock symbols from Alpaca screener, with Alpaca-bars fallback.
 
@@ -1316,6 +1333,20 @@ def get_trending_symbols(client, base_symbols):
         for idx, item in enumerate(items):
             sym = str(item.get("symbol") or item.get("ticker") or "").upper().strip()
             if not sym or sym in ETF_SYMBOLS or sym in base_set:
+                continue
+            if not _is_valid_trending_symbol(sym):
+                continue
+
+            # Validate real-time tradability characteristics via recent bars.
+            try:
+                bars = fetch_bars(client, sym)
+                if len(bars) < TRENDING_MIN_BAR_COUNT:
+                    continue
+                last_close = float(bars["close"].iloc[-1])
+                last_volume = int(float(bars["volume"].iloc[-1]))
+                if last_close < TRENDING_MIN_PRICE or last_volume < TRENDING_MIN_LAST_VOLUME:
+                    continue
+            except Exception:
                 continue
 
             pct = _safe_float_num(
