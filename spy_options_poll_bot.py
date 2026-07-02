@@ -73,6 +73,11 @@ TRENDING_MIN_BAR_COUNT = int(os.getenv("TRENDING_MIN_BAR_COUNT", "55"))
 TRENDING_MIN_LAST_VOLUME = int(os.getenv("TRENDING_MIN_LAST_VOLUME", "100000"))
 TRENDING_MIN_PRICE = float(os.getenv("TRENDING_MIN_PRICE", "5"))
 TRENDING_EXCLUDE_WARRANTS = os.getenv("TRENDING_EXCLUDE_WARRANTS", "1") == "1"
+TRENDING_EXCLUDE_SYMBOLS = {
+    s.strip().upper()
+    for s in os.getenv("TRENDING_EXCLUDE_SYMBOLS", "BITO").split(",")
+    if s.strip()
+}
 ENABLE_SYMBOL_NEWS_CONTEXT = os.getenv("ENABLE_SYMBOL_NEWS_CONTEXT", "1") == "1"
 SYMBOL_NEWS_HEADLINES = int(os.getenv("SYMBOL_NEWS_HEADLINES", "2"))
 SYMBOL_NEWS_REFRESH_SECONDS = int(os.getenv("SYMBOL_NEWS_REFRESH_SECONDS", "300"))
@@ -210,6 +215,8 @@ _last_gsheet_init_attempt: "datetime | None" = None
 _spy_vwap_cache: "dict" = {"side": None, "updated_at": None}
 # Cached trending stocks and reasons from Alpaca screener/news.
 _trending_cache: "dict" = {"updated_at": None, "symbols": [], "reasons": {}}
+# Cached tradability/profile checks for trending candidates.
+_trending_asset_cache: "dict" = {}
 # Cached symbol news context used by entry alerts.
 _symbol_news_cache: "dict" = {"updated_at": {}, "items": {}}
 
@@ -1405,6 +1412,41 @@ def _is_valid_trending_symbol(sym):
     return True
 
 
+def _is_stock_like_trending_candidate(sym):
+    """Best-effort stock-only gate for screener symbols."""
+    upper = str(sym or "").upper().strip()
+    if not upper:
+        return False
+    if upper in TRENDING_EXCLUDE_SYMBOLS:
+        return False
+
+    cached = _trending_asset_cache.get(upper)
+    if cached is not None:
+        return bool(cached)
+
+    if _trading_client is None:
+        return True
+
+    allowed = True
+    try:
+        asset = _trading_client.get_asset(upper)
+        if hasattr(asset, "tradable") and not bool(getattr(asset, "tradable", True)):
+            allowed = False
+        name = str(getattr(asset, "name", "") or "").lower()
+        if name:
+            etf_markers = (
+                "etf", "exchange traded fund", "fund", "trust", "index", "proshares",
+                "ishares", "invesco", "direxion", "vanguard", "spdr",
+            )
+            if any(marker in name for marker in etf_markers):
+                allowed = False
+    except Exception:
+        allowed = True
+
+    _trending_asset_cache[upper] = allowed
+    return allowed
+
+
 def get_trending_symbols(client, base_symbols):
     """Get trending stock symbols from Alpaca screener, with Alpaca-bars fallback.
 
@@ -1434,6 +1476,8 @@ def get_trending_symbols(client, base_symbols):
             if not sym or sym in ETF_SYMBOLS or sym in base_set:
                 continue
             if not _is_valid_trending_symbol(sym):
+                continue
+            if not _is_stock_like_trending_candidate(sym):
                 continue
 
             # Validate real-time tradability characteristics via recent bars.
