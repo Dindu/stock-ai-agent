@@ -98,6 +98,7 @@ SCORE_WATCH  = int(os.getenv("SCORE_WATCH",  "50"))   # WATCHLIST heads-up
 SCORE_DOMINANCE = int(os.getenv("SCORE_DOMINANCE", "20"))  # bull must lead bear by this much (and vice versa)
 # Global bypass for all entry gating layers (tier/stock strict/opening/cooldown/ignition/RSI/macro/anti-chase/candle).
 NO_GATING_MODE = os.getenv("NO_GATING_MODE", "1") == "1"
+ENFORCE_OPENING_WINDOW_IN_NO_GATING = os.getenv("ENFORCE_OPENING_WINDOW_IN_NO_GATING", "1") == "1"
 # Stock-only tightening: require a slightly higher effective strong score.
 STOCK_STRONG_SCORE_BONUS = int(os.getenv("STOCK_STRONG_SCORE_BONUS", "5"))
 # Hard score gate control:
@@ -2265,7 +2266,8 @@ def run_symbol(client, symbol):
             f"\u2014 below STRONG threshold, no Discord alert.")
         return
 
-    if not NO_GATING_MODE:
+    enforce_opening_window = (not NO_GATING_MODE) or ENFORCE_OPENING_WINDOW_IN_NO_GATING
+    if enforce_opening_window:
         opening_block_minutes = opening_no_trade_minutes_remaining()
         if opening_block_minutes > 0:
             log(
@@ -2542,6 +2544,10 @@ def main():
             log("NO_GATING_MODE enabled - bypassing entry gates, including hard score gate.")
         else:
             log("NO_GATING_MODE enabled - bypassing entry gates (hard score gate disabled globally).")
+        if ENFORCE_OPENING_WINDOW_IN_NO_GATING:
+            log(f"Opening no-trade window remains enforced for first {OPENING_NO_TRADE_MINUTES}m after open.")
+        else:
+            log("Opening no-trade window bypassed in NO_GATING_MODE.")
 
     init_google_sheets()
 
