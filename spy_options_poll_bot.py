@@ -97,7 +97,7 @@ SCORE_SIGNAL = int(os.getenv("SCORE_SIGNAL", "65"))   # CALL/PUT alert
 SCORE_WATCH  = int(os.getenv("SCORE_WATCH",  "50"))   # WATCHLIST heads-up
 SCORE_DOMINANCE = int(os.getenv("SCORE_DOMINANCE", "20"))  # bull must lead bear by this much (and vice versa)
 # Global bypass for all entry gating layers (tier/stock strict/opening/cooldown/ignition/RSI/macro/anti-chase/candle).
-NO_GATING_MODE = os.getenv("NO_GATING_MODE", "1") == "1"
+NO_GATING_MODE = os.getenv("NO_GATING_MODE", "0") == "1"
 ENFORCE_OPENING_WINDOW_IN_NO_GATING = os.getenv("ENFORCE_OPENING_WINDOW_IN_NO_GATING", "1") == "1"
 # Stock-only tightening: require a slightly higher effective strong score.
 STOCK_STRONG_SCORE_BONUS = int(os.getenv("STOCK_STRONG_SCORE_BONUS", "5"))
@@ -2277,7 +2277,7 @@ def run_symbol(client, symbol):
             return
 
     # One STRONG CALL alert and one STRONG PUT alert max per (symbol, side) per day.
-    # After a trade closes, a 30-min cooldown allows the same setup to re-trigger.
+    # After a trade closes, a cooldown allows the same setup to re-trigger.
     alert_key = (symbol, side)
     now_ct = datetime.now(central)
     if not NO_GATING_MODE:
