@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import time
+import threading
 import traceback
 import uuid
 from collections import deque
@@ -27,6 +28,7 @@ import requests
 from dotenv import load_dotenv
 
 from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
+from alpaca.data.live import StockDataStream
 from alpaca.data.requests import StockBarsRequest, OptionLatestQuoteRequest, OptionSnapshotRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed, OptionsFeed
@@ -83,6 +85,11 @@ SYMBOL_NEWS_HEADLINES = int(os.getenv("SYMBOL_NEWS_HEADLINES", "2"))
 SYMBOL_NEWS_REFRESH_SECONDS = int(os.getenv("SYMBOL_NEWS_REFRESH_SECONDS", "300"))
 BAR_MINUTES = 5
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index options
+USE_WEBSOCKET_STREAM = os.getenv("USE_WEBSOCKET_STREAM", "0") == "1"
+WS_SYMBOL_MIN_EVAL_SECONDS = int(os.getenv("WS_SYMBOL_MIN_EVAL_SECONDS", "5"))
+WS_EXIT_CHECK_SECONDS = int(os.getenv("WS_EXIT_CHECK_SECONDS", "5"))
+WS_LOOP_SLEEP_SECONDS = float(os.getenv("WS_LOOP_SLEEP_SECONDS", "0.5"))
+WS_FULL_SCAN_INTERVAL_SECONDS = int(os.getenv("WS_FULL_SCAN_INTERVAL_SECONDS", "180"))
 OPENING_NO_TRADE_MINUTES = int(os.getenv("OPENING_NO_TRADE_MINUTES", "15"))
 CLOSING_NO_TRADE_MINUTES = int(os.getenv("CLOSING_NO_TRADE_MINUTES", "30"))
 LOOKBACK_BARS = 120
@@ -223,6 +230,10 @@ _trending_cache: "dict" = {"updated_at": None, "symbols": [], "reasons": {}}
 _trending_asset_cache: "dict" = {}
 # Cached symbol news context used by entry alerts.
 _symbol_news_cache: "dict" = {"updated_at": {}, "items": {}}
+# WebSocket-driven symbol scheduling state.
+_ws_pending_symbols: "set[str]" = set()
+_ws_last_eval_at: "dict[str, datetime]" = {}
+_ws_pending_lock = threading.Lock()
 # Daily performance tracker for hourly Discord summaries (resets by CT date).
 _perf_stats: "dict" = {
     "date": None,
@@ -2382,6 +2393,104 @@ def run_cycle(client):
         log(f"Hourly perf report error: {e}")
 
 
+async def _on_stock_trade_tick(trade):
+    """WebSocket callback: enqueue symbol for immediate evaluation."""
+    symbol = str(getattr(trade, "symbol", "") or "").upper().strip()
+    if not symbol:
+        return
+    with _ws_pending_lock:
+        _ws_pending_symbols.add(symbol)
+
+
+def _reset_daily_alert_state_if_needed(now_ct):
+    """Mirror run_cycle day rollover behavior for websocket mode."""
+    today = now_ct.date()
+    if _alerted_today["date"] != today:
+        _alerted_today["date"] = today
+        _alerted_today["keys"] = set()
+
+
+def run_websocket_cycle(client):
+    """Event-driven loop: evaluate symbols on ticks instead of fixed polling cadence."""
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        raise Exception("Missing Alpaca API keys in .env")
+
+    stream = StockDataStream(
+        ALPACA_API_KEY,
+        ALPACA_SECRET_KEY,
+        feed=DataFeed(FEED),
+        raw_data=False,
+    )
+    for sym in SYMBOLS:
+        stream.subscribe_trades(_on_stock_trade_tick, sym)
+
+    stream_thread = threading.Thread(target=stream.run, daemon=True, name="alpaca-stock-stream")
+    stream_thread.start()
+    log(f"WebSocket mode enabled. Subscribed to trade ticks for {len(SYMBOLS)} symbols (feed={FEED}).")
+
+    next_exit_check_at = datetime.now(central)
+    next_full_scan_at = datetime.now(central)
+    min_eval_gap = max(1, WS_SYMBOL_MIN_EVAL_SECONDS)
+    exit_check_gap = max(1, WS_EXIT_CHECK_SECONDS)
+    loop_sleep = max(0.1, WS_LOOP_SLEEP_SECONDS)
+    full_scan_gap = max(30, WS_FULL_SCAN_INTERVAL_SECONDS)
+
+    while True:
+        now_ct = datetime.now(central)
+
+        if not market_open_now():
+            log("Market closed — websocket loop idle.")
+            time.sleep(max(5, POLL_SECONDS))
+            continue
+
+        _reset_daily_alert_state_if_needed(now_ct)
+        _reset_perf_stats_if_new_day(now_ct)
+
+        symbols_to_run = []
+        with _ws_pending_lock:
+            pending = list(_ws_pending_symbols)
+
+        for symbol in pending:
+            last_eval = _ws_last_eval_at.get(symbol)
+            if last_eval is None or (now_ct - last_eval).total_seconds() >= min_eval_gap:
+                symbols_to_run.append(symbol)
+
+        # Safety net: periodic full scan catches missed stream events or reconnect gaps.
+        if now_ct >= next_full_scan_at:
+            for sym in SYMBOLS:
+                if sym not in symbols_to_run:
+                    symbols_to_run.append(sym)
+            next_full_scan_at = now_ct + timedelta(seconds=full_scan_gap)
+
+        for symbol in symbols_to_run:
+            try:
+                run_symbol(client, symbol)
+            except Exception:
+                log(f"[{symbol}] WebSocket cycle error:")
+                traceback.print_exc()
+                sys.stdout.flush()
+            finally:
+                _ws_last_eval_at[symbol] = datetime.now(central)
+                with _ws_pending_lock:
+                    _ws_pending_symbols.discard(symbol)
+
+        if now_ct >= next_exit_check_at:
+            try:
+                track_open_trades()
+            except Exception:
+                log("track_open_trades error:")
+                traceback.print_exc()
+                sys.stdout.flush()
+            next_exit_check_at = datetime.now(central) + timedelta(seconds=exit_check_gap)
+
+        try:
+            maybe_send_hourly_perf_report(datetime.now(central))
+        except Exception as e:
+            log(f"Hourly perf report error: {e}")
+
+        time.sleep(loop_sleep)
+
+
 def run_symbol(client, symbol):
     bars = fetch_bars(client, symbol)
     log(f"[{symbol}] Fetched {len(bars)} bars.")
@@ -2742,18 +2851,32 @@ def main():
     if RECOVER_OPEN_POSITIONS:
         sync_open_trades_from_alpaca()
 
-    log(f"Options Alert Bot started. Symbols={','.join(SYMBOLS)} "
-        f"Polling every {POLL_SECONDS}s. Feed={FEED}.")
+    if USE_WEBSOCKET_STREAM:
+        log(
+            f"Options Alert Bot started. Symbols={','.join(SYMBOLS)} "
+            f"Mode=websocket (tick-triggered). Feed={FEED}."
+        )
+        while True:
+            try:
+                run_websocket_cycle(client)
+            except Exception:
+                log("WebSocket loop error — retrying in 5s:")
+                traceback.print_exc()
+                sys.stdout.flush()
+                time.sleep(5)
+    else:
+        log(f"Options Alert Bot started. Symbols={','.join(SYMBOLS)} "
+            f"Polling every {POLL_SECONDS}s. Feed={FEED}.")
 
-    while True:
-        try:
-            run_cycle(client)
-        except Exception:
-            log("Cycle error:")
-            traceback.print_exc()
-            sys.stdout.flush()
-        log(f"Sleeping {POLL_SECONDS}s...")
-        time.sleep(POLL_SECONDS)
+        while True:
+            try:
+                run_cycle(client)
+            except Exception:
+                log("Cycle error:")
+                traceback.print_exc()
+                sys.stdout.flush()
+            log(f"Sleeping {POLL_SECONDS}s...")
+            time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
