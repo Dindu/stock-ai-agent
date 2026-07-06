@@ -85,7 +85,6 @@ SYMBOL_NEWS_HEADLINES = int(os.getenv("SYMBOL_NEWS_HEADLINES", "2"))
 SYMBOL_NEWS_REFRESH_SECONDS = int(os.getenv("SYMBOL_NEWS_REFRESH_SECONDS", "300"))
 BAR_MINUTES = 5
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index options
-USE_WEBSOCKET_STREAM = os.getenv("USE_WEBSOCKET_STREAM", "0") == "1"
 WS_SYMBOL_MIN_EVAL_SECONDS = int(os.getenv("WS_SYMBOL_MIN_EVAL_SECONDS", "5"))
 WS_EXIT_CHECK_SECONDS = int(os.getenv("WS_EXIT_CHECK_SECONDS", "5"))
 WS_LOOP_SLEEP_SECONDS = float(os.getenv("WS_LOOP_SLEEP_SECONDS", "0.5"))
@@ -2456,8 +2455,18 @@ def run_websocket_cycle(client):
                 symbols_to_run.append(symbol)
 
         # Safety net: periodic full scan catches missed stream events or reconnect gaps.
+        # Include trending symbols here so websocket mode keeps parity with polling mode.
         if now_ct >= next_full_scan_at:
-            for sym in SYMBOLS:
+            full_scan_symbols = list(SYMBOLS)
+            try:
+                trending_symbols, _ = get_trending_symbols(client, SYMBOLS)
+                for tsym in trending_symbols:
+                    if tsym not in full_scan_symbols:
+                        full_scan_symbols.append(tsym)
+            except Exception as e:
+                log(f"Trending refresh warning (websocket full scan): {e}")
+
+            for sym in full_scan_symbols:
                 if sym not in symbols_to_run:
                     symbols_to_run.append(sym)
             next_full_scan_at = now_ct + timedelta(seconds=full_scan_gap)
@@ -2851,32 +2860,18 @@ def main():
     if RECOVER_OPEN_POSITIONS:
         sync_open_trades_from_alpaca()
 
-    if USE_WEBSOCKET_STREAM:
-        log(
-            f"Options Alert Bot started. Symbols={','.join(SYMBOLS)} "
-            f"Mode=websocket (tick-triggered). Feed={FEED}."
-        )
-        while True:
-            try:
-                run_websocket_cycle(client)
-            except Exception:
-                log("WebSocket loop error — retrying in 5s:")
-                traceback.print_exc()
-                sys.stdout.flush()
-                time.sleep(5)
-    else:
-        log(f"Options Alert Bot started. Symbols={','.join(SYMBOLS)} "
-            f"Polling every {POLL_SECONDS}s. Feed={FEED}.")
-
-        while True:
-            try:
-                run_cycle(client)
-            except Exception:
-                log("Cycle error:")
-                traceback.print_exc()
-                sys.stdout.flush()
-            log(f"Sleeping {POLL_SECONDS}s...")
-            time.sleep(POLL_SECONDS)
+    log(
+        f"Options Alert Bot started. Symbols={','.join(SYMBOLS)} "
+        f"Mode=websocket (tick-triggered). Feed={FEED}."
+    )
+    while True:
+        try:
+            run_websocket_cycle(client)
+        except Exception:
+            log("WebSocket loop error — retrying in 5s:")
+            traceback.print_exc()
+            sys.stdout.flush()
+            time.sleep(5)
 
 
 if __name__ == "__main__":
