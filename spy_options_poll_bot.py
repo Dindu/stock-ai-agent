@@ -145,6 +145,8 @@ ANTI_CHASE_FILTER  = os.getenv("ANTI_CHASE_FILTER", "1") == "1"
 MAX_EXT_FROM_VWAP  = float(os.getenv("MAX_EXT_FROM_VWAP", "0.012"))  # 1.2%
 CANDLE_CONFIRMATION = os.getenv("CANDLE_CONFIRMATION", "1") == "1"
 ALERT_ONLY_COOLDOWN_MINUTES = int(os.getenv("ALERT_ONLY_COOLDOWN_MINUTES", "20"))
+ENABLE_HOURLY_DISCORD_PERF_REPORT = os.getenv("ENABLE_HOURLY_DISCORD_PERF_REPORT", "1") == "1"
+HOURLY_REPORT_MINUTE_WINDOW = int(os.getenv("HOURLY_REPORT_MINUTE_WINDOW", "2"))
 
 # Paper-trading execution. When ENABLE_ALPACA_PAPER_TRADING=1 the bot will
 # submit a paper-account market BUY when a STRONG signal fires, then poll the
@@ -221,6 +223,30 @@ _trending_cache: "dict" = {"updated_at": None, "symbols": [], "reasons": {}}
 _trending_asset_cache: "dict" = {}
 # Cached symbol news context used by entry alerts.
 _symbol_news_cache: "dict" = {"updated_at": {}, "items": {}}
+# Daily performance tracker for hourly Discord summaries (resets by CT date).
+_perf_stats: "dict" = {
+    "date": None,
+    "entries": 0,
+    "closed": 0,
+    "wins": 0,
+    "losses": 0,
+    "realized_pnl_dollar": 0.0,
+    "realized_pnl_pct_sum": 0.0,
+    "gross_win_dollar": 0.0,
+    "gross_loss_dollar": 0.0,
+    "win_pnl_pct_sum": 0.0,
+    "loss_pnl_pct_sum": 0.0,
+    "best_win_dollar": 0.0,
+    "best_win_symbol": "",
+    "worst_loss_dollar": 0.0,
+    "worst_loss_symbol": "",
+    "last_report_entries": 0,
+    "last_report_closed": 0,
+    "last_report_wins": 0,
+    "last_report_losses": 0,
+    "last_report_realized_pnl_dollar": 0.0,
+    "last_sent_hour": None,
+}
 
 # Column headers for the two Google Sheets tabs.
 _ALERTS_HEADERS = [
@@ -1572,6 +1598,159 @@ def log(msg):
     print(f"[{datetime.now(central):%Y-%m-%d %H:%M:%S} CT] {msg}", flush=True)
 
 
+def _reset_perf_stats_if_new_day(now_ct=None):
+    """Reset in-memory daily performance counters on date rollover."""
+    now_ct = now_ct or datetime.now(central)
+    today = now_ct.date()
+    if _perf_stats.get("date") == today:
+        return
+
+    _perf_stats["date"] = today
+    _perf_stats["entries"] = 0
+    _perf_stats["closed"] = 0
+    _perf_stats["wins"] = 0
+    _perf_stats["losses"] = 0
+    _perf_stats["realized_pnl_dollar"] = 0.0
+    _perf_stats["realized_pnl_pct_sum"] = 0.0
+    _perf_stats["gross_win_dollar"] = 0.0
+    _perf_stats["gross_loss_dollar"] = 0.0
+    _perf_stats["win_pnl_pct_sum"] = 0.0
+    _perf_stats["loss_pnl_pct_sum"] = 0.0
+    _perf_stats["best_win_dollar"] = 0.0
+    _perf_stats["best_win_symbol"] = ""
+    _perf_stats["worst_loss_dollar"] = 0.0
+    _perf_stats["worst_loss_symbol"] = ""
+    _perf_stats["last_report_entries"] = 0
+    _perf_stats["last_report_closed"] = 0
+    _perf_stats["last_report_wins"] = 0
+    _perf_stats["last_report_losses"] = 0
+    _perf_stats["last_report_realized_pnl_dollar"] = 0.0
+    _perf_stats["last_sent_hour"] = None
+
+
+def _record_trade_open_for_perf(now_ct=None):
+    """Record one opened trade in today's in-memory performance counters."""
+    _reset_perf_stats_if_new_day(now_ct)
+    _perf_stats["entries"] = int(_perf_stats.get("entries", 0)) + 1
+
+
+def _record_trade_close_for_perf(trade, exit_price, pnl_pct, now_ct=None):
+    """Record one closed trade in today's in-memory performance counters."""
+    _reset_perf_stats_if_new_day(now_ct)
+
+    qty = int(trade.get("qty", 0) or 0)
+    entry_px = float(trade.get("entry", 0.0) or 0.0)
+    exit_px = float(exit_price or 0.0)
+    pnl_dollar = (exit_px - entry_px) * float(max(0, qty)) * 100.0
+
+    _perf_stats["closed"] = int(_perf_stats.get("closed", 0)) + 1
+    if pnl_pct > 0:
+        _perf_stats["wins"] = int(_perf_stats.get("wins", 0)) + 1
+        _perf_stats["gross_win_dollar"] = float(_perf_stats.get("gross_win_dollar", 0.0)) + pnl_dollar
+        _perf_stats["win_pnl_pct_sum"] = float(_perf_stats.get("win_pnl_pct_sum", 0.0)) + float(pnl_pct * 100.0)
+        if pnl_dollar > float(_perf_stats.get("best_win_dollar", 0.0)):
+            _perf_stats["best_win_dollar"] = pnl_dollar
+            _perf_stats["best_win_symbol"] = str(trade.get("underlying", "") or "")
+    else:
+        _perf_stats["losses"] = int(_perf_stats.get("losses", 0)) + 1
+        _perf_stats["gross_loss_dollar"] = float(_perf_stats.get("gross_loss_dollar", 0.0)) + abs(pnl_dollar)
+        _perf_stats["loss_pnl_pct_sum"] = float(_perf_stats.get("loss_pnl_pct_sum", 0.0)) + float(pnl_pct * 100.0)
+        if pnl_dollar < float(_perf_stats.get("worst_loss_dollar", 0.0)):
+            _perf_stats["worst_loss_dollar"] = pnl_dollar
+            _perf_stats["worst_loss_symbol"] = str(trade.get("underlying", "") or "")
+    _perf_stats["realized_pnl_dollar"] = float(_perf_stats.get("realized_pnl_dollar", 0.0)) + pnl_dollar
+    _perf_stats["realized_pnl_pct_sum"] = float(_perf_stats.get("realized_pnl_pct_sum", 0.0)) + float(pnl_pct * 100.0)
+
+
+def maybe_send_hourly_perf_report(now_ct=None):
+    """Send one hourly Discord performance summary for today's trades."""
+    if not ENABLE_HOURLY_DISCORD_PERF_REPORT:
+        return
+    if not DISCORD_WEBHOOK_URL:
+        return
+
+    now_ct = now_ct or datetime.now(central)
+    _reset_perf_stats_if_new_day(now_ct)
+
+    # Post once per hour near the top of the hour to avoid noisy timing drift.
+    minute_window = max(1, min(15, HOURLY_REPORT_MINUTE_WINDOW))
+    if now_ct.minute >= minute_window:
+        return
+
+    hour_key = (now_ct.date(), now_ct.hour)
+    if _perf_stats.get("last_sent_hour") == hour_key:
+        return
+
+    entries = int(_perf_stats.get("entries", 0))
+    closed = int(_perf_stats.get("closed", 0))
+    wins = int(_perf_stats.get("wins", 0))
+    losses = int(_perf_stats.get("losses", 0))
+    open_positions = len(_open_trades)
+    realized_pnl_dollar = float(_perf_stats.get("realized_pnl_dollar", 0.0))
+    avg_closed_pnl_pct = (float(_perf_stats.get("realized_pnl_pct_sum", 0.0)) / closed) if closed > 0 else 0.0
+    win_rate = (wins / closed * 100.0) if closed > 0 else 0.0
+    gross_win_dollar = float(_perf_stats.get("gross_win_dollar", 0.0))
+    gross_loss_dollar = float(_perf_stats.get("gross_loss_dollar", 0.0))
+    profit_factor = (gross_win_dollar / gross_loss_dollar) if gross_loss_dollar > 0 else (float("inf") if gross_win_dollar > 0 else 0.0)
+    avg_win_pct = (float(_perf_stats.get("win_pnl_pct_sum", 0.0)) / wins) if wins > 0 else 0.0
+    avg_loss_pct = (float(_perf_stats.get("loss_pnl_pct_sum", 0.0)) / losses) if losses > 0 else 0.0
+    best_win_dollar = float(_perf_stats.get("best_win_dollar", 0.0))
+    best_win_symbol = str(_perf_stats.get("best_win_symbol", "") or "")
+    worst_loss_dollar = float(_perf_stats.get("worst_loss_dollar", 0.0))
+    worst_loss_symbol = str(_perf_stats.get("worst_loss_symbol", "") or "")
+    last_entries = int(_perf_stats.get("last_report_entries", 0))
+    last_closed = int(_perf_stats.get("last_report_closed", 0))
+    last_wins = int(_perf_stats.get("last_report_wins", 0))
+    last_losses = int(_perf_stats.get("last_report_losses", 0))
+    last_realized_pnl = float(_perf_stats.get("last_report_realized_pnl_dollar", 0.0))
+    delta_entries = entries - last_entries
+    delta_closed = closed - last_closed
+    delta_wins = wins - last_wins
+    delta_losses = losses - last_losses
+    delta_realized_pnl = realized_pnl_dollar - last_realized_pnl
+    delta_win_rate = (delta_wins / delta_closed * 100.0) if delta_closed > 0 else 0.0
+    pf_text = "N/A"
+    if profit_factor == float("inf"):
+        pf_text = "INF"
+    elif gross_loss_dollar > 0:
+        pf_text = f"{profit_factor:.2f}"
+
+    color = DISCORD_COLOR_WARN
+    if realized_pnl_dollar > 0:
+        color = DISCORD_COLOR_CALL
+    elif realized_pnl_dollar < 0:
+        color = DISCORD_COLOR_PUT
+
+    send_discord(
+        f"📊 **Hourly Trade Summary ({now_ct:%Y-%m-%d %H:%M} CT)**\n\n"
+        f"**Today Entries:** `{entries}`\n"
+        f"**Closed Trades:** `{closed}`\n"
+        f"**Wins / Losses:** `{wins}` / `{losses}`\n"
+        f"**Win Rate:** `{win_rate:.1f}%`\n"
+        f"**Open Positions:** `{open_positions}`\n"
+        f"**Realized P&L ($):** `{realized_pnl_dollar:+,.2f}`\n"
+        f"**Avg Closed P&L (%):** `{avg_closed_pnl_pct:+.2f}%`\n"
+        f"**Gross Wins / Losses ($):** `{gross_win_dollar:,.2f}` / `{gross_loss_dollar:,.2f}`\n"
+        f"**Profit Factor:** `{pf_text}`\n"
+        f"**Avg Win / Loss (%):** `{avg_win_pct:+.2f}%` / `{avg_loss_pct:+.2f}%`\n"
+        f"**Best / Worst Trade ($):** `{best_win_symbol or '-'} {best_win_dollar:+,.2f}` / `{worst_loss_symbol or '-'} {worst_loss_dollar:+,.2f}`\n"
+        f"**Since Last Report:** Entries `{delta_entries:+d}` | Closed `{delta_closed:+d}` | "
+        f"W/L `{delta_wins:+d}/{delta_losses:+d}` | WinRate `{delta_win_rate:.1f}%` | "
+        f"P&L `{delta_realized_pnl:+,.2f}`",
+        color=color,
+    )
+    _perf_stats["last_report_entries"] = entries
+    _perf_stats["last_report_closed"] = closed
+    _perf_stats["last_report_wins"] = wins
+    _perf_stats["last_report_losses"] = losses
+    _perf_stats["last_report_realized_pnl_dollar"] = realized_pnl_dollar
+    _perf_stats["last_sent_hour"] = hour_key
+    log(
+        f"Hourly perf report sent: entries={entries} closed={closed} wins={wins} "
+        f"losses={losses} realized=${realized_pnl_dollar:+,.2f}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Paper-trading execution + position tracking
 # ---------------------------------------------------------------------------
@@ -2012,6 +2191,7 @@ def close_trade(trade, exit_price, reason, pnl_pct):
         log(f"CSV write failed: {e}")
 
     log_trade_to_sheets(row, trade)
+    _record_trade_close_for_perf(trade, exit_price, pnl_pct, closed_at)
 
     _open_trades.pop(trade["contract"], None)
 
@@ -2101,6 +2281,7 @@ def try_open_paper_trade(symbol, side, option, data):
 
     trade = open_trade_record(symbol, signal_label, option, score, fill_price, qty)
     _open_trades[trade["contract"]] = trade
+    _record_trade_open_for_perf(datetime.now(central))
 
     # Persist both ALERTS and TRADES records as part of the same entry flow.
     log_alert_to_sheets(symbol, data, option)
@@ -2164,6 +2345,8 @@ def run_cycle(client):
         log("Market closed — skipping.")
         return
 
+    _reset_perf_stats_if_new_day(datetime.now(central))
+
     # Reset the per-day dedupe set when the date rolls over.
     today = datetime.now(central).date()
     if _alerted_today["date"] != today:
@@ -2192,6 +2375,11 @@ def run_cycle(client):
         log("track_open_trades error:")
         traceback.print_exc()
         sys.stdout.flush()
+
+    try:
+        maybe_send_hourly_perf_report(datetime.now(central))
+    except Exception as e:
+        log(f"Hourly perf report error: {e}")
 
 
 def run_symbol(client, symbol):
