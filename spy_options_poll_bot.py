@@ -106,7 +106,7 @@ STOCK_STRONG_SCORE_BONUS = int(os.getenv("STOCK_STRONG_SCORE_BONUS", "5"))
 # - When NO_GATING_MODE=1, the hard gate is bypassed by default unless
 #   HARD_SCORE_GATE_IN_NO_GATING_MODE=1.
 HARD_SCORE_GATE_ENABLED = os.getenv("HARD_SCORE_GATE_ENABLED", "1") == "1"
-HARD_SCORE_GATE_IN_NO_GATING_MODE = os.getenv("HARD_SCORE_GATE_IN_NO_GATING_MODE", "0") == "1"
+HARD_SCORE_GATE_IN_NO_GATING_MODE = os.getenv("HARD_SCORE_GATE_IN_NO_GATING_MODE", "1") == "1"
 # Execution behavior controls.
 # Default: do not auto-execute WATCHLIST setups (alerts-only quality).
 EXECUTE_WATCHLIST_SIGNALS = os.getenv("EXECUTE_WATCHLIST_SIGNALS", "0") == "1"
