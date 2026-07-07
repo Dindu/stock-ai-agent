@@ -2194,14 +2194,28 @@ def place_paper_exit(contract_symbol, qty):
     if _trading_client is None:
         raise Exception("Trading client not initialized")
 
-    # Determine close direction from the live broker position sign.
+    # Determine close direction from broker position side first.
+    # Alpaca may report qty as positive even for short positions, so relying
+    # only on qty sign can choose the wrong close side.
     pos = _trading_client.get_open_position(contract_symbol)
     pos_qty_raw = float(getattr(pos, "qty", 0) or 0)
     if pos_qty_raw == 0:
         raise Exception(f"No open qty to close for {contract_symbol}")
 
-    close_side = OrderSide.SELL if pos_qty_raw > 0 else OrderSide.BUY
+    pos_side_raw = str(getattr(pos, "side", "") or "").strip().lower()
+    if "short" in pos_side_raw:
+        close_side = OrderSide.BUY
+    elif "long" in pos_side_raw:
+        close_side = OrderSide.SELL
+    else:
+        close_side = OrderSide.SELL if pos_qty_raw > 0 else OrderSide.BUY
+
     close_qty = max(1, min(abs(int(pos_qty_raw)), int(max(1, qty))))
+    log(
+        f"[{_underlying_from_contract(contract_symbol) or contract_symbol}] Exit intent: "
+        f"contract={contract_symbol} pos_side={pos_side_raw or 'unknown'} qty={pos_qty_raw} "
+        f"-> side={close_side.name} qty={close_qty}"
+    )
 
     order_req = MarketOrderRequest(
         symbol=contract_symbol,
