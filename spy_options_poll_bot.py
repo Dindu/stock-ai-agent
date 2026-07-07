@@ -88,7 +88,7 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index opti
 WS_SYMBOL_MIN_EVAL_SECONDS = int(os.getenv("WS_SYMBOL_MIN_EVAL_SECONDS", "5"))
 WS_EXIT_CHECK_SECONDS = int(os.getenv("WS_EXIT_CHECK_SECONDS", "5"))
 WS_LOOP_SLEEP_SECONDS = float(os.getenv("WS_LOOP_SLEEP_SECONDS", "0.5"))
-WS_FULL_SCAN_INTERVAL_SECONDS = int(os.getenv("WS_FULL_SCAN_INTERVAL_SECONDS", "180"))
+WS_FULL_SCAN_INTERVAL_SECONDS = int(os.getenv("WS_FULL_SCAN_INTERVAL_SECONDS", "30"))
 OPENING_NO_TRADE_MINUTES = int(os.getenv("OPENING_NO_TRADE_MINUTES", "15"))
 CLOSING_NO_TRADE_MINUTES = int(os.getenv("CLOSING_NO_TRADE_MINUTES", "30"))
 LOOKBACK_BARS = 120
@@ -2432,7 +2432,14 @@ def run_websocket_cycle(client):
     min_eval_gap = max(1, WS_SYMBOL_MIN_EVAL_SECONDS)
     exit_check_gap = max(1, WS_EXIT_CHECK_SECONDS)
     loop_sleep = max(0.1, WS_LOOP_SLEEP_SECONDS)
-    full_scan_gap = max(30, WS_FULL_SCAN_INTERVAL_SECONDS)
+    full_scan_gap = max(10, WS_FULL_SCAN_INTERVAL_SECONDS)
+    log(
+        "WebSocket cadence: "
+        f"symbol_min_eval={min_eval_gap}s, "
+        f"full_scan={full_scan_gap}s, "
+        f"exit_check={exit_check_gap}s, "
+        f"loop_sleep={loop_sleep}s"
+    )
 
     while True:
         now_ct = datetime.now(central)
