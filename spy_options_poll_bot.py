@@ -281,6 +281,7 @@ _ALERTS_HEADERS = [
     "Score Components",
     "VWAP", "EMA20", "EMA50", "PDH", "PDL", "Recent High", "Recent Low",
     "Bar Volume", "Bar Vol Avg",
+    "Trade Status", "P&L ($)", "P&L %", "Exit Reason", "Closed At (CT)", "Updated At (CT)",
 ]
 _TRADES_HEADERS = [
     "Trade ID", "Symbol", "Entry Price", "Exit Price", "Strike", "Direction",
@@ -432,9 +433,12 @@ def ensure_google_sheets_ready():
 
 
 def log_alert_to_sheets(symbol, data, option):
-    """Append one row to the Alerts tab for every STRONG signal that fires."""
+    """Append one row to the Alerts tab for every STRONG signal that fires.
+
+    Returns the 1-based sheet row index when available, else None.
+    """
     if _gsheet is None and not ensure_google_sheets_ready():
-        return
+        return None
     try:
         breakdown = data["bull_breakdown"] if data["side"] == "CALL" else data["bear_breakdown"]
         components = ", ".join(f"{k} (+{v})" for k, v in breakdown.items())
@@ -444,6 +448,7 @@ def log_alert_to_sheets(symbol, data, option):
         else:
             delta = (data["bear_score"] - data["bear_5m"]) if data["bear_5m"] is not None else ""
 
+        now_ct = datetime.now(central).strftime("%Y-%m-%d %H:%M:%S")
         row = [
             datetime.now(central).strftime("%Y-%m-%d %H:%M:%S"),
             symbol,
@@ -473,11 +478,106 @@ def log_alert_to_sheets(symbol, data, option):
             round(data["recent_low"],  2),
             int(data["volume"]),
             int(data["vol_avg"]),
+            "OPEN",
+            "",
+            "",
+            "",
+            "",
+            now_ct,
         ]
-        _gsheet.worksheet("Alerts").append_row(row, value_input_option="USER_ENTERED")
+        ws = _gsheet.worksheet("Alerts")
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        alert_row = len(ws.col_values(1))
         log(f"[{symbol}] Alert logged to Google Sheets.")
+        return alert_row
     except Exception as e:
         log(f"[{symbol}] Google Sheets alert log failed: {e}")
+        return None
+
+
+def _find_latest_open_alert_row(contract):
+    """Best-effort lookup for the latest OPEN alert row by contract symbol."""
+    if _gsheet is None and not ensure_google_sheets_ready():
+        return None
+    try:
+        ws = _gsheet.worksheet("Alerts")
+        rows = ws.get_all_values()
+        if len(rows) <= 1:
+            return None
+
+        headers = rows[0]
+        contract_idx = headers.index("Contract")
+        status_idx = headers.index("Trade Status") if "Trade Status" in headers else None
+
+        for i in range(len(rows) - 1, 0, -1):
+            row = rows[i]
+            row_contract = str(row[contract_idx]).strip() if contract_idx < len(row) else ""
+            if row_contract != str(contract):
+                continue
+            row_status = str(row[status_idx]).strip().upper() if (status_idx is not None and status_idx < len(row)) else ""
+            if row_status in ("", "OPEN", "RECOVERED"):
+                return i + 1
+        return None
+    except Exception:
+        return None
+
+
+def update_alert_close_to_sheets(row, trade):
+    """Mark the corresponding Alerts row as CLOSED and fill realized P&L fields."""
+    if _gsheet is None and not ensure_google_sheets_ready():
+        return
+    try:
+        ws = _gsheet.worksheet("Alerts")
+        headers = ws.row_values(1)
+        if not headers:
+            return
+
+        row_idx = trade.get("alerts_row")
+        if not row_idx:
+            row_idx = _find_latest_open_alert_row(trade.get("contract", ""))
+        if not row_idx:
+            log(f"[{trade.get('underlying', 'UNKNOWN')}] Alerts close update skipped: no matching OPEN alert row.")
+            return
+
+        existing = ws.row_values(int(row_idx))
+        needed = len(headers)
+        if len(existing) < needed:
+            existing.extend([""] * (needed - len(existing)))
+
+        qty = int(row.get("qty", 0) or 0)
+        pnl_dollar = round((float(row["exit"]) - float(row["entry"])) * float(qty) * 100.0, 2)
+        pnl_pct = round(float(row["pnl_pct"]), 2)
+        closed_at = row.get("closed_at")
+        closed_text = (
+            closed_at.strftime("%Y-%m-%d %H:%M:%S")
+            if isinstance(closed_at, datetime)
+            else str(closed_at or "")
+        )
+        now_ct = datetime.now(central).strftime("%Y-%m-%d %H:%M:%S")
+
+        index_map = {name: idx for idx, name in enumerate(headers)}
+        if "Trade Status" in index_map:
+            existing[index_map["Trade Status"]] = "CLOSED"
+        if "P&L ($)" in index_map:
+            existing[index_map["P&L ($)"]] = pnl_dollar
+        if "P&L %" in index_map:
+            existing[index_map["P&L %"]] = pnl_pct
+        if "Exit Reason" in index_map:
+            existing[index_map["Exit Reason"]] = row.get("reason", "")
+        if "Closed At (CT)" in index_map:
+            existing[index_map["Closed At (CT)"]] = closed_text
+        if "Updated At (CT)" in index_map:
+            existing[index_map["Updated At (CT)"]] = now_ct
+
+        ws.update(
+            range_name=f"A{int(row_idx)}",
+            values=[existing],
+            value_input_option="USER_ENTERED",
+        )
+        trade["alerts_row"] = int(row_idx)
+        log(f"[{trade.get('underlying', 'UNKNOWN')}] Alerts row {row_idx} marked CLOSED with P&L.")
+    except Exception as e:
+        log(f"[{trade.get('underlying', 'UNKNOWN')}] Alerts close update failed: {e}")
 
 
 def log_trade_open_to_sheets(trade):
@@ -2397,6 +2497,7 @@ def sync_open_trades_from_alpaca():
             "status": "OPEN",
             "trade_id": prev.get("trade_id") if prev else None,
             "sheets_row": prev.get("sheets_row") if prev else None,
+            "alerts_row": prev.get("alerts_row") if prev else None,
         }
 
     if recovered:
@@ -2649,6 +2750,7 @@ def close_trade(trade, exit_price, reason, pnl_pct):
     except Exception as e:
         log(f"CSV write failed: {e}")
 
+    update_alert_close_to_sheets(row, trade)
     log_trade_to_sheets(row, trade)
     _record_trade_close_for_perf(trade, exit_price, pnl_pct, closed_at)
 
@@ -2743,7 +2845,9 @@ def try_open_paper_trade(symbol, side, option, data):
     _record_trade_open_for_perf(datetime.now(central))
 
     # Persist both ALERTS and TRADES records as part of the same entry flow.
-    log_alert_to_sheets(symbol, data, option)
+    alert_row = log_alert_to_sheets(symbol, data, option)
+    if alert_row:
+        trade["alerts_row"] = int(alert_row)
     log_trade_open_to_sheets(trade)
 
     setup = "MOMENTUM BREAKOUT" if score >= 90 else "TREND CONTINUATION"
