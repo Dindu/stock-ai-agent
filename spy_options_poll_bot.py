@@ -67,6 +67,7 @@ AGGRESSIVE_STOCK_SYMBOLS = {"TSLA", "AMD", "PLTR", "SMCI", "COIN", "SHOP", "UBER
 DEFAULT_SYMBOLS = "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,META,TSLA,AMD,PLTR,NFLX,GOOGL,AVGO,SMCI,MU,COIN,QCOM,INTC,CRM,ORCL,SHOP,UBER"
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
 ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")
+ALPACA_TRADING_BASE_URL = os.getenv("ALPACA_TRADING_BASE_URL", "https://paper-api.alpaca.markets")
 ENABLE_TRENDING_STOCKS = os.getenv("ENABLE_TRENDING_STOCKS", "1") == "1"
 TRENDING_STOCK_COUNT = int(os.getenv("TRENDING_STOCK_COUNT", "5"))
 TRENDING_REFRESH_SECONDS = int(os.getenv("TRENDING_REFRESH_SECONDS", "300"))
@@ -153,6 +154,10 @@ CANDLE_CONFIRMATION = os.getenv("CANDLE_CONFIRMATION", "1") == "1"
 ALERT_ONLY_COOLDOWN_MINUTES = int(os.getenv("ALERT_ONLY_COOLDOWN_MINUTES", "20"))
 ENABLE_HOURLY_DISCORD_PERF_REPORT = os.getenv("ENABLE_HOURLY_DISCORD_PERF_REPORT", "1") == "1"
 HOURLY_REPORT_MINUTE_WINDOW = int(os.getenv("HOURLY_REPORT_MINUTE_WINDOW", "2"))
+ENABLE_STATE_TRANSITION_ALERTS = os.getenv("ENABLE_STATE_TRANSITION_ALERTS", "1") == "1"
+TRANSITION_ALERT_MIN_TIER = os.getenv("TRANSITION_ALERT_MIN_TIER", "SIGNAL").strip().upper()
+TRANSITION_ALERT_COOLDOWN_SECONDS = int(os.getenv("TRANSITION_ALERT_COOLDOWN_SECONDS", "90"))
+ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
 
 # Paper-trading execution. When ENABLE_ALPACA_PAPER_TRADING=1 the bot will
 # submit a paper-account market BUY when a STRONG signal fires, then poll the
@@ -229,6 +234,12 @@ _trending_cache: "dict" = {"updated_at": None, "symbols": [], "reasons": {}}
 _trending_asset_cache: "dict" = {}
 # Cached symbol news context used by entry alerts.
 _symbol_news_cache: "dict" = {"updated_at": {}, "items": {}}
+# Last observed state per symbol for transition-only alerting.
+_last_symbol_state: "dict[str, dict]" = {}
+# Per-symbol timestamp of the most recent transition alert.
+_last_transition_alert_at: "dict[str, datetime]" = {}
+# Per-symbol opportunity cache used by priority scan ordering.
+_symbol_opportunity_cache: "dict[str, dict]" = {}
 # WebSocket-driven symbol scheduling state.
 _ws_pending_symbols: "set[str]" = set()
 _ws_last_eval_at: "dict[str, datetime]" = {}
@@ -256,6 +267,9 @@ _perf_stats: "dict" = {
     "last_report_losses": 0,
     "last_report_realized_pnl_dollar": 0.0,
     "last_sent_hour": None,
+    "hydrated_for": None,
+    "hydrated_source": "",
+    "last_hydrate_attempt": None,
 }
 
 # Column headers for the two Google Sheets tabs.
@@ -565,6 +579,7 @@ def log_trade_to_sheets(row, trade):
 DISCORD_COLOR_CALL = 0x2ECC71
 DISCORD_COLOR_PUT = 0xE74C3C
 DISCORD_COLOR_WARN = 0xF1C40F
+_TIER_RANK = {"NONE": 0, "WATCH": 1, "SIGNAL": 2, "STRONG": 3}
 
 
 def send_discord(message, color=None):
@@ -675,6 +690,131 @@ def symbol_profile(symbol):
             "max_ext_from_vwap": min(MAX_EXT_FROM_VWAP, 0.010),
         })
     return profile
+
+
+def _score_trend_deltas(data, side):
+    """Return 5m/10m score deltas for the intended side."""
+    side = str(side or "").upper()
+    now_score = int(data.get("bull_score", 0)) if side == "CALL" else int(data.get("bear_score", 0))
+    past_5m = data.get("bull_5m") if side == "CALL" else data.get("bear_5m")
+    past_10m = data.get("bull_10m") if side == "CALL" else data.get("bear_10m")
+    delta_5m = None if past_5m is None else int(now_score - int(past_5m))
+    delta_10m = None if past_10m is None else int(now_score - int(past_10m))
+    return delta_5m, delta_10m
+
+
+def _why_now_line(data, side):
+    """Compact explanation of why this side is actionable now."""
+    side = str(side or "").upper()
+    dominant = int(data.get("bull_score", 0)) if side == "CALL" else int(data.get("bear_score", 0))
+    opposite = int(data.get("bear_score", 0)) if side == "CALL" else int(data.get("bull_score", 0))
+    delta_5m, delta_10m = _score_trend_deltas(data, side)
+    pieces = [f"score {dominant}", f"dominance +{max(0, dominant - opposite)}"]
+    if delta_5m is not None:
+        pieces.append(f"5mΔ {delta_5m:+d}")
+    if delta_10m is not None:
+        pieces.append(f"10mΔ {delta_10m:+d}")
+    return " | ".join(pieces)
+
+
+def _tier_rank(tier):
+    return _TIER_RANK.get(str(tier or "").upper(), 0)
+
+
+def _opportunity_score_from_data(data):
+    """Estimate opportunity strength for scan prioritization."""
+    tier = str(data.get("tier", "NONE") or "NONE").upper()
+    side = str(data.get("side", "NO TRADE") or "NO TRADE").upper()
+    bull = int(data.get("bull_score", 0))
+    bear = int(data.get("bear_score", 0))
+    dominant = max(bull, bear)
+    dominance = abs(bull - bear)
+    delta_5m, _ = _score_trend_deltas(data, "CALL" if side == "CALL" else "PUT")
+    delta_boost = max(0, int(delta_5m or 0))
+    tier_boost = {"STRONG": 30, "SIGNAL": 15, "WATCH": 5}.get(tier, 0)
+    news_boost = {"HIGH": 8, "MEDIUM": 4, "LOW": 0}.get(str(data.get("news_impact_label", "LOW") or "LOW").upper(), 0)
+    return float(dominant + (0.8 * dominance) + (1.2 * delta_boost) + tier_boost + news_boost)
+
+
+def _update_symbol_opportunity_cache(symbol, data):
+    """Store latest signal strength snapshot for priority scheduling."""
+    if not symbol or not data:
+        return
+    _symbol_opportunity_cache[symbol] = {
+        "updated_at": datetime.now(central),
+        "score": _opportunity_score_from_data(data),
+        "tier": str(data.get("tier", "NONE") or "NONE").upper(),
+        "side": str(data.get("side", "NO TRADE") or "NO TRADE").upper(),
+    }
+
+
+def _order_symbols_by_priority(symbols):
+    """Sort symbols by current opportunity score while preserving deterministic fallback order."""
+    if not symbols:
+        return []
+
+    ordered_unique = list(dict.fromkeys(symbols))
+    if not ENABLE_PRIORITY_SCANNING:
+        return ordered_unique
+
+    def _key(sym):
+        rec = _symbol_opportunity_cache.get(sym, {})
+        return (
+            float(rec.get("score", -1.0)),
+            _tier_rank(rec.get("tier", "NONE")),
+            -(ordered_unique.index(sym)),
+        )
+
+    return sorted(ordered_unique, key=_key, reverse=True)
+
+
+def _maybe_send_transition_alert(symbol, data):
+    """Send a low-noise Discord update only when signal state transitions."""
+    if not data:
+        return
+
+    now_ct = datetime.now(central)
+    current_tier = str(data.get("tier", "NONE") or "NONE").upper()
+    current_side = str(data.get("side", "NO TRADE") or "NO TRADE").upper()
+    current_signal = str(data.get("signal", "NO TRADE") or "NO TRADE")
+    current = {
+        "tier": current_tier,
+        "side": current_side,
+        "signal": current_signal,
+        "score": int(data.get("bull_score", 0)) if current_side == "CALL" else int(data.get("bear_score", 0)),
+    }
+    previous = _last_symbol_state.get(symbol)
+    _last_symbol_state[symbol] = {**current, "at": now_ct}
+
+    if not ENABLE_STATE_TRANSITION_ALERTS:
+        return
+    if current_tier == "NONE" or current_side not in ("CALL", "PUT"):
+        return
+    min_rank = _tier_rank(TRANSITION_ALERT_MIN_TIER)
+    if _tier_rank(current_tier) < min_rank:
+        return
+    if previous and previous.get("tier") == current_tier and previous.get("side") == current_side:
+        return
+
+    last_sent = _last_transition_alert_at.get(symbol)
+    if last_sent and (now_ct - last_sent).total_seconds() < max(0, TRANSITION_ALERT_COOLDOWN_SECONDS):
+        return
+
+    from_state = "NONE"
+    if previous:
+        from_state = f"{previous.get('tier', 'NONE')} {previous.get('side', '')}".strip()
+    to_state = f"{current_tier} {current_side}".strip()
+    why_now = _why_now_line(data, current_side)
+    news_impact = str(data.get("news_impact_label", "LOW") or "LOW").upper()
+    send_discord(
+        f"🔁 **STATE CHANGE — {symbol}**\n"
+        f"`{from_state}` → `{to_state}`\n"
+        f"Signal: `{current_signal}`\n"
+        f"Why now: `{why_now}`\n"
+        f"News impact: `{news_impact}`",
+        color=DISCORD_COLOR_WARN,
+    )
+    _last_transition_alert_at[symbol] = now_ct
 
 
 def position_qty_from_score(score, dominance=0):
@@ -1316,11 +1456,59 @@ def _alpaca_data_get_json(path, params=None, timeout=8):
         return None
 
 
+def _alpaca_trading_get_json(path, params=None, timeout=10):
+    """GET JSON from Alpaca trading API (paper/live based on configured base URL)."""
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return None
+    url = f"{ALPACA_TRADING_BASE_URL.rstrip('/')}{path}"
+    try:
+        r = requests.get(url, headers=_alpaca_data_headers(), params=params or {}, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
 def _safe_float_num(v, default=0.0):
     try:
         return float(v)
     except Exception:
         return default
+
+
+def _safe_int_num(v, default=0):
+    try:
+        return int(float(v))
+    except Exception:
+        return default
+
+
+def _parse_datetime_any(value):
+    """Parse common date/datetime strings into central timezone, or None."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    candidates = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ]
+    for fmt in candidates:
+        try:
+            dt = datetime.strptime(raw, fmt)
+            return central.localize(dt)
+        except Exception:
+            pass
+
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            return central.localize(dt)
+        return dt.astimezone(central)
+    except Exception:
+        return None
 
 
 def _extract_screener_items(payload):
@@ -1636,6 +1824,210 @@ def _reset_perf_stats_if_new_day(now_ct=None):
     _perf_stats["last_report_losses"] = 0
     _perf_stats["last_report_realized_pnl_dollar"] = 0.0
     _perf_stats["last_sent_hour"] = None
+    _perf_stats["hydrated_for"] = None
+    _perf_stats["hydrated_source"] = ""
+    _perf_stats["last_hydrate_attempt"] = None
+
+
+def _blank_perf_snapshot(today):
+    return {
+        "date": today,
+        "entries": 0,
+        "closed": 0,
+        "wins": 0,
+        "losses": 0,
+        "realized_pnl_dollar": 0.0,
+        "realized_pnl_pct_sum": 0.0,
+        "gross_win_dollar": 0.0,
+        "gross_loss_dollar": 0.0,
+        "win_pnl_pct_sum": 0.0,
+        "loss_pnl_pct_sum": 0.0,
+        "best_win_dollar": 0.0,
+        "best_win_symbol": "",
+        "worst_loss_dollar": 0.0,
+        "worst_loss_symbol": "",
+    }
+
+
+def _accumulate_closed_trade_stats(snapshot, symbol, pnl_dollar, pnl_pct):
+    """Update aggregate counters with one closed trade outcome."""
+    snapshot["closed"] = int(snapshot.get("closed", 0)) + 1
+    snapshot["realized_pnl_dollar"] = float(snapshot.get("realized_pnl_dollar", 0.0)) + float(pnl_dollar)
+    snapshot["realized_pnl_pct_sum"] = float(snapshot.get("realized_pnl_pct_sum", 0.0)) + float(pnl_pct)
+
+    if pnl_dollar > 0:
+        snapshot["wins"] = int(snapshot.get("wins", 0)) + 1
+        snapshot["gross_win_dollar"] = float(snapshot.get("gross_win_dollar", 0.0)) + float(pnl_dollar)
+        snapshot["win_pnl_pct_sum"] = float(snapshot.get("win_pnl_pct_sum", 0.0)) + float(pnl_pct)
+        if float(pnl_dollar) > float(snapshot.get("best_win_dollar", 0.0)):
+            snapshot["best_win_dollar"] = float(pnl_dollar)
+            snapshot["best_win_symbol"] = str(symbol or "")
+    else:
+        snapshot["losses"] = int(snapshot.get("losses", 0)) + 1
+        snapshot["gross_loss_dollar"] = float(snapshot.get("gross_loss_dollar", 0.0)) + abs(float(pnl_dollar))
+        snapshot["loss_pnl_pct_sum"] = float(snapshot.get("loss_pnl_pct_sum", 0.0)) + float(pnl_pct)
+        if float(pnl_dollar) < float(snapshot.get("worst_loss_dollar", 0.0)):
+            snapshot["worst_loss_dollar"] = float(pnl_dollar)
+            snapshot["worst_loss_symbol"] = str(symbol or "")
+
+
+def _rehydrate_perf_from_sheets(today):
+    """Rebuild today's counters from Google Sheets Trades tab (if available)."""
+    if _gsheet is None and not ensure_google_sheets_ready():
+        return None
+    if _gsheet is None:
+        return None
+
+    try:
+        ws = _gsheet.worksheet("Trades")
+        rows = ws.get_all_values()
+    except Exception as e:
+        log(f"Perf rehydrate (Sheets) failed: {e}")
+        return None
+
+    if not rows or len(rows) <= 1:
+        return None
+
+    snap = _blank_perf_snapshot(today)
+    for row in rows[1:]:
+        if len(row) < 14:
+            continue
+
+        symbol = str(row[1] if len(row) > 1 else "").strip().upper()
+        entry_dt = _parse_datetime_any(row[6] if len(row) > 6 else "")
+        exit_dt = _parse_datetime_any(row[7] if len(row) > 7 else "")
+        status = str(row[9] if len(row) > 9 else "").strip().upper()
+
+        if entry_dt and entry_dt.date() == today:
+            snap["entries"] = int(snap.get("entries", 0)) + 1
+
+        if status != "CLOSED" or not exit_dt or exit_dt.date() != today:
+            continue
+
+        pnl_dollar = _safe_float_num(str(row[12]).replace("$", "").replace(",", ""), 0.0)
+        pnl_pct = _safe_float_num(str(row[13]).replace("%", "").replace(",", ""), 0.0)
+        _accumulate_closed_trade_stats(snap, symbol, pnl_dollar, pnl_pct)
+
+    return snap
+
+
+def _rehydrate_perf_from_alpaca_orders(today):
+    """Rebuild today's counters from filled Alpaca option orders using FIFO matching."""
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return None
+
+    snap = _blank_perf_snapshot(today)
+    day_start_ct = central.localize(datetime(today.year, today.month, today.day, 0, 0, 0))
+    day_end_ct = day_start_ct + timedelta(days=1)
+    after_iso = day_start_ct.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    until_iso = day_end_ct.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    params = {
+        "status": "all",
+        "direction": "asc",
+        "limit": 500,
+        "nested": "false",
+        "after": after_iso,
+        "until": until_iso,
+    }
+    orders = _alpaca_trading_get_json("/v2/orders", params=params, timeout=10)
+    if not orders:
+        return None
+    if not isinstance(orders, list):
+        return None
+
+    lots = {}
+    for o in orders:
+        if str(o.get("status", "")).lower() != "filled":
+            continue
+
+        contract = str(o.get("symbol", "") or "").strip().upper()
+        if not re.match(r"^[A-Z]+\d{6}[CP]\d{8}$", contract):
+            continue
+
+        side = str(o.get("side", "") or "").strip().upper()
+        qty = _safe_float_num(o.get("filled_qty", o.get("qty", 0)), 0.0)
+        price = _safe_float_num(o.get("filled_avg_price", 0), 0.0)
+        if qty <= 0 or price <= 0:
+            continue
+
+        filled_dt = _parse_datetime_any(o.get("filled_at") or o.get("updated_at") or o.get("submitted_at"))
+        if not filled_dt or filled_dt.date() != today:
+            continue
+
+        underlying = _underlying_from_contract(contract) or contract
+        if side == "BUY":
+            snap["entries"] = int(snap.get("entries", 0)) + 1
+            lots.setdefault(contract, []).append([qty, price])
+            continue
+
+        if side != "SELL":
+            continue
+
+        remaining = qty
+        matched_qty = 0.0
+        buy_cost = 0.0
+        pnl_dollar = 0.0
+        queue = lots.setdefault(contract, [])
+        while remaining > 1e-9 and queue:
+            lot_qty, lot_price = queue[0]
+            use_qty = min(remaining, lot_qty)
+            pnl_dollar += (price - lot_price) * use_qty * 100.0
+            buy_cost += lot_price * use_qty * 100.0
+            matched_qty += use_qty
+            lot_qty -= use_qty
+            remaining -= use_qty
+            if lot_qty <= 1e-9:
+                queue.pop(0)
+            else:
+                queue[0][0] = lot_qty
+
+        pnl_pct = ((pnl_dollar / buy_cost) * 100.0) if buy_cost > 0 else 0.0
+        _accumulate_closed_trade_stats(snap, underlying, pnl_dollar, pnl_pct)
+
+    return snap
+
+
+def _rehydrate_perf_stats_if_needed(now_ct=None):
+    """Hydrate daily perf counters after restart using Sheets/Alpaca history."""
+    now_ct = now_ct or datetime.now(central)
+    today = now_ct.date()
+    if _perf_stats.get("hydrated_for") == today:
+        return
+
+    _perf_stats["last_hydrate_attempt"] = now_ct
+
+    candidates = []
+    sheet_snap = _rehydrate_perf_from_sheets(today)
+    if sheet_snap:
+        candidates.append(("google_sheets", sheet_snap))
+
+    alpaca_snap = _rehydrate_perf_from_alpaca_orders(today)
+    if alpaca_snap:
+        candidates.append(("alpaca_orders", alpaca_snap))
+
+    if candidates:
+        source, chosen = max(
+            candidates,
+            key=lambda item: (
+                int(item[1].get("closed", 0)),
+                int(item[1].get("entries", 0)),
+                abs(float(item[1].get("realized_pnl_dollar", 0.0))),
+            ),
+        )
+        for k, v in chosen.items():
+            _perf_stats[k] = v
+        _perf_stats["hydrated_source"] = source
+        log(
+            f"Hourly perf rehydrated from {source}: entries={_perf_stats['entries']} "
+            f"closed={_perf_stats['closed']} wins={_perf_stats['wins']} losses={_perf_stats['losses']} "
+            f"realized=${float(_perf_stats['realized_pnl_dollar']):+,.2f}"
+        )
+    else:
+        _perf_stats["hydrated_source"] = "none"
+        log("Hourly perf rehydrate: no historical trades found for today (starting from zero).")
+
+    _perf_stats["hydrated_for"] = today
 
 
 def _record_trade_open_for_perf(now_ct=None):
@@ -1681,6 +2073,7 @@ def maybe_send_hourly_perf_report(now_ct=None):
 
     now_ct = now_ct or datetime.now(central)
     _reset_perf_stats_if_new_day(now_ct)
+    _rehydrate_perf_stats_if_needed(now_ct)
 
     # Post once per hour near the top of the hour to avoid noisy timing drift.
     minute_window = max(1, min(15, HOURLY_REPORT_MINUTE_WINDOW))
@@ -2329,16 +2722,18 @@ def try_open_paper_trade(symbol, side, option, data):
     if trending_news:
         news_context_lines.append(f"\U0001f4c8 **Trending Context:** `{trending_news}`")
     news_context_block = "\n".join(news_context_lines)
+    why_now_line = _why_now_line(data, trade["side"])
 
     send_discord(
         f"\U0001f680 **ENTRY ALERT — {entry_header} | {trade['side']} | ${trade['entry']:.2f} | {expiry_mmdd}**\n\n"
         f"------------------------------\n"
         f"\U0001f4b2 **Current Price:** `${float(data.get('price', 0.0) or 0.0):.2f}`\n"
         f"\U0001f4ca **Setup:** `{setup}` | Score: `{score_line}` ({grade})\n"
-        f"{news_context_block}\n"
+        f"⚡ **Why Now:** `{why_now_line}`\n"
         f"\U0001f3af **Plan:** Entry `${trade['entry']:.2f}` | Target `${target_1:.2f}` / `${target_2:.2f}` | Stop `-{stop_pct:.0f}%`\n"
         f"\U0001f6d1 **Invalidation:** VWAP loss / hard stop hit\n"
-        f"\U0001f916 **AI:** \U0001f7e1 **{ai_label}** — balanced setup with rules-aligned confirmation\n\n"
+        f"\U0001f916 **AI:** \U0001f7e1 **{ai_label}** — balanced setup with rules-aligned confirmation\n"
+        f"{news_context_block}\n\n"
         f"\U0001f4cc **Action:** ENTERED (`{trade['qty']}` contract{'s' if trade['qty'] != 1 else ''})",
         color=DISCORD_COLOR_CALL if trade['side'] == 'CALL' else DISCORD_COLOR_PUT,
     )
@@ -2370,6 +2765,8 @@ def run_cycle(client):
     for sym in trending_symbols:
         if sym not in symbols_to_scan:
             symbols_to_scan.append(sym)
+
+    symbols_to_scan = _order_symbols_by_priority(symbols_to_scan)
 
     for symbol in symbols_to_scan:
         try:
@@ -2478,6 +2875,8 @@ def run_websocket_cycle(client):
                     symbols_to_run.append(sym)
             next_full_scan_at = now_ct + timedelta(seconds=full_scan_gap)
 
+        symbols_to_run = _order_symbols_by_priority(symbols_to_run)
+
         for symbol in symbols_to_run:
             try:
                 run_symbol(client, symbol)
@@ -2537,6 +2936,9 @@ def run_symbol(client, symbol):
         if symbol == "SPY":
             _spy_vwap_cache["side"] = "bull" if data["price"] > data["vwap"] else "bear"
             _spy_vwap_cache["updated_at"] = datetime.now(central)
+
+        _update_symbol_opportunity_cache(symbol, data)
+        _maybe_send_transition_alert(symbol, data)
 
     if side == "NO TRADE":
         return
