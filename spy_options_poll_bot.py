@@ -2191,10 +2191,22 @@ def place_paper_exit(contract_symbol, qty):
     Returns (order, fill_price).  fill_price is None if not filled in time.
     Market SELL fills at the bid (not mid), so this is the real exit price.
     """
+    if _trading_client is None:
+        raise Exception("Trading client not initialized")
+
+    # Determine close direction from the live broker position sign.
+    pos = _trading_client.get_open_position(contract_symbol)
+    pos_qty_raw = float(getattr(pos, "qty", 0) or 0)
+    if pos_qty_raw == 0:
+        raise Exception(f"No open qty to close for {contract_symbol}")
+
+    close_side = OrderSide.SELL if pos_qty_raw > 0 else OrderSide.BUY
+    close_qty = max(1, min(abs(int(pos_qty_raw)), int(max(1, qty))))
+
     order_req = MarketOrderRequest(
         symbol=contract_symbol,
-        qty=qty,
-        side=OrderSide.SELL,
+        qty=close_qty,
+        side=close_side,
         time_in_force=TimeInForce.DAY,
     )
     order = _trading_client.submit_order(order_req)
@@ -2523,6 +2535,7 @@ def close_trade(trade, exit_price, reason, pnl_pct):
     submitting the market SELL we replace it with the actual Alpaca fill price
     so Discord and the CSV reflect what the account really received (bid-side).
     """
+    exit_confirmed = not ENABLE_ALPACA_PAPER_TRADING
     if ENABLE_ALPACA_PAPER_TRADING and _trading_client is not None:
         try:
             _, fill_price = place_paper_exit(
@@ -2537,8 +2550,37 @@ def close_trade(trade, exit_price, reason, pnl_pct):
                     f"(mid was ${exit_price:.2f}, diff ${actual_exit - exit_price:+.2f})")
                 exit_price = actual_exit
                 pnl_pct    = actual_pnl
+                exit_confirmed = True
+            else:
+                # Order submitted but fill unknown: verify whether broker position is gone.
+                try:
+                    _trading_client.get_open_position(trade["contract"])
+                    log(
+                        f"[{trade['underlying']}] Exit submit pending/unfilled for {trade['contract']} "
+                        "— keeping trade OPEN."
+                    )
+                    return
+                except Exception:
+                    # Position no longer open at broker; treat as closed using trigger price.
+                    log(f"[{trade['underlying']}] Broker position already closed for {trade['contract']}.")
+                    exit_confirmed = True
         except Exception as e:
             log(f"[{trade['underlying']}] Paper exit submit failed: {e}")
+            # If position still exists, do not mark as closed locally.
+            try:
+                _trading_client.get_open_position(trade["contract"])
+                log(
+                    f"[{trade['underlying']}] Exit not confirmed at broker for {trade['contract']} "
+                    "— keeping trade OPEN."
+                )
+                return
+            except Exception:
+                # Position not found => likely closed externally; allow local close bookkeeping.
+                log(f"[{trade['underlying']}] Broker position missing for {trade['contract']} after exit error; treating as closed.")
+                exit_confirmed = True
+
+    if not exit_confirmed:
+        return
 
     emoji = "\u2705" if pnl_pct > 0 else "\u274c"
     outcome_label = "PROFIT" if pnl_pct > 0 else "LOSS"
