@@ -682,10 +682,10 @@ DISCORD_COLOR_WARN = 0xF1C40F
 _TIER_RANK = {"NONE": 0, "WATCH": 1, "SIGNAL": 2, "STRONG": 3}
 
 
-def send_discord(message, color=None):
+def send_discord(message, color=None, reply_to_message_id=None, wait_for_response=False):
     if not DISCORD_WEBHOOK_URL:
         print("Missing Discord webhook.")
-        return
+        return None
     payload = None
     if color is None:
         if len(message) > 1990:
@@ -702,12 +702,88 @@ def send_discord(message, color=None):
                 }
             ]
         }
+
+    if reply_to_message_id:
+        payload["message_reference"] = {
+            "message_id": str(reply_to_message_id),
+            "fail_if_not_exists": False,
+        }
+
     try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+        webhook_url = DISCORD_WEBHOOK_URL
+        if wait_for_response and "wait=true" not in webhook_url:
+            sep = "&" if "?" in webhook_url else "?"
+            webhook_url = f"{webhook_url}{sep}wait=true"
+
+        r = requests.post(webhook_url, json=payload, timeout=10)
         if r.status_code not in (200, 204):
             print(f"Discord post returned {r.status_code}: {r.text[:100]}", flush=True)
+            return None
+
+        # When webhook is called with wait=true, Discord returns the message object.
+        if wait_for_response:
+            try:
+                return r.json()
+            except Exception:
+                return None
+        return None
     except Exception as e:
         print(f"Discord post failed: {e}")
+        return None
+
+
+def _trade_progress_reason(trade, current_price, pnl_pct):
+    """Build a concise progress reason string for milestone alerts."""
+    entry = float(trade.get("entry", 0.0) or 0.0)
+    target = float(trade.get("target", 0.0) or 0.0)
+    stop = float(trade.get("stop", 0.0) or 0.0)
+    max_pnl = float(trade.get("max_pnl_pct", pnl_pct) or pnl_pct)
+
+    if target > 0:
+        to_target = ((target - float(current_price)) / target) * 100.0
+    else:
+        to_target = 0.0
+
+    if entry > 0:
+        cushion = ((float(current_price) - stop) / entry) * 100.0
+    else:
+        cushion = 0.0
+
+    return (
+        f"Momentum follow-through: trade is +{pnl_pct * 100:.2f}% from entry, "
+        f"max seen +{max_pnl * 100:.2f}%, "
+        f"target gap {to_target:+.2f}%, stop cushion {cushion:+.2f}%."
+    )
+
+
+def maybe_send_trade_progress_alert(trade, current_price, pnl_pct):
+    """Send a one-time +10% progress update, preferably as a reply to entry alert."""
+    sent = bool(trade.get("milestone_10_sent", False))
+    if sent:
+        return
+    if pnl_pct < 0.10:
+        return
+
+    side = str(trade.get("side", "")).upper()
+    color = DISCORD_COLOR_CALL if side == "CALL" else DISCORD_COLOR_PUT
+    strike_val = float(trade.get("strike", 0) or 0)
+    strike_text = str(int(strike_val)) if abs(strike_val - int(strike_val)) < 1e-9 else f"{strike_val:.2f}"
+    header = f"{trade.get('underlying', 'UNKNOWN')} strike {strike_text}"
+    reason = _trade_progress_reason(trade, current_price, pnl_pct)
+    opened = trade.get("opened_at")
+    opened_text = opened.strftime("%Y-%m-%d %H:%M:%S %Z") if isinstance(opened, datetime) else str(opened)
+
+    send_discord(
+        f"\U0001f4c8 **TRADE UPDATE — {header} | {side} | +10% Milestone Hit**\n\n"
+        f"\U0001f4b2 **Current Price:** `${float(current_price):.2f}`\n"
+        f"\U0001f4ca **PnL:** `{pnl_pct * 100:+.2f}%`\n"
+        f"\U0001f9e0 **Reason:** `{reason}`\n"
+        f"\U0001f4cc **Opened:** `{opened_text}`",
+        color=color,
+        reply_to_message_id=trade.get("entry_message_id"),
+    )
+    trade["milestone_10_sent"] = True
+    log(f"[{trade.get('underlying', 'UNKNOWN')}] Milestone alert sent (+10%): {trade.get('contract', '')}")
 
 
 def market_open_now():
@@ -2358,6 +2434,8 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty):
         "max_pnl_pct": 0.0,
         "opened_at":  datetime.now(central),
         "status":     "OPEN",
+        "entry_message_id": None,
+        "milestone_10_sent": False,
     }
 
 
@@ -2498,6 +2576,8 @@ def sync_open_trades_from_alpaca():
             "trade_id": prev.get("trade_id") if prev else None,
             "sheets_row": prev.get("sheets_row") if prev else None,
             "alerts_row": prev.get("alerts_row") if prev else None,
+            "entry_message_id": prev.get("entry_message_id") if prev else None,
+            "milestone_10_sent": prev.get("milestone_10_sent", False) if prev else False,
         }
 
     if recovered:
@@ -2636,6 +2716,8 @@ def track_open_trades():
         log(f"[{trade['underlying']}] {contract_sym} | "
             f"entry ${entry:.2f} (Alpaca) | current ${current_price:.2f} (Alpaca) | "
             f"PnL {pnl_pct * 100:+.2f}%")
+
+        maybe_send_trade_progress_alert(trade, current_price, pnl_pct)
 
         if pnl_pct >= PROFIT_TARGET_PCT:
             close_trade(trade, current_price, "TARGET HIT", pnl_pct)
@@ -2884,7 +2966,7 @@ def try_open_paper_trade(symbol, side, option, data):
     news_context_block = "\n".join(news_context_lines)
     why_now_line = _why_now_line(data, trade["side"])
 
-    send_discord(
+    entry_msg = send_discord(
         f"\U0001f680 **ENTRY ALERT — {entry_header} | {trade['side']} | ${trade['entry']:.2f} | {expiry_mmdd}**\n\n"
         f"------------------------------\n"
         f"\U0001f4b2 **Current Price:** `${float(data.get('price', 0.0) or 0.0):.2f}`\n"
@@ -2896,7 +2978,15 @@ def try_open_paper_trade(symbol, side, option, data):
         f"{news_context_block}\n\n"
         f"\U0001f4cc **Action:** ENTERED (`{trade['qty']}` contract{'s' if trade['qty'] != 1 else ''})",
         color=DISCORD_COLOR_CALL if trade['side'] == 'CALL' else DISCORD_COLOR_PUT,
+        wait_for_response=True,
     )
+    try:
+        msg_id = (entry_msg or {}).get("id") if isinstance(entry_msg, dict) else None
+        if msg_id:
+            trade["entry_message_id"] = str(msg_id)
+    except Exception:
+        pass
+
     log(f"[{symbol}] Paper trade opened: {trade['contract']} fill ${trade['entry']:.2f} "
         f"target ${trade['target']:.2f} stop ${trade['stop']:.2f}")
     return True
