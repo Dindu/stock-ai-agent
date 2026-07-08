@@ -154,6 +154,18 @@ CANDLE_CONFIRMATION = os.getenv("CANDLE_CONFIRMATION", "1") == "1"
 ALERT_ONLY_COOLDOWN_MINUTES = int(os.getenv("ALERT_ONLY_COOLDOWN_MINUTES", "20"))
 ENABLE_HOURLY_DISCORD_PERF_REPORT = os.getenv("ENABLE_HOURLY_DISCORD_PERF_REPORT", "1") == "1"
 HOURLY_REPORT_MINUTE_WINDOW = int(os.getenv("HOURLY_REPORT_MINUTE_WINDOW", "2"))
+ENABLE_MORNING_BRIEFING = os.getenv("ENABLE_MORNING_BRIEFING", "1") == "1"
+MORNING_BRIEFING_HOUR_CT = int(os.getenv("MORNING_BRIEFING_HOUR_CT", "8"))
+MORNING_BRIEFING_MINUTE_CT = int(os.getenv("MORNING_BRIEFING_MINUTE_CT", "35"))
+ENABLE_MIDDAY_BRIEFING = os.getenv("ENABLE_MIDDAY_BRIEFING", "1") == "1"
+MIDDAY_BRIEFING_HOUR_CT = int(os.getenv("MIDDAY_BRIEFING_HOUR_CT", "12"))
+MIDDAY_BRIEFING_MINUTE_CT = int(os.getenv("MIDDAY_BRIEFING_MINUTE_CT", "5"))
+MORNING_BRIEFING_NEWS_LIMIT = int(os.getenv("MORNING_BRIEFING_NEWS_LIMIT", "40"))
+MORNING_BRIEFING_HEADLINES_PER_SECTION = int(os.getenv("MORNING_BRIEFING_HEADLINES_PER_SECTION", "3"))
+MORNING_BRIEFING_NEWS_SYMBOLS = os.getenv(
+    "MORNING_BRIEFING_NEWS_SYMBOLS",
+    "SPY,QQQ,IWM,DIA,TLT,GLD,USO,AAPL,NVDA,MSFT,AMZN,META,TSLA",
+)
 ENABLE_STATE_TRANSITION_ALERTS = os.getenv("ENABLE_STATE_TRANSITION_ALERTS", "0") == "1"
 TRANSITION_ALERT_MIN_TIER = os.getenv("TRANSITION_ALERT_MIN_TIER", "SIGNAL").strip().upper()
 TRANSITION_ALERT_COOLDOWN_SECONDS = int(os.getenv("TRANSITION_ALERT_COOLDOWN_SECONDS", "90"))
@@ -271,6 +283,10 @@ _perf_stats: "dict" = {
     "hydrated_source": "",
     "last_hydrate_attempt": None,
 }
+# Last date for which morning briefing was already sent.
+_morning_briefing_sent_date: "date | None" = None
+# Last date for which midday briefing was already sent.
+_midday_briefing_sent_date: "date | None" = None
 
 # Column headers for the two Google Sheets tabs.
 _ALERTS_HEADERS = [
@@ -2330,6 +2346,227 @@ def maybe_send_hourly_perf_report(now_ct=None):
     )
 
 
+def _extract_news_articles(payload):
+    """Normalize Alpaca news payloads into a simple list of article dicts."""
+    if not isinstance(payload, dict):
+        return []
+    articles = payload.get("news")
+    if not isinstance(articles, list):
+        articles = payload.get("articles")
+    if not isinstance(articles, list):
+        return []
+    return [a for a in articles if isinstance(a, dict)]
+
+
+def _fetch_daily_change_summary(client, symbol):
+    """Return latest daily close move versus previous close for one symbol."""
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=10)
+
+    try:
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame(1, TimeFrameUnit.Day),
+            start=start,
+            end=end,
+            feed=DataFeed(FEED),
+        )
+        bars = client.get_stock_bars(req).df
+        if bars is None or bars.empty:
+            return None
+        if isinstance(bars.index, pd.MultiIndex):
+            bars = bars.xs(symbol, level=0)
+        bars = bars[["close"]].dropna().tail(2)
+        if len(bars) < 2:
+            return None
+
+        prev_close = float(bars["close"].iloc[-2])
+        last_close = float(bars["close"].iloc[-1])
+        if prev_close <= 0:
+            return None
+        pct = ((last_close - prev_close) / prev_close) * 100.0
+        return {
+            "symbol": symbol,
+            "last_close": last_close,
+            "prev_close": prev_close,
+            "pct": pct,
+        }
+    except Exception:
+        return None
+
+
+def _categorize_market_headlines(articles, now_ct):
+    """Split headlines into FED/FOMC, earnings, geopolitics, and broad market buckets."""
+    fed_keys = (
+        "fomc", "federal reserve", "fed ", "powell", "rate cut", "rate hike",
+        "inflation", "cpi", "ppi", "pce", "jobs", "payroll", "treasury yield",
+    )
+    earnings_keys = (
+        "earnings", "guidance", "eps", "revenue", "beat", "miss", "forecast", "outlook",
+    )
+    geopolitics_keys = (
+        "iran", "israel", "ukraine", "russia", "china", "taiwan", "gaza",
+        "middle east", "red sea", "strait of hormuz", "south china sea",
+        "missile", "drone strike", "airstrike", "ceasefire", "sanctions", "tariff",
+        "nato", "pentagon", "opec", "oil supply", "shipping route", "embassy",
+    )
+
+    fed, earnings, geopolitics, market = [], [], [], []
+    seen = set()
+
+    for art in articles:
+        title = str(art.get("headline") or art.get("title") or "").strip()
+        if not title:
+            continue
+        key = title.lower()
+        if key in seen:
+            continue
+
+        # Prefer today's headlines for the morning briefing; allow recent fallback.
+        created = _parse_datetime_any(art.get("created_at") or art.get("updated_at") or "")
+        if created is not None:
+            if created.astimezone(central).date() != now_ct.date():
+                continue
+
+        seen.add(key)
+        blob = f"{title} {str(art.get('summary') or '')}".lower()
+
+        if any(k in blob for k in fed_keys):
+            fed.append(title)
+        elif any(k in blob for k in earnings_keys):
+            earnings.append(title)
+        elif any(k in blob for k in geopolitics_keys):
+            geopolitics.append(title)
+        else:
+            market.append(title)
+
+    # If no same-day headlines were found, use recent headlines as fallback.
+    if not (fed or earnings or geopolitics or market):
+        for art in articles:
+            title = str(art.get("headline") or art.get("title") or "").strip()
+            if not title:
+                continue
+            key = title.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            blob = f"{title} {str(art.get('summary') or '')}".lower()
+            if any(k in blob for k in fed_keys):
+                fed.append(title)
+            elif any(k in blob for k in earnings_keys):
+                earnings.append(title)
+            elif any(k in blob for k in geopolitics_keys):
+                geopolitics.append(title)
+            else:
+                market.append(title)
+
+    return fed, earnings, geopolitics, market
+
+
+def _maybe_send_scheduled_briefing(client, now_ct, title, target_hour, target_minute, sent_date):
+    """Send one daily scheduled market briefing after target CT time."""
+    if not DISCORD_WEBHOOK_URL:
+        return sent_date
+
+    target_time = now_ct.replace(
+        hour=max(0, min(23, int(target_hour))),
+        minute=max(0, min(59, int(target_minute))),
+        second=0,
+        microsecond=0,
+    )
+    if now_ct < target_time:
+        return sent_date
+    if sent_date == now_ct.date():
+        return sent_date
+
+    index_rows = []
+    for sym in ("SPY", "QQQ", "IWM"):
+        snap = _fetch_daily_change_summary(client, sym)
+        if not snap:
+            continue
+        index_rows.append(
+            f"- `{sym}` close `{snap['last_close']:.2f}` ({snap['pct']:+.2f}% vs prior close)"
+        )
+    if not index_rows:
+        index_rows.append("- `Index snapshot unavailable from Alpaca right now`")
+
+    symbols_csv = ",".join(
+        [s.strip().upper() for s in str(MORNING_BRIEFING_NEWS_SYMBOLS).split(",") if s.strip()]
+    )
+    payload = _alpaca_data_get_json(
+        "/v1beta1/news",
+        params={"symbols": symbols_csv, "limit": max(10, MORNING_BRIEFING_NEWS_LIMIT), "sort": "desc"},
+        timeout=10,
+    )
+    articles = _extract_news_articles(payload)
+    fed_news, earnings_news, geopolitics_news, market_news = _categorize_market_headlines(articles, now_ct)
+
+    n = max(1, MORNING_BRIEFING_HEADLINES_PER_SECTION)
+    fed_lines = [f"- {h}" for h in fed_news[:n]] or ["- No major Fed/FOMC macro headline detected yet"]
+    earn_lines = [f"- {h}" for h in earnings_news[:n]] or ["- No major earnings headline detected yet"]
+    geopolitics_lines = [f"- {h}" for h in geopolitics_news[:n]] or ["- No major geopolitics headline detected yet"]
+    market_lines = [f"- {h}" for h in market_news[:n]] or ["- No broad market-moving headline detected yet"]
+    index_block = "\n".join(index_rows)
+    fed_block = "\n".join(fed_lines)
+    earn_block = "\n".join(earn_lines)
+    geopolitics_block = "\n".join(geopolitics_lines)
+    market_block = "\n".join(market_lines)
+
+    send_discord(
+        f"\U0001f305 **{title} ({now_ct:%Y-%m-%d %H:%M} CT)**\n\n"
+        f"**Market Snapshot**\n"
+        f"{index_block}\n\n"
+        f"**Fed / FOMC / Macro Watch**\n"
+        f"{fed_block}\n\n"
+        f"**Earnings Watch**\n"
+        f"{earn_block}\n\n"
+        f"**Geopolitics Watch**\n"
+        f"{geopolitics_block}\n\n"
+        f"**Other Market Drivers**\n"
+        f"{market_block}\n\n"
+        f"\U0001f4cc **Note:** headline scan is news-based; always verify exact event times on your economic/earnings calendar.",
+        color=DISCORD_COLOR_WARN,
+    )
+    log(f"{title} sent to Discord.")
+    return now_ct.date()
+
+
+def maybe_send_morning_briefing(client, now_ct=None):
+    """Send one morning market briefing to Discord with macro + catalyst context."""
+    global _morning_briefing_sent_date
+
+    if not ENABLE_MORNING_BRIEFING:
+        return
+
+    now_ct = now_ct or datetime.now(central)
+    _morning_briefing_sent_date = _maybe_send_scheduled_briefing(
+        client,
+        now_ct,
+        "Morning Market Briefing",
+        MORNING_BRIEFING_HOUR_CT,
+        MORNING_BRIEFING_MINUTE_CT,
+        _morning_briefing_sent_date,
+    )
+
+
+def maybe_send_midday_briefing(client, now_ct=None):
+    """Send one midday market briefing to Discord with refreshed catalysts."""
+    global _midday_briefing_sent_date
+
+    if not ENABLE_MIDDAY_BRIEFING:
+        return
+
+    now_ct = now_ct or datetime.now(central)
+    _midday_briefing_sent_date = _maybe_send_scheduled_briefing(
+        client,
+        now_ct,
+        "Midday Market Briefing",
+        MIDDAY_BRIEFING_HOUR_CT,
+        MIDDAY_BRIEFING_MINUTE_CT,
+        _midday_briefing_sent_date,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Paper-trading execution + position tracking
 # ---------------------------------------------------------------------------
@@ -3038,6 +3275,16 @@ def run_cycle(client):
     except Exception as e:
         log(f"Hourly perf report error: {e}")
 
+    try:
+        maybe_send_morning_briefing(client, datetime.now(central))
+    except Exception as e:
+        log(f"Morning briefing error: {e}")
+
+    try:
+        maybe_send_midday_briefing(client, datetime.now(central))
+    except Exception as e:
+        log(f"Midday briefing error: {e}")
+
 
 async def _on_stock_trade_tick(trade):
     """WebSocket callback: enqueue symbol for immediate evaluation."""
@@ -3152,6 +3399,16 @@ def run_websocket_cycle(client):
             maybe_send_hourly_perf_report(datetime.now(central))
         except Exception as e:
             log(f"Hourly perf report error: {e}")
+
+        try:
+            maybe_send_morning_briefing(client, datetime.now(central))
+        except Exception as e:
+            log(f"Morning briefing error: {e}")
+
+        try:
+            maybe_send_midday_briefing(client, datetime.now(central))
+        except Exception as e:
+            log(f"Midday briefing error: {e}")
 
         time.sleep(loop_sleep)
 
