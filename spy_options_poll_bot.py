@@ -128,6 +128,9 @@ IGNITION_REQUIRED   = os.getenv("IGNITION_REQUIRED", "1") == "1"
 IGNITION_MIN_DELTA  = int(os.getenv("IGNITION_MIN_DELTA",  "25"))  # Raised: require a stronger burst to confirm real ignition
 IGNITION_PRIOR_MAX  = int(os.getenv("IGNITION_PRIOR_MAX",  "74"))  # Block only if already at STRONG level (≥75); allows breakouts from 70
 IGNITION_LOOKBACK_S = int(os.getenv("IGNITION_LOOKBACK_S", "300"))  # how far back to compare (default 5 min)
+IGNITION_DELTA_80_89 = int(os.getenv("IGNITION_DELTA_80_89", "20"))
+IGNITION_DELTA_90_94 = int(os.getenv("IGNITION_DELTA_90_94", "15"))
+IGNITION_DELTA_95_PLUS = int(os.getenv("IGNITION_DELTA_95_PLUS", "0"))
 # Continuation override: allow one strong alert even if the trend is already hot,
 # as long as score remains very strong and has not faded over lookback.
 IGNITION_CONTINUATION_ENABLED = os.getenv("IGNITION_CONTINUATION_ENABLED", "1") == "1"
@@ -889,6 +892,22 @@ def symbol_profile(symbol):
             "max_ext_from_vwap": min(MAX_EXT_FROM_VWAP, 0.010),
         })
     return profile
+
+
+def ignition_delta_required(now_score, base_delta):
+    """Return adaptive ignition delta requirement from score band."""
+    try:
+        score = int(now_score)
+    except Exception:
+        score = 0
+
+    if score >= 95:
+        return max(0, int(IGNITION_DELTA_95_PLUS))
+    if score >= 90:
+        return max(0, int(IGNITION_DELTA_90_94))
+    if score >= 80:
+        return max(0, int(IGNITION_DELTA_80_89))
+    return max(0, int(base_delta))
 
 
 def _score_trend_deltas(data, side):
@@ -3613,6 +3632,8 @@ def run_symbol(client, symbol):
             now_score = data["bear_score"]
             past_score = data["bear_5m"]
 
+        required_delta = ignition_delta_required(now_score, ignition_min_delta)
+
         if past_score is None:
             history = score_history.get(symbol, deque())
             if len(history) >= 2:
@@ -3621,10 +3642,10 @@ def run_symbol(client, symbol):
                 _, oldest_bull, oldest_bear = history[0]
                 past_score = oldest_bull if side == "CALL" else oldest_bear
                 delta = now_score - past_score
-                if now_score < 90 and delta < ignition_min_delta:
+                if now_score < 95 and delta < required_delta:
                     log(
                         f"[{symbol}] Ignition gate: warmup history only ({len(history)} samples), "
-                        f"{side} delta +{delta} < +{ignition_min_delta} \u2014 waiting for clearer ignition."
+                        f"{side} delta +{delta} < +{required_delta} \u2014 waiting for clearer ignition."
                     )
                     return
                 log(
@@ -3671,9 +3692,9 @@ def run_symbol(client, symbol):
                     f"(>= {IGNITION_PRIOR_MAX}) \u2014 mid/late trend, no alert."
                 )
                 return
-        if (not continuation_override) and now_score < 90 and delta < ignition_min_delta:
+        if (not continuation_override) and now_score < 95 and delta < required_delta:
             log(
-                f"[{symbol}] Ignition gate: {side} delta only +{delta} (need +{ignition_min_delta}) "
+                f"[{symbol}] Ignition gate: {side} delta only +{delta} (need +{required_delta}) "
                 f"\u2014 trend not igniting, no alert."
             )
             return
