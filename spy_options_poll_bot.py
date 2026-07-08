@@ -3394,6 +3394,7 @@ def run_websocket_cycle(client):
     exit_check_gap = max(1, WS_EXIT_CHECK_SECONDS)
     loop_sleep = max(0.1, WS_LOOP_SLEEP_SECONDS)
     full_scan_gap = max(10, WS_FULL_SCAN_INTERVAL_SECONDS)
+    session_open_seen = market_open_now()
     log(
         "WebSocket cadence: "
         f"symbol_min_eval={min_eval_gap}s, "
@@ -3405,10 +3406,19 @@ def run_websocket_cycle(client):
     while True:
         now_ct = datetime.now(central)
 
-        if not market_open_now():
-            log("Market closed — websocket loop idle.")
+        is_open = market_open_now()
+        if not is_open:
+            if session_open_seen:
+                log("Market session ended — stopping bot process (no auto-restart).")
+                try:
+                    stream.stop()
+                except Exception:
+                    pass
+                return
+            log("Market closed (pre-open/off-hours) — websocket loop idle.")
             time.sleep(max(5, POLL_SECONDS))
             continue
+        session_open_seen = True
 
         _reset_daily_alert_state_if_needed(now_ct)
         _reset_perf_stats_if_new_day(now_ct)
@@ -3847,14 +3857,13 @@ def main():
         f"Options Alert Bot started. Symbols={','.join(SYMBOLS)} "
         f"Mode=websocket (tick-triggered). Feed={FEED}."
     )
-    while True:
-        try:
-            run_websocket_cycle(client)
-        except Exception:
-            log("WebSocket loop error — retrying in 5s:")
-            traceback.print_exc()
-            sys.stdout.flush()
-            time.sleep(5)
+    try:
+        run_websocket_cycle(client)
+    except Exception:
+        log("Fatal WebSocket loop error — exiting (no auto-restart).")
+        traceback.print_exc()
+        sys.stdout.flush()
+        raise
 
 
 if __name__ == "__main__":
