@@ -783,6 +783,10 @@ def maybe_send_trade_progress_alert(trade, current_price, pnl_pct):
     side = str(trade.get("side", "")).upper()
     color = DISCORD_COLOR_CALL if side == "CALL" else DISCORD_COLOR_PUT
     strike_val = float(trade.get("strike", 0) or 0)
+    if strike_val <= 0:
+        parsed_strike = _strike_from_contract(trade.get("contract", ""))
+        if parsed_strike is not None:
+            strike_val = float(parsed_strike)
     strike_text = str(int(strike_val)) if abs(strike_val - int(strike_val)) < 1e-9 else f"{strike_val:.2f}"
     header = f"{trade.get('underlying', 'UNKNOWN')} strike {strike_text}"
     reason = _trade_progress_reason(trade, current_price, pnl_pct)
@@ -2769,7 +2773,10 @@ def sync_open_trades_from_alpaca():
                 strike_val = float(getattr(pos, "strike_price", 0) or 0)
             except Exception:
                 strike_val = 0.0
-            strike = int(strike_val) if strike_val else 0
+            if strike_val <= 0:
+                parsed_strike = _strike_from_contract(contract_sym)
+                strike_val = float(parsed_strike) if parsed_strike is not None else 0.0
+            strike = strike_val
 
             expiry = str(getattr(pos, "expiration_date", "") or "")
 
