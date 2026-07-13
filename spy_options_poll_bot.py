@@ -183,6 +183,28 @@ ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
 ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "1"
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))  # take-profit at +20%
 STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.20"))  # stop-loss at -20%
+# Adaptive exit profile (expectancy-focused, not trade-count suppression).
+PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "0.12"))
+PARTIAL_CLOSE_FRACTION = float(os.getenv("PARTIAL_CLOSE_FRACTION", "0.50"))
+TRAILING_STOP_GIVEBACK_PCT = float(os.getenv("TRAILING_STOP_GIVEBACK_PCT", "0.10"))
+TIME_DECAY_EXIT_MINUTES = int(os.getenv("TIME_DECAY_EXIT_MINUTES", "45"))
+TIME_DECAY_MIN_PROGRESS_PCT = float(os.getenv("TIME_DECAY_MIN_PROGRESS_PCT", "0.03"))
+MOMENTUM_FAIL_EXIT_ENABLED = os.getenv("MOMENTUM_FAIL_EXIT_ENABLED", "1") == "1"
+MOMENTUM_FAIL_MIN_PNL_PCT = float(os.getenv("MOMENTUM_FAIL_MIN_PNL_PCT", "0.06"))
+# Regime-aware target/stop profile.
+ADAPTIVE_EXIT_PROFILE_ENABLED = os.getenv("ADAPTIVE_EXIT_PROFILE_ENABLED", "1") == "1"
+HIGH_VOL_RATIO = float(os.getenv("HIGH_VOL_RATIO", "1.50"))
+LOW_VOL_RATIO = float(os.getenv("LOW_VOL_RATIO", "0.90"))
+HIGH_VOL_TARGET_PCT = float(os.getenv("HIGH_VOL_TARGET_PCT", "0.24"))
+HIGH_VOL_STOP_PCT = float(os.getenv("HIGH_VOL_STOP_PCT", "0.22"))
+LOW_VOL_TARGET_PCT = float(os.getenv("LOW_VOL_TARGET_PCT", "0.16"))
+LOW_VOL_STOP_PCT = float(os.getenv("LOW_VOL_STOP_PCT", "0.14"))
+# Option contract ranking preferences.
+TARGET_OPTION_DELTA_MIN = float(os.getenv("TARGET_OPTION_DELTA_MIN", "0.35"))
+TARGET_OPTION_DELTA_MAX = float(os.getenv("TARGET_OPTION_DELTA_MAX", "0.50"))
+OPTION_RANK_SPREAD_WEIGHT = float(os.getenv("OPTION_RANK_SPREAD_WEIGHT", "0.50"))
+OPTION_RANK_LIQUIDITY_WEIGHT = float(os.getenv("OPTION_RANK_LIQUIDITY_WEIGHT", "0.35"))
+OPTION_RANK_DELTA_WEIGHT = float(os.getenv("OPTION_RANK_DELTA_WEIGHT", "0.15"))
 # Legacy profit-protection env vars are retained for backward compatibility,
 # but are intentionally not used in exit logic.
 PROFIT_PROTECT_ARM_PCT = float(os.getenv("PROFIT_PROTECT_ARM_PCT", "0.04"))
@@ -640,8 +662,12 @@ def log_trade_open_to_sheets(trade):
         log(f"[{trade['underlying']}] Google Sheets open log failed: {e}")
 
 
-def log_trade_to_sheets(row, trade):
-    """Update the existing Trades row (written at open) with exit details."""
+def log_trade_to_sheets(row, trade, final_close=True):
+    """Write trade exit details to Trades sheet.
+
+    - final_close=True: update the original OPEN row in-place to CLOSED.
+    - final_close=False: append a PARTIAL audit row and keep OPEN row intact.
+    """
     if _gsheet is None and not ensure_google_sheets_ready():
         log(f"[{row.get('underlying', 'UNKNOWN')}] Trades close write skipped: Google Sheets not initialized.")
         return
@@ -653,7 +679,8 @@ def log_trade_to_sheets(row, trade):
             if isinstance(opened, datetime) and isinstance(closed, datetime)
             else ""
         )
-        pnl_dollar = round((row["exit"] - row["entry"]) * 100, 2)
+        qty = int(row.get("qty", 1) or 1)
+        pnl_dollar = round((row["exit"] - row["entry"]) * 100 * float(max(1, qty)), 2)
         pnl_pct = round(row["pnl_pct"], 2)
         trade_id = trade.get("trade_id", "")
         now = datetime.now(central).strftime("%Y-%m-%d %H:%M:%S")
@@ -668,7 +695,7 @@ def log_trade_to_sheets(row, trade):
             opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),  # Entry Time
             closed.strftime("%Y-%m-%d %H:%M:%S") if isinstance(closed, datetime) else str(closed),  # Exit Time
             row["reason"],                                      # Exit Reason
-            "CLOSED",                                           # Status
+            "CLOSED" if final_close else "PARTIAL",             # Status
             trade.get("expiry", ""),                            # Options Expiration
             trade.get("order_id", ""),                          # Alpaca Order ID
             pnl_dollar,                                         # P&L ($)
@@ -680,7 +707,7 @@ def log_trade_to_sheets(row, trade):
 
         ws = _gsheet.worksheet("Trades")
         sheets_row = trade.get("sheets_row")
-        if sheets_row:
+        if final_close and sheets_row:
             ws.update(
                 range_name=f"A{sheets_row}",
                 values=[full_row],
@@ -688,9 +715,10 @@ def log_trade_to_sheets(row, trade):
             )
             log(f"[{trade_id}] Trade closed → Google Sheets row {sheets_row} updated.")
         else:
-            # Fallback: no open-row was stored, just append.
+            # Partial closes (or missing open row ref) append an audit row.
             ws.append_row(full_row, value_input_option="USER_ENTERED")
-            log(f"[{trade_id}] Trade closed → Google Sheets appended (no open row ref).")
+            suffix = "partial" if not final_close else "close"
+            log(f"[{trade_id}] Trade {suffix} → Google Sheets appended.")
     except Exception as e:
         log(f"[{row['underlying']}] Google Sheets trade close update failed: {e}")
 
@@ -908,6 +936,50 @@ def ignition_delta_required(now_score, base_delta):
     if score >= 80:
         return max(0, int(IGNITION_DELTA_80_89))
     return max(0, int(base_delta))
+
+
+def adaptive_target_stop_pcts(data):
+    """Return target/stop percentages tuned to current volatility regime."""
+    base_target = float(PROFIT_TARGET_PCT)
+    base_stop = float(STOP_LOSS_PCT)
+    if not ADAPTIVE_EXIT_PROFILE_ENABLED:
+        return base_target, base_stop
+
+    vol_ratio = _safe_float_num((data or {}).get("vol_ratio", 1.0), 1.0)
+    if vol_ratio >= HIGH_VOL_RATIO:
+        return max(0.01, HIGH_VOL_TARGET_PCT), max(0.01, HIGH_VOL_STOP_PCT)
+    if vol_ratio <= LOW_VOL_RATIO:
+        return max(0.01, LOW_VOL_TARGET_PCT), max(0.01, LOW_VOL_STOP_PCT)
+    return base_target, base_stop
+
+
+def option_candidate_rank(candidate):
+    """Rank option candidates by spread, liquidity and delta alignment."""
+    spread_pct = _safe_float_num(candidate.get("spread_pct", 1.0), 1.0)
+    volume = max(0.0, _safe_float_num(candidate.get("volume", 0), 0.0))
+    oi = max(0.0, _safe_float_num(candidate.get("open_interest", 0), 0.0))
+    delta_abs = abs(_safe_float_num(candidate.get("delta", 0.0), 0.0))
+
+    # Lower spread is better.
+    spread_score = max(0.0, 1.0 - min(1.0, spread_pct / 0.35))
+    # Larger volume+OI is better, saturating scale.
+    liq_raw = min(1.0, (volume / 1000.0)) * 0.6 + min(1.0, (oi / 5000.0)) * 0.4
+    # Prefer delta inside target band.
+    if delta_abs <= 0:
+        delta_score = 0.0
+    elif TARGET_OPTION_DELTA_MIN <= delta_abs <= TARGET_OPTION_DELTA_MAX:
+        delta_score = 1.0
+    elif delta_abs < TARGET_OPTION_DELTA_MIN:
+        delta_score = max(0.0, 1.0 - ((TARGET_OPTION_DELTA_MIN - delta_abs) / max(0.05, TARGET_OPTION_DELTA_MIN)))
+    else:
+        delta_score = max(0.0, 1.0 - ((delta_abs - TARGET_OPTION_DELTA_MAX) / max(0.05, 1.0 - TARGET_OPTION_DELTA_MAX)))
+
+    score = (
+        spread_score * OPTION_RANK_SPREAD_WEIGHT
+        + liq_raw * OPTION_RANK_LIQUIDITY_WEIGHT
+        + delta_score * OPTION_RANK_DELTA_WEIGHT
+    )
+    return score
 
 
 def _score_trend_deltas(data, side):
@@ -1168,6 +1240,13 @@ def analyze(df, client, symbol):
     strong_volume = volume > vol_avg * VOLUME_MULTIPLIER
     bullish_candle = price > open_
     bearish_candle = price < open_
+    vol_ratio = volume / vol_avg if vol_avg > 0 else 1.0
+
+    ema20_prev = float(previous["EMA20"]) if not pd.isna(previous["EMA20"]) else ema20
+    ema20_slope_pct = ((ema20 - ema20_prev) / ema20_prev) if ema20_prev else 0.0
+    prev_vol = float(previous["volume"]) if not pd.isna(previous["volume"]) else volume
+    volume_accel = ((volume - prev_vol) / prev_vol) if prev_vol > 0 else 0.0
+    momentum_quality = max(0.0, min(100.0, (abs(ema20_slope_pct) * 10000.0 * 0.6) + (max(0.0, volume_accel) * 100.0 * 0.4)))
 
     vwap_distance_now = price - vwap
     vwap_distance_prev = float(previous["close"]) - float(previous["VWAP"])
@@ -1272,7 +1351,6 @@ def analyze(df, client, symbol):
             + ((1.0 if moving_away_bearish else 0.0) * 0.20)
         ))
 
-        vol_ratio = volume / vol_avg if vol_avg > 0 else 1.0
         volume_bull = _to_100((
             (_clamp01((vol_ratio - 1.0) / 1.0)) * 0.50
             + ((1.0 if bullish_candle else 0.0) * 0.25)
@@ -1429,6 +1507,10 @@ def analyze(df, client, symbol):
         "vwap_distance_now": vwap_distance_now,
         "vwap_distance_prev": vwap_distance_prev,
         "vwap_extension_pct": (abs(vwap_distance_now) / vwap) if vwap else 0.0,
+        "vol_ratio": vol_ratio,
+        "ema20_slope_pct": ema20_slope_pct,
+        "volume_accel": volume_accel,
+        "momentum_quality": momentum_quality,
         "bullish_candle": bullish_candle,
         "bearish_candle": bearish_candle,
         "bull_score": bull_score,
@@ -1543,6 +1625,8 @@ def get_option_contract(symbol, signal, underlying_price):
                 print(msg, flush=True)
                 rejection_logged += 1
 
+        passed_candidates = []
+
         for candidate in contracts:
             contract_sym = candidate.symbol
             exp_date = _exp_date(candidate)
@@ -1558,6 +1642,7 @@ def get_option_contract(symbol, signal, underlying_price):
             if snap:
                 q = getattr(snap, "latest_quote", None) or getattr(snap, "quote", None)
                 t = getattr(snap, "latest_trade", None) or getattr(snap, "trade", None)
+                greeks = getattr(snap, "greeks", None)
 
                 if q is not None:
                     bid = _safe_float(getattr(q, "bid_price", 0.0), 0.0)
@@ -1566,6 +1651,9 @@ def get_option_contract(symbol, signal, underlying_price):
                     last = _safe_float(getattr(t, "price", 0.0), 0.0)
                     # Snapshot trade size is not true daily volume, but we keep it for telemetry.
                     vol = _safe_int(getattr(t, "size", 0), 0)
+                delta_val = _safe_float(getattr(greeks, "delta", 0.0), 0.0) if greeks is not None else 0.0
+            else:
+                delta_val = 0.0
 
             dte = (exp_date - today).days
 
@@ -1597,12 +1685,8 @@ def get_option_contract(symbol, signal, underlying_price):
                 )
                 continue
 
-            print(
-                f"[{symbol}] Selected contract: {contract_sym}  strike={candidate.strike_price}  "
-                f"expiry={exp_date}  bid={bid:.2f} ask={ask:.2f} vol={vol} oi={oi}",
-                flush=True,
-            )
-            return {
+            slippage_est = max(0.0, ask - bid)
+            passed_candidates.append({
                 "contract":      contract_sym,
                 "expiry":        exp_date.strftime("%Y-%m-%d"),
                 "dte":           dte,
@@ -1612,8 +1696,23 @@ def get_option_contract(symbol, signal, underlying_price):
                 "last":          last,
                 "volume":        vol,
                 "open_interest": oi,
+                "delta":         delta_val,
+                "spread_pct":    spread_pct,
+                "slippage_est":  slippage_est,
                 "side":          signal,  # stored so close_trade can build the alert_key
-            }
+            })
+
+        if passed_candidates:
+            ranked = sorted(passed_candidates, key=option_candidate_rank, reverse=True)
+            best = ranked[0]
+            print(
+                f"[{symbol}] Selected contract: {best['contract']} strike={best['strike']} "
+                f"expiry={best['expiry']} bid={best['bid']:.2f} ask={best['ask']:.2f} "
+                f"vol={best['volume']} oi={best['open_interest']} delta={best['delta']:.2f} "
+                f"rank={option_candidate_rank(best):.3f}",
+                flush=True,
+            )
+            return best
 
         if rejection_total > rejection_logged:
             print(f"[{symbol}] ... {rejection_total - rejection_logged} additional contract rejection(s) omitted.", flush=True)
@@ -2735,10 +2834,11 @@ def place_paper_exit(contract_symbol, qty):
     return order, fill_price
 
 
-def open_trade_record(symbol, signal, option, score, fill_price, qty):
+def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None):
     """Build a trade record using the actual Alpaca fill price (never a yfinance estimate)."""
     entry_price = fill_price
     side = option.get("side", signal.split()[-1])  # "CALL" or "PUT"
+    target_pct, stop_pct = adaptive_target_stop_pcts(data or {})
     return {
         "underlying": symbol,
         "signal":     signal,
@@ -2748,10 +2848,16 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty):
         "strike":     option["strike"],
         "entry":      entry_price,
         "qty":        int(qty),
-        "target":     entry_price * (1 + PROFIT_TARGET_PCT),
-        "stop":       entry_price * (1 - STOP_LOSS_PCT),
+        "target":     entry_price * (1 + target_pct),
+        "stop":       entry_price * (1 - stop_pct),
+        "target_pct": target_pct,
+        "stop_pct":   stop_pct,
         "score":      score,
         "max_pnl_pct": 0.0,
+        "partial_taken": False,
+        "partial_target": entry_price * (1 + max(0.01, PARTIAL_TP_PCT)),
+        "entry_momentum_quality": _safe_float_num((data or {}).get("momentum_quality", 0.0), 0.0),
+        "entry_vol_ratio": _safe_float_num((data or {}).get("vol_ratio", 1.0), 1.0),
         "opened_at":  datetime.now(central),
         "status":     "OPEN",
         "entry_message_id": None,
@@ -2892,8 +2998,14 @@ def sync_open_trades_from_alpaca():
             "current_price": p["current_price"],
             "target": p["entry"] * (1 + PROFIT_TARGET_PCT),
             "stop": p["entry"] * (1 - STOP_LOSS_PCT),
+            "target_pct": PROFIT_TARGET_PCT,
+            "stop_pct": STOP_LOSS_PCT,
             "score": prev.get("score", 0) if prev else 0,
             "max_pnl_pct": prev.get("max_pnl_pct", 0.0) if prev else 0.0,
+            "partial_taken": bool(prev.get("partial_taken", False)) if prev else False,
+            "partial_target": prev.get("partial_target", p["entry"] * (1 + max(0.01, PARTIAL_TP_PCT))) if prev else p["entry"] * (1 + max(0.01, PARTIAL_TP_PCT)),
+            "entry_momentum_quality": prev.get("entry_momentum_quality", 0.0) if prev else 0.0,
+            "entry_vol_ratio": prev.get("entry_vol_ratio", 1.0) if prev else 1.0,
             "opened_at": prev.get("opened_at", datetime.now(central)) if prev else datetime.now(central),
             "status": "OPEN",
             "trade_id": prev.get("trade_id") if prev else None,
@@ -2982,6 +3094,32 @@ def get_current_option_price(trade):
         return None
 
 
+def _momentum_failed(trade):
+    """Return True when underlying structure no longer supports the open side."""
+    if _option_client is None:
+        return False
+    try:
+        symbol = str(trade.get("underlying", "") or "")
+        side = str(trade.get("side", "") or "").upper()
+        if not symbol or side not in ("CALL", "PUT"):
+            return False
+
+        client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        bars = fetch_bars(client, symbol)
+        if bars is None or bars.empty or len(bars) < 25:
+            return False
+        df = calculate_indicators(bars)
+        latest = df.iloc[-1]
+        price = float(latest["close"])
+        vwap = float(latest["VWAP"]) if not pd.isna(latest["VWAP"]) else price
+        ema20 = float(latest["EMA20"]) if not pd.isna(latest["EMA20"]) else price
+        if side == "CALL":
+            return price < min(vwap, ema20)
+        return price > max(vwap, ema20)
+    except Exception:
+        return False
+
+
 def track_open_trades():
     """Walk every open paper trade, mark current PnL, and exit on target/stop.
 
@@ -3020,8 +3158,11 @@ def track_open_trades():
                     log(f"[{trade['underlying']}] Entry corrected: "
                         f"${trade['entry']:.2f} → ${alpaca_entry:.2f} (Alpaca actual fill)")
                     trade["entry"]  = alpaca_entry
-                    trade["target"] = alpaca_entry * (1 + PROFIT_TARGET_PCT)
-                    trade["stop"]   = alpaca_entry * (1 - STOP_LOSS_PCT)
+                    target_pct = float(trade.get("target_pct", PROFIT_TARGET_PCT) or PROFIT_TARGET_PCT)
+                    stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT)
+                    trade["target"] = alpaca_entry * (1 + target_pct)
+                    trade["stop"] = alpaca_entry * (1 - stop_pct)
+                    trade["partial_target"] = alpaca_entry * (1 + max(0.01, PARTIAL_TP_PCT))
             except Exception:
                 pass  # position not yet visible or already closed on Alpaca side
 
@@ -3042,25 +3183,60 @@ def track_open_trades():
 
         maybe_send_trade_progress_alert(trade, current_price, pnl_pct)
 
-        if pnl_pct >= PROFIT_TARGET_PCT:
+        target_pct = float(trade.get("target_pct", PROFIT_TARGET_PCT) or PROFIT_TARGET_PCT)
+        stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT)
+        partial_target = float(trade.get("partial_target", trade.get("entry", 0.0) * (1 + max(0.01, PARTIAL_TP_PCT))) or 0.0)
+        partial_taken = bool(trade.get("partial_taken", False))
+        held_minutes = max(1, int((datetime.now(central) - trade.get("opened_at", datetime.now(central))).total_seconds() // 60))
+
+        # 1) Adaptive hard exits.
+        if pnl_pct >= target_pct:
             close_trade(trade, current_price, "TARGET HIT", pnl_pct)
-        elif pnl_pct <= -STOP_LOSS_PCT:
-            close_trade(trade, current_price, "STOP LOSS",  pnl_pct)
+            continue
+        if pnl_pct <= -stop_pct:
+            close_trade(trade, current_price, "STOP LOSS", pnl_pct)
+            continue
+
+        # 2) Take partial profit and let remainder run.
+        if (not partial_taken) and current_price >= partial_target and int(trade.get("qty", 0) or 0) > 1:
+            partial_qty = max(1, int(round(int(trade.get("qty", 0)) * max(0.1, min(0.9, PARTIAL_CLOSE_FRACTION)))))
+            close_trade(trade, current_price, "PARTIAL TAKE PROFIT", pnl_pct, close_qty=partial_qty, final_close=False)
+            # After partial TP, protect remaining risk by moving stop near break-even.
+            trade["stop"] = max(float(trade.get("stop", 0.0) or 0.0), float(trade.get("entry", 0.0) or 0.0) * 0.99)
+            continue
+
+        # 3) Time-decay exit: no meaningful progress after a holding window.
+        if held_minutes >= max(5, TIME_DECAY_EXIT_MINUTES) and pnl_pct < max(0.0, TIME_DECAY_MIN_PROGRESS_PCT):
+            close_trade(trade, current_price, "TIME DECAY / NO FOLLOW-THROUGH", pnl_pct)
+            continue
+
+        # 4) Momentum-failure exit for non-performing trades.
+        if MOMENTUM_FAIL_EXIT_ENABLED and pnl_pct <= MOMENTUM_FAIL_MIN_PNL_PCT and _momentum_failed(trade):
+            close_trade(trade, current_price, "MOMENTUM FAILURE", pnl_pct)
+            continue
+
+        # 5) Trailing stop after partial take.
+        max_seen = float(trade.get("max_pnl_pct", 0.0) or 0.0)
+        if partial_taken and max_seen > 0 and pnl_pct <= (max_seen - max(0.02, TRAILING_STOP_GIVEBACK_PCT)):
+            close_trade(trade, current_price, "TRAILING STOP", pnl_pct)
 
 
-def close_trade(trade, exit_price, reason, pnl_pct):
+def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=True):
     """Submit a paper exit (if enabled), Discord the result, and append to CSV.
 
     exit_price is the mid-price trigger used to detect target/stop.  After
     submitting the market SELL we replace it with the actual Alpaca fill price
     so Discord and the CSV reflect what the account really received (bid-side).
     """
+    current_qty = int(trade.get("qty", max(BASE_POSITION_QTY, MIN_POSITION_QTY)) or 0)
+    close_qty_int = int(max(1, min(current_qty, int(close_qty or current_qty))))
+
     exit_confirmed = not ENABLE_ALPACA_PAPER_TRADING
     if ENABLE_ALPACA_PAPER_TRADING and _trading_client is not None:
         try:
             _, fill_price = place_paper_exit(
                 trade["contract"],
-                int(trade.get("qty", max(BASE_POSITION_QTY, MIN_POSITION_QTY))),
+                close_qty_int,
             )
             if fill_price is not None:
                 # Recalculate PnL using the real fill, not the mid-price estimate.
@@ -3122,6 +3298,7 @@ def close_trade(trade, exit_price, reason, pnl_pct):
         f"\U0001f534 **{exit_type_label} — {exit_header} | {trade['side']} - {pnl_pct * 100:+.2f}%**\n\n"
         f"------------------------------\n"
         f"\U0001f4b2 **Current Price:** `${exit_px:.2f}`\n"
+        f"\U0001f4e6 **Qty Closed:** `{close_qty_int}`\n"
         f"\U0001f4ca **Trade:** `${entry_px:.2f} -> ${exit_px:.2f}` | `{duration_min}m`\n"
         f"\U0001f4c9 **Result:** `{reason}`\n"
         f"\U0001f9e0 **Summary:** `{trade['underlying']} {trade['side']} closed by rules`\n"
@@ -3138,7 +3315,7 @@ def close_trade(trade, exit_price, reason, pnl_pct):
         "underlying": trade["underlying"],
         "contract":   trade["contract"],
         "signal":     trade["signal"],
-        "qty":        int(trade.get("qty", max(BASE_POSITION_QTY, MIN_POSITION_QTY))),
+        "qty":        close_qty_int,
         "entry":      trade["entry"],
         "exit":       exit_price,
         "pnl_pct":    pnl_pct * 100,
@@ -3155,9 +3332,18 @@ def close_trade(trade, exit_price, reason, pnl_pct):
     except Exception as e:
         log(f"CSV write failed: {e}")
 
-    update_alert_close_to_sheets(row, trade)
-    log_trade_to_sheets(row, trade)
-    _record_trade_close_for_perf(trade, exit_price, pnl_pct, closed_at)
+    if final_close:
+        update_alert_close_to_sheets(row, trade)
+    log_trade_to_sheets(row, trade, final_close=final_close)
+    perf_trade = dict(trade)
+    perf_trade["qty"] = close_qty_int
+    _record_trade_close_for_perf(perf_trade, exit_price, pnl_pct, closed_at)
+
+    if (not final_close) and close_qty_int < current_qty:
+        trade["qty"] = max(0, current_qty - close_qty_int)
+        trade["partial_taken"] = True
+        log(f"[{trade['underlying']}] Partial close executed: {close_qty_int} closed, {trade['qty']} remaining.")
+        return
 
     _open_trades.pop(trade["contract"], None)
 
@@ -3245,7 +3431,7 @@ def try_open_paper_trade(symbol, side, option, data):
         log(f"[{symbol}] Order submitted but no fill confirmed within 5s — not tracking trade.")
         return False
 
-    trade = open_trade_record(symbol, signal_label, option, score, fill_price, qty)
+    trade = open_trade_record(symbol, signal_label, option, score, fill_price, qty, data=data)
     _open_trades[trade["contract"]] = trade
     _record_trade_open_for_perf(datetime.now(central))
 
@@ -3258,9 +3444,10 @@ def try_open_paper_trade(symbol, side, option, data):
     setup = "MOMENTUM BREAKOUT" if score >= 90 else "TREND CONTINUATION"
     ai_label = "HIGH" if score >= 90 else "MEDIUM" if score >= 80 else "LOW"
     grade = "A" if score >= 90 else "B" if score >= 80 else "C"
-    stop_pct = STOP_LOSS_PCT * 100
-    target_1 = trade['entry'] * 1.25
-    target_2 = trade['entry'] * 1.50
+    stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT)) * 100.0
+    target_pct = float(trade.get("target_pct", PROFIT_TARGET_PCT)) * 100.0
+    target_1 = float(trade.get("partial_target", trade['entry'] * (1 + max(0.01, PARTIAL_TP_PCT))))
+    target_2 = float(trade.get("target", trade['entry'] * (1 + PROFIT_TARGET_PCT)))
 
     score_line = f"{score}/100"
     if macro_penalty > 0:
@@ -3295,7 +3482,8 @@ def try_open_paper_trade(symbol, side, option, data):
         f"\U0001f4b2 **Current Price:** `${float(data.get('price', 0.0) or 0.0):.2f}`\n"
         f"\U0001f4ca **Setup:** `{setup}` | Score: `{score_line}` ({grade})\n"
         f"⚡ **Why Now:** `{why_now_line}`\n"
-        f"\U0001f3af **Plan:** Entry `${trade['entry']:.2f}` | Target `${target_1:.2f}` / `${target_2:.2f}` | Stop `-{stop_pct:.0f}%`\n"
+        f"\U0001f3af **Plan:** Entry `${trade['entry']:.2f}` | Partial `${target_1:.2f}` (+{PARTIAL_TP_PCT*100:.0f}%) | "
+        f"Final `${target_2:.2f}` (+{target_pct:.0f}%) | Stop `-{stop_pct:.0f}%`\n"
         f"\U0001f6d1 **Invalidation:** VWAP loss / hard stop hit\n"
         f"\U0001f916 **AI:** \U0001f7e1 **{ai_label}** — balanced setup with rules-aligned confirmation\n"
         f"{news_context_block}\n\n"
