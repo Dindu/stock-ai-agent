@@ -115,9 +115,22 @@ STOCK_STRONG_SCORE_BONUS = int(os.getenv("STOCK_STRONG_SCORE_BONUS", "5"))
 #   HARD_SCORE_GATE_IN_NO_GATING_MODE=1.
 HARD_SCORE_GATE_ENABLED = os.getenv("HARD_SCORE_GATE_ENABLED", "1") == "1"
 HARD_SCORE_GATE_IN_NO_GATING_MODE = os.getenv("HARD_SCORE_GATE_IN_NO_GATING_MODE", "1") == "1"
+# Dynamic hard-gate tuning: adjust required score by real-time regime/momentum quality.
+DYNAMIC_HARD_GATE_ENABLED = os.getenv("DYNAMIC_HARD_GATE_ENABLED", "1") == "1"
+DYNAMIC_HARD_GATE_MAX_RELIEF = int(os.getenv("DYNAMIC_HARD_GATE_MAX_RELIEF", "8"))
+DYNAMIC_HARD_GATE_MAX_PENALTY = int(os.getenv("DYNAMIC_HARD_GATE_MAX_PENALTY", "4"))
+DYNAMIC_HARD_GATE_MIN_FLOOR_ETF = int(os.getenv("DYNAMIC_HARD_GATE_MIN_FLOOR_ETF", "67"))
+DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK = int(os.getenv("DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK", "70"))
 # Execution behavior controls.
 # Default: do not auto-execute WATCHLIST setups (alerts-only quality).
 EXECUTE_WATCHLIST_SIGNALS = os.getenv("EXECUTE_WATCHLIST_SIGNALS", "0") == "1"
+# Selective watchlist execution: allow entries only when continuation confirmation passes.
+SELECTIVE_WATCHLIST_EXECUTION_ENABLED = os.getenv("SELECTIVE_WATCHLIST_EXECUTION_ENABLED", "1") == "1"
+WATCHLIST_PROMOTION_MIN_SCORE = int(os.getenv("WATCHLIST_PROMOTION_MIN_SCORE", "58"))
+WATCHLIST_PROMOTION_MIN_DOMINANCE = int(os.getenv("WATCHLIST_PROMOTION_MIN_DOMINANCE", "12"))
+WATCHLIST_PROMOTION_MIN_MOMENTUM = int(os.getenv("WATCHLIST_PROMOTION_MIN_MOMENTUM", "58"))
+WATCHLIST_PROMOTION_MIN_VOLUME = int(os.getenv("WATCHLIST_PROMOTION_MIN_VOLUME", "35"))
+WATCHLIST_PROMOTION_MIN_DELTA_5M = int(os.getenv("WATCHLIST_PROMOTION_MIN_DELTA_5M", "2"))
 # Pre-check options buying power before submitting market BUYs.
 OPTIONS_BP_BUFFER_PCT = float(os.getenv("OPTIONS_BP_BUFFER_PCT", "0.05"))
 
@@ -155,6 +168,12 @@ SPY_MACRO_HARD_BLOCK    = os.getenv("SPY_MACRO_HARD_BLOCK", "0") == "1"
 ANTI_CHASE_FILTER  = os.getenv("ANTI_CHASE_FILTER", "1") == "1"
 MAX_EXT_FROM_VWAP  = float(os.getenv("MAX_EXT_FROM_VWAP", "0.012"))  # 1.2%
 CANDLE_CONFIRMATION = os.getenv("CANDLE_CONFIRMATION", "1") == "1"
+# Momentum continuation pre-entry filter: block weak/late continuation even after ignition.
+ENTRY_MOMENTUM_CONTINUATION_FILTER = os.getenv("ENTRY_MOMENTUM_CONTINUATION_FILTER", "1") == "1"
+ENTRY_CONT_MIN_MOMENTUM_SCORE = float(os.getenv("ENTRY_CONT_MIN_MOMENTUM_SCORE", "58"))
+ENTRY_CONT_MIN_DELTA_5M = int(os.getenv("ENTRY_CONT_MIN_DELTA_5M", "2"))
+ENTRY_CONT_MIN_EMA20_SLOPE_PCT = float(os.getenv("ENTRY_CONT_MIN_EMA20_SLOPE_PCT", "0.00015"))
+ENTRY_CONT_MIN_MOMENTUM_QUALITY = float(os.getenv("ENTRY_CONT_MIN_MOMENTUM_QUALITY", "8.0"))
 ALERT_ONLY_COOLDOWN_MINUTES = int(os.getenv("ALERT_ONLY_COOLDOWN_MINUTES", "20"))
 ENABLE_HOURLY_DISCORD_PERF_REPORT = os.getenv("ENABLE_HOURLY_DISCORD_PERF_REPORT", "1") == "1"
 HOURLY_REPORT_MINUTE_WINDOW = int(os.getenv("HOURLY_REPORT_MINUTE_WINDOW", "2"))
@@ -936,6 +955,147 @@ def ignition_delta_required(now_score, base_delta):
     if score >= 80:
         return max(0, int(IGNITION_DELTA_80_89))
     return max(0, int(base_delta))
+
+
+def _side_metric_bundle(data, side):
+    """Return normalized side-specific metrics used by dynamic entry gates."""
+    side = str(side or "").upper()
+    if side == "CALL":
+        side_score = _safe_float_num((data or {}).get("bull_score", 0.0), 0.0)
+        momentum = _safe_float_num((data or {}).get("momentum_score_bull", 0.0), 0.0)
+        volume = _safe_float_num((data or {}).get("volume_score_bull", 0.0), 0.0)
+        regime = _safe_float_num((data or {}).get("market_regime_score_bull", 0.0), 0.0)
+        pattern = _safe_float_num((data or {}).get("pattern_quality_score_bull", 0.0), 0.0)
+        now_score = _safe_float_num((data or {}).get("bull_score", 0.0), 0.0)
+        prev_score = (data or {}).get("bull_5m")
+        opposite = _safe_float_num((data or {}).get("bear_score", 0.0), 0.0)
+    else:
+        side_score = _safe_float_num((data or {}).get("bear_score", 0.0), 0.0)
+        momentum = _safe_float_num((data or {}).get("momentum_score_bear", 0.0), 0.0)
+        volume = _safe_float_num((data or {}).get("volume_score_bear", 0.0), 0.0)
+        regime = _safe_float_num((data or {}).get("market_regime_score_bear", 0.0), 0.0)
+        pattern = _safe_float_num((data or {}).get("pattern_quality_score_bear", 0.0), 0.0)
+        now_score = _safe_float_num((data or {}).get("bear_score", 0.0), 0.0)
+        prev_score = (data or {}).get("bear_5m")
+        opposite = _safe_float_num((data or {}).get("bull_score", 0.0), 0.0)
+
+    delta_5m = None if prev_score is None else int(round(now_score - _safe_float_num(prev_score, now_score)))
+    ema20_slope_pct = _safe_float_num((data or {}).get("ema20_slope_pct", 0.0), 0.0)
+    momentum_quality = _safe_float_num((data or {}).get("momentum_quality", 0.0), 0.0)
+    dominance = side_score - opposite
+
+    return {
+        "side_score": side_score,
+        "momentum": momentum,
+        "volume": volume,
+        "regime": regime,
+        "pattern": pattern,
+        "delta_5m": delta_5m,
+        "ema20_slope_pct": ema20_slope_pct,
+        "momentum_quality": momentum_quality,
+        "dominance": dominance,
+    }
+
+
+def dynamic_min_required_score(symbol, side, data):
+    """Return a dynamic hard minimum score using regime and continuation quality."""
+    base = SCORE_STRONG + 1 if symbol in ETF_SYMBOLS else SCORE_STRONG + max(0, STOCK_STRONG_SCORE_BONUS)
+    if not DYNAMIC_HARD_GATE_ENABLED:
+        return int(base)
+
+    m = _side_metric_bundle(data, side)
+    relief = 0
+    penalty = 0
+
+    if m["regime"] >= 80:
+        relief += 3
+    if m["momentum"] >= 70:
+        relief += 3
+    elif m["momentum"] < 45:
+        penalty += 2
+    if m["volume"] >= 60:
+        relief += 1
+    elif m["volume"] < 25:
+        penalty += 1
+    if m["pattern"] >= 65:
+        relief += 1
+    if m["delta_5m"] is not None:
+        if m["delta_5m"] >= 5:
+            relief += 1
+        elif m["delta_5m"] <= 0:
+            penalty += 1
+
+    slope = m["ema20_slope_pct"]
+    if (side == "CALL" and slope <= 0) or (side == "PUT" and slope >= 0):
+        penalty += 1
+
+    adjusted = int(base - min(DYNAMIC_HARD_GATE_MAX_RELIEF, relief) + min(DYNAMIC_HARD_GATE_MAX_PENALTY, penalty))
+    floor = DYNAMIC_HARD_GATE_MIN_FLOOR_ETF if symbol in ETF_SYMBOLS else DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK
+    return max(int(floor), adjusted)
+
+
+def watchlist_execution_confirmed(symbol, side, data):
+    """Promote WATCH tier to executable only when continuation quality is strong."""
+    if not SELECTIVE_WATCHLIST_EXECUTION_ENABLED:
+        return False, "selective watchlist execution disabled"
+
+    m = _side_metric_bundle(data, side)
+    if m["side_score"] < WATCHLIST_PROMOTION_MIN_SCORE:
+        return False, f"score {m['side_score']:.0f} < {WATCHLIST_PROMOTION_MIN_SCORE}"
+    if m["dominance"] < WATCHLIST_PROMOTION_MIN_DOMINANCE:
+        return False, f"dominance {m['dominance']:.0f} < {WATCHLIST_PROMOTION_MIN_DOMINANCE}"
+    if m["momentum"] < WATCHLIST_PROMOTION_MIN_MOMENTUM:
+        return False, f"momentum {m['momentum']:.1f} < {WATCHLIST_PROMOTION_MIN_MOMENTUM}"
+    if m["volume"] < WATCHLIST_PROMOTION_MIN_VOLUME:
+        return False, f"volume {m['volume']:.1f} < {WATCHLIST_PROMOTION_MIN_VOLUME}"
+    if m["regime"] < 60:
+        return False, f"regime alignment {m['regime']:.1f} < 60"
+    if m["delta_5m"] is None and m["side_score"] < 90:
+        return False, "insufficient 5m history for continuation"
+    if m["delta_5m"] is not None and m["delta_5m"] < WATCHLIST_PROMOTION_MIN_DELTA_5M:
+        return False, f"5m delta {m['delta_5m']} < {WATCHLIST_PROMOTION_MIN_DELTA_5M}"
+
+    slope = m["ema20_slope_pct"]
+    if side == "CALL" and slope <= 0:
+        return False, f"ema20 slope {slope:.5f} not bullish"
+    if side == "PUT" and slope >= 0:
+        return False, f"ema20 slope {slope:.5f} not bearish"
+    if m["momentum_quality"] < ENTRY_CONT_MIN_MOMENTUM_QUALITY:
+        return False, f"momentum quality {m['momentum_quality']:.1f} < {ENTRY_CONT_MIN_MOMENTUM_QUALITY}"
+
+    return True, (
+        f"score={m['side_score']:.0f}, dom={m['dominance']:.0f}, "
+        f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, "
+        f"regime={m['regime']:.1f}, d5={m['delta_5m']}"
+    )
+
+
+def entry_momentum_continuation_ok(side, data):
+    """Require continuation structure to avoid weak/late entries."""
+    if not ENTRY_MOMENTUM_CONTINUATION_FILTER:
+        return True, "disabled"
+
+    m = _side_metric_bundle(data, side)
+    if m["momentum"] < ENTRY_CONT_MIN_MOMENTUM_SCORE:
+        return False, f"momentum {m['momentum']:.1f} < {ENTRY_CONT_MIN_MOMENTUM_SCORE}"
+    if m["momentum_quality"] < ENTRY_CONT_MIN_MOMENTUM_QUALITY:
+        return False, f"momentum quality {m['momentum_quality']:.1f} < {ENTRY_CONT_MIN_MOMENTUM_QUALITY}"
+    if m["delta_5m"] is None and m["side_score"] < 90:
+        return False, "insufficient 5m history"
+    if m["delta_5m"] is not None and m["delta_5m"] < ENTRY_CONT_MIN_DELTA_5M:
+        return False, f"5m delta {m['delta_5m']} < {ENTRY_CONT_MIN_DELTA_5M}"
+
+    slope = m["ema20_slope_pct"]
+    min_slope = abs(ENTRY_CONT_MIN_EMA20_SLOPE_PCT)
+    if side == "CALL" and slope < min_slope:
+        return False, f"ema20 slope {slope:.5f} < +{min_slope:.5f}"
+    if side == "PUT" and slope > -min_slope:
+        return False, f"ema20 slope {slope:.5f} > -{min_slope:.5f}"
+
+    return True, (
+        f"mom={m['momentum']:.1f}, mq={m['momentum_quality']:.1f}, "
+        f"d5={m['delta_5m']}, slope={slope:.5f}"
+    )
 
 
 def adaptive_target_stop_pcts(data):
@@ -3742,23 +3902,30 @@ def run_symbol(client, symbol):
         )
         return
 
-    if data.get("tier") == "WATCH" and not EXECUTE_WATCHLIST_SIGNALS:
-        log(f"[{symbol}] Execution gate: WATCHLIST tier is alerts-only (set EXECUTE_WATCHLIST_SIGNALS=1 to enable entries).")
-        return
+    watchlist_promoted = False
+    if data.get("tier") == "WATCH":
+        if EXECUTE_WATCHLIST_SIGNALS:
+            watchlist_promoted = True
+            log(f"[{symbol}] WATCHLIST execution enabled globally (EXECUTE_WATCHLIST_SIGNALS=1).")
+        else:
+            wl_ok, wl_reason = watchlist_execution_confirmed(symbol, side, data)
+            if not wl_ok:
+                log(
+                    f"[{symbol}] Execution gate: WATCHLIST tier blocked "
+                    f"(selective criteria not met: {wl_reason})."
+                )
+                return
+            watchlist_promoted = True
+            log(f"[{symbol}] WATCHLIST promoted for execution — {wl_reason}.")
+    data["watchlist_promoted"] = watchlist_promoted
 
-    # Hard minimum score gate with symbol-aware threshold.
-    # ETFs keep the base strict gate (> SCORE_STRONG), while single stocks require
-    # an extra score buffer (SCORE_STRONG + STOCK_STRONG_SCORE_BONUS).
+    # Hard minimum score gate with dynamic threshold from regime + continuation quality.
     enforce_hard_gate = HARD_SCORE_GATE_ENABLED and (
         (not NO_GATING_MODE) or HARD_SCORE_GATE_IN_NO_GATING_MODE
     )
     if enforce_hard_gate:
         side_score = data["bull_score"] if side == "CALL" else data["bear_score"]
-        min_required_score = (
-            SCORE_STRONG + 1
-            if symbol in ETF_SYMBOLS
-            else SCORE_STRONG + max(0, STOCK_STRONG_SCORE_BONUS)
-        )
+        min_required_score = dynamic_min_required_score(symbol, side, data)
         if side_score < min_required_score:
             log(
                 f"[{symbol}] Hard score gate: {side} {side_score} < {min_required_score} "
@@ -3766,8 +3933,8 @@ def run_symbol(client, symbol):
             )
             return
 
-    # Only send Discord alerts for the perfect setup (STRONG tier) unless no-gating mode is enabled.
-    if (not NO_GATING_MODE) and data["tier"] != "STRONG":
+    # Only send Discord alerts for STRONG tier unless watchlist was selectively promoted.
+    if (not NO_GATING_MODE) and data["tier"] != "STRONG" and not data.get("watchlist_promoted", False):
         log(f"[{symbol}] {data['signal']} (BULL {data['bull_score']} / BEAR {data['bear_score']}) "
             f"\u2014 below STRONG threshold, no Discord alert.")
         return
@@ -3891,6 +4058,13 @@ def run_symbol(client, symbol):
             f"[{symbol}] \U0001f680 Ignition confirmed: {side} score {past_score} \u2192 {now_score} "
             f"(\u0394 +{delta}) over last {IGNITION_LOOKBACK_S}s."
         )
+
+    # Stricter continuation check to avoid late or fading entries.
+    if not NO_GATING_MODE:
+        cont_ok, cont_reason = entry_momentum_continuation_ok(side, data)
+        if not cont_ok:
+            log(f"[{symbol}] Momentum continuation filter: {side} blocked — {cont_reason}.")
+            return
 
     # ── RSI exhaustion filter ─────────────────────────────────────────────────
     # Don't enter CALLs when RSI is already overbought (move likely exhausted),
