@@ -206,8 +206,6 @@ STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.20"))  # stop-loss a
 PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "0.12"))
 PARTIAL_CLOSE_FRACTION = float(os.getenv("PARTIAL_CLOSE_FRACTION", "0.50"))
 TRAILING_STOP_GIVEBACK_PCT = float(os.getenv("TRAILING_STOP_GIVEBACK_PCT", "0.10"))
-TIME_DECAY_EXIT_MINUTES = int(os.getenv("TIME_DECAY_EXIT_MINUTES", "45"))
-TIME_DECAY_MIN_PROGRESS_PCT = float(os.getenv("TIME_DECAY_MIN_PROGRESS_PCT", "0.03"))
 MOMENTUM_FAIL_EXIT_ENABLED = os.getenv("MOMENTUM_FAIL_EXIT_ENABLED", "1") == "1"
 MOMENTUM_FAIL_MIN_PNL_PCT = float(os.getenv("MOMENTUM_FAIL_MIN_PNL_PCT", "0.06"))
 # Regime-aware target/stop profile.
@@ -3365,17 +3363,12 @@ def track_open_trades():
             trade["stop"] = max(float(trade.get("stop", 0.0) or 0.0), float(trade.get("entry", 0.0) or 0.0) * 0.99)
             continue
 
-        # 3) Time-decay exit: no meaningful progress after a holding window.
-        if held_minutes >= max(5, TIME_DECAY_EXIT_MINUTES) and pnl_pct < max(0.0, TIME_DECAY_MIN_PROGRESS_PCT):
-            close_trade(trade, current_price, "TIME DECAY / NO FOLLOW-THROUGH", pnl_pct)
-            continue
-
-        # 4) Momentum-failure exit for non-performing trades.
+        # 3) Momentum-failure exit for non-performing trades.
         if MOMENTUM_FAIL_EXIT_ENABLED and pnl_pct <= MOMENTUM_FAIL_MIN_PNL_PCT and _momentum_failed(trade):
             close_trade(trade, current_price, "MOMENTUM FAILURE", pnl_pct)
             continue
 
-        # 5) Trailing stop after partial take.
+        # 4) Trailing stop after partial take.
         max_seen = float(trade.get("max_pnl_pct", 0.0) or 0.0)
         if partial_taken and max_seen > 0 and pnl_pct <= (max_seen - max(0.02, TRAILING_STOP_GIVEBACK_PCT)):
             close_trade(trade, current_price, "TRAILING STOP", pnl_pct)
