@@ -3444,6 +3444,8 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     duration_min = max(1, int((closed_at - trade["opened_at"]).total_seconds() // 60))
     entry_px = float(trade["entry"])
     exit_px = float(exit_price)
+    remaining_qty = max(0, int(current_qty - close_qty_int))
+    exit_scope = "PARTIAL EXIT" if (not final_close and close_qty_int < current_qty) else "FINAL EXIT"
     strike_val = float(trade.get("strike", 0) or 0)
     if strike_val <= 0:
         parsed_strike = _strike_from_contract(trade.get("contract", ""))
@@ -3455,10 +3457,12 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     grade = "A" if pnl_pct >= 0.20 else "B" if pnl_pct >= 0.10 else "C" if pnl_pct >= -0.10 else "D"
 
     send_discord(
-        f"\U0001f534 **{exit_type_label} — {exit_header} | {trade['side']} - {pnl_pct * 100:+.2f}%**\n\n"
+        f"\U0001f534 **{exit_type_label} — {exit_header} | {trade['side']} - {pnl_pct * 100:+.2f}%**\n"
+        f"\U0001f3f7\ufe0f **{exit_scope}**\n\n"
         f"------------------------------\n"
         f"\U0001f4b2 **Current Price:** `${exit_px:.2f}`\n"
-        f"\U0001f4e6 **Qty Closed:** `{close_qty_int}`\n"
+        f"\U0001f4e6 **Qty:** closed `{close_qty_int}/{current_qty}`"
+        f" | remaining `{remaining_qty}`\n"
         f"\U0001f4ca **Trade:** `${entry_px:.2f} -> ${exit_px:.2f}` | `{duration_min}m`\n"
         f"\U0001f4c9 **Result:** `{reason}`\n"
         f"\U0001f9e0 **Summary:** `{trade['underlying']} {trade['side']} closed by rules`\n"
