@@ -14,6 +14,8 @@ import json
 import re
 import sys
 import time
+from math import exp
+import subprocess
 import threading
 import traceback
 import uuid
@@ -178,6 +180,20 @@ ENTRY_CONT_MIN_MOMENTUM_SCORE = float(os.getenv("ENTRY_CONT_MIN_MOMENTUM_SCORE",
 ENTRY_CONT_MIN_DELTA_5M = int(os.getenv("ENTRY_CONT_MIN_DELTA_5M", "1"))
 ENTRY_CONT_MIN_EMA20_SLOPE_PCT = float(os.getenv("ENTRY_CONT_MIN_EMA20_SLOPE_PCT", "0.00015"))
 ENTRY_CONT_MIN_MOMENTUM_QUALITY = float(os.getenv("ENTRY_CONT_MIN_MOMENTUM_QUALITY", "8.0"))
+# ML entry gate (optional): model reads current rule-engine features and returns win probability.
+ML_GATE_ENABLED = os.getenv("ML_GATE_ENABLED", "0") == "1"
+ML_GATE_MODEL_PATH = os.getenv("ML_GATE_MODEL_PATH", "models/entry_model.json")
+ML_GATE_REQUIRE_MODEL = os.getenv("ML_GATE_REQUIRE_MODEL", "0") == "1"
+ML_MIN_PROBABILITY = float(os.getenv("ML_MIN_PROBABILITY", "0.62"))
+ML_MIN_EXPECTED_RETURN = float(os.getenv("ML_MIN_EXPECTED_RETURN", "0.00"))
+# Auto-retrain: refresh ML model after enough closed trades (non-blocking background job).
+AUTO_RETRAIN_MODEL_ENABLED = os.getenv("AUTO_RETRAIN_MODEL_ENABLED", "0") == "1"
+AUTO_RETRAIN_MIN_NEW_CLOSED_TRADES = int(os.getenv("AUTO_RETRAIN_MIN_NEW_CLOSED_TRADES", "25"))
+AUTO_RETRAIN_COOLDOWN_MINUTES = int(os.getenv("AUTO_RETRAIN_COOLDOWN_MINUTES", "60"))
+AUTO_RETRAIN_SOURCE = os.getenv("AUTO_RETRAIN_SOURCE", "csv").strip().lower()
+AUTO_RETRAIN_INPUT_PATH = os.getenv("AUTO_RETRAIN_INPUT_PATH", "trade_results.csv")
+AUTO_RETRAIN_OUTPUT_PATH = os.getenv("AUTO_RETRAIN_OUTPUT_PATH", "models/entry_model.json")
+AUTO_RETRAIN_MIN_SAMPLES = int(os.getenv("AUTO_RETRAIN_MIN_SAMPLES", "20"))
 ALERT_ONLY_COOLDOWN_MINUTES = int(os.getenv("ALERT_ONLY_COOLDOWN_MINUTES", "20"))
 ENABLE_HOURLY_DISCORD_PERF_REPORT = os.getenv("ENABLE_HOURLY_DISCORD_PERF_REPORT", "1") == "1"
 HOURLY_REPORT_MINUTE_WINDOW = int(os.getenv("HOURLY_REPORT_MINUTE_WINDOW", "2"))
@@ -294,6 +310,16 @@ _trending_cache: "dict" = {"updated_at": None, "symbols": [], "reasons": {}}
 _trending_asset_cache: "dict" = {}
 # Cached symbol news context used by entry alerts.
 _symbol_news_cache: "dict" = {"updated_at": {}, "items": {}}
+# Cached ML model metadata for low-overhead per-symbol gating.
+_ml_gate_cache: "dict" = {"path": None, "mtime": None, "model": None, "checked": None}
+_auto_retrain_state: "dict" = {
+    "running": False,
+    "last_run_at": None,
+    "last_status": "",
+    "last_closed_count": 0,
+    "closed_count": 0,
+}
+_auto_retrain_lock = threading.Lock()
 # Last observed state per symbol for transition-only alerting.
 _last_symbol_state: "dict[str, dict]" = {}
 # Per-symbol timestamp of the most recent transition alert.
@@ -2026,6 +2052,218 @@ def _safe_int_num(v, default=0):
         return default
 
 
+def _ml_sigmoid(x):
+    """Numerically stable sigmoid for logistic-style probability outputs."""
+    z = max(-50.0, min(50.0, _safe_float_num(x, 0.0)))
+    return 1.0 / (1.0 + exp(-z))
+
+
+def _extract_ml_entry_features(symbol, side, data):
+    """Build model features from the existing rule-engine state."""
+    side_u = str(side or "").upper()
+    call_side = side_u == "CALL"
+    m = _side_metric_bundle(data or {}, side_u)
+    delta_5m, delta_10m = _score_trend_deltas(data or {}, side_u)
+
+    side_score = _safe_float_num((data or {}).get("bull_score", 0.0), 0.0) if call_side else _safe_float_num((data or {}).get("bear_score", 0.0), 0.0)
+    opposite_score = _safe_float_num((data or {}).get("bear_score", 0.0), 0.0) if call_side else _safe_float_num((data or {}).get("bull_score", 0.0), 0.0)
+    dominance = side_score - opposite_score
+
+    feats = {
+        "is_call": 1.0 if call_side else 0.0,
+        "is_put": 0.0 if call_side else 1.0,
+        "is_etf": 1.0 if symbol in ETF_SYMBOLS else 0.0,
+        "is_top_stock": 1.0 if symbol in TOP_STOCK_SYMBOLS else 0.0,
+        "is_aggressive_stock": 1.0 if symbol in AGGRESSIVE_STOCK_SYMBOLS else 0.0,
+        "effective_score": _safe_float_num((data or {}).get("effective_score", side_score), side_score),
+        "raw_score": _safe_float_num((data or {}).get("raw_entry_score", side_score), side_score),
+        "macro_penalty": _safe_float_num((data or {}).get("macro_penalty", 0.0), 0.0),
+        "side_score": side_score,
+        "opposite_score": opposite_score,
+        "dominance": dominance,
+        "delta_5m": _safe_float_num(delta_5m, 0.0),
+        "delta_10m": _safe_float_num(delta_10m, 0.0),
+        "momentum": _safe_float_num(m.get("momentum", 0.0), 0.0),
+        "volume": _safe_float_num(m.get("volume", 0.0), 0.0),
+        "regime": _safe_float_num(m.get("regime", 0.0), 0.0),
+        "pattern": _safe_float_num(m.get("pattern", 0.0), 0.0),
+        "momentum_quality": _safe_float_num(m.get("momentum_quality", 0.0), 0.0),
+        "ema20_slope_pct": _safe_float_num((data or {}).get("ema20_slope_pct", 0.0), 0.0),
+        "rsi": _safe_float_num((data or {}).get("rsi", 50.0), 50.0),
+        "vol_ratio": _safe_float_num((data or {}).get("vol_ratio", 1.0), 1.0),
+        "vwap_extension_pct": _safe_float_num((data or {}).get("vwap_extension_pct", 0.0), 0.0),
+        "watchlist_promoted": 1.0 if bool((data or {}).get("watchlist_promoted", False)) else 0.0,
+    }
+    return feats
+
+
+def _load_ml_gate_model():
+    """Load and cache a lightweight JSON logistic model for entry gating."""
+    path = str(ML_GATE_MODEL_PATH or "").strip()
+    if not path:
+        return None
+
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception:
+        mtime = None
+
+    cached = _ml_gate_cache
+    if cached.get("path") == path and cached.get("mtime") == mtime:
+        return cached.get("model")
+
+    model = None
+    if mtime is not None:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                feature_order = payload.get("feature_order") or []
+                weights = payload.get("weights") or []
+                bias = _safe_float_num(payload.get("bias", 0.0), 0.0)
+                threshold = _safe_float_num(payload.get("threshold", ML_MIN_PROBABILITY), ML_MIN_PROBABILITY)
+                feature_stats = payload.get("feature_stats") if isinstance(payload.get("feature_stats"), dict) else {}
+                expected_return = payload.get("expected_return") if isinstance(payload.get("expected_return"), dict) else None
+
+                if isinstance(feature_order, list) and isinstance(weights, list) and len(feature_order) == len(weights) and len(feature_order) > 0:
+                    model = {
+                        "feature_order": [str(x) for x in feature_order],
+                        "weights": [_safe_float_num(x, 0.0) for x in weights],
+                        "bias": bias,
+                        "threshold": threshold,
+                        "feature_stats": feature_stats,
+                        "expected_return": expected_return,
+                    }
+        except Exception:
+            model = None
+
+    _ml_gate_cache["path"] = path
+    _ml_gate_cache["mtime"] = mtime
+    _ml_gate_cache["model"] = model
+    _ml_gate_cache["checked"] = datetime.now(central)
+    return model
+
+
+def _predict_ml_entry(symbol, side, data):
+    """Return (probability, expected_return, source_label) for the current setup."""
+    model = _load_ml_gate_model()
+    if not model:
+        return None, None, "none"
+
+    feats = _extract_ml_entry_features(symbol, side, data)
+    order = list(model.get("feature_order") or [])
+    weights = list(model.get("weights") or [])
+    stats = model.get("feature_stats") or {}
+
+    linear = _safe_float_num(model.get("bias", 0.0), 0.0)
+    for idx, name in enumerate(order):
+        val = _safe_float_num(feats.get(name, 0.0), 0.0)
+        st = stats.get(name) if isinstance(stats, dict) else None
+        if isinstance(st, dict):
+            mean = _safe_float_num(st.get("mean", 0.0), 0.0)
+            std = abs(_safe_float_num(st.get("std", 1.0), 1.0))
+            if std > 1e-9:
+                val = (val - mean) / std
+        linear += _safe_float_num(weights[idx], 0.0) * val
+
+    probability = _ml_sigmoid(linear)
+
+    expected_return = None
+    er = model.get("expected_return")
+    if isinstance(er, dict):
+        er_order = er.get("feature_order") if isinstance(er.get("feature_order"), list) else order
+        er_weights = er.get("weights") if isinstance(er.get("weights"), list) else []
+        if len(er_order) == len(er_weights) and len(er_order) > 0:
+            er_linear = _safe_float_num(er.get("bias", 0.0), 0.0)
+            for idx, name in enumerate(er_order):
+                er_linear += _safe_float_num(er_weights[idx], 0.0) * _safe_float_num(feats.get(name, 0.0), 0.0)
+            expected_return = er_linear
+
+    return probability, expected_return, "json_model"
+
+
+def _run_auto_retrain_job(trigger_reason=""):
+    """Run model training in background without blocking scan/execution loops."""
+    cmd = [
+        sys.executable,
+        "train_entry_model.py",
+        "--source", str(AUTO_RETRAIN_SOURCE or "csv"),
+        "--input", str(AUTO_RETRAIN_INPUT_PATH or "trade_results.csv"),
+        "--output", str(AUTO_RETRAIN_OUTPUT_PATH or "models/entry_model.json"),
+        "--min-samples", str(max(5, int(AUTO_RETRAIN_MIN_SAMPLES))),
+    ]
+
+    started = datetime.now(central)
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=os.getcwd(),
+            timeout=300,
+        )
+        ok = proc.returncode == 0
+        stdout_tail = (proc.stdout or "").strip().splitlines()[-1:] if proc.stdout else []
+        stderr_tail = (proc.stderr or "").strip().splitlines()[-1:] if proc.stderr else []
+        summary = " ".join(stdout_tail + stderr_tail).strip()
+        if ok:
+            log(
+                f"[AUTO-RETRAIN] Model refresh succeeded"
+                f" ({trigger_reason or 'periodic'}) in "
+                f"{int((datetime.now(central) - started).total_seconds())}s."
+                f" {summary}"
+            )
+        else:
+            log(
+                f"[AUTO-RETRAIN] Model refresh failed (code={proc.returncode})"
+                f" ({trigger_reason or 'periodic'}). {summary}"
+            )
+    except Exception as e:
+        ok = False
+        summary = str(e)
+        log(f"[AUTO-RETRAIN] Model refresh exception: {e}")
+
+    with _auto_retrain_lock:
+        _auto_retrain_state["running"] = False
+        _auto_retrain_state["last_run_at"] = datetime.now(central)
+        _auto_retrain_state["last_status"] = "ok" if ok else f"error: {summary}"
+        if ok:
+            _auto_retrain_state["last_closed_count"] = int(_auto_retrain_state.get("closed_count", 0))
+
+
+def maybe_trigger_auto_retrain(trigger_reason=""):
+    """Schedule non-blocking model retraining when enough new closed trades accumulate."""
+    if not AUTO_RETRAIN_MODEL_ENABLED:
+        return
+
+    now_ct = datetime.now(central)
+    with _auto_retrain_lock:
+        if _auto_retrain_state.get("running", False):
+            return
+
+        last_run_at = _auto_retrain_state.get("last_run_at")
+        if isinstance(last_run_at, datetime):
+            elapsed = (now_ct - last_run_at).total_seconds()
+            if elapsed < max(60, AUTO_RETRAIN_COOLDOWN_MINUTES * 60):
+                return
+
+        closed_count = int(_auto_retrain_state.get("closed_count", 0))
+        last_closed_count = int(_auto_retrain_state.get("last_closed_count", 0))
+        need = max(1, int(AUTO_RETRAIN_MIN_NEW_CLOSED_TRADES))
+        if (closed_count - last_closed_count) < need:
+            return
+
+        _auto_retrain_state["running"] = True
+
+    thread = threading.Thread(
+        target=_run_auto_retrain_job,
+        kwargs={"trigger_reason": trigger_reason},
+        daemon=True,
+        name="auto-ml-retrain",
+    )
+    thread.start()
+
+
 def _parse_datetime_any(value):
     """Parse common date/datetime strings into central timezone, or None."""
     raw = str(value or "").strip()
@@ -3639,6 +3877,9 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
 
     _open_trades.pop(trade["contract"], None)
 
+    with _auto_retrain_lock:
+        _auto_retrain_state["closed_count"] = int(_auto_retrain_state.get("closed_count", 0)) + 1
+
     # 30-minute cooldown before the same (symbol, side) can re-alert.
     # Prevents same-day whipsaw but allows re-entry after the lockout expires.
     alert_key = (trade["underlying"], trade.get("side", trade["signal"].split()[-1]))
@@ -3646,6 +3887,8 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     # Clear the alert lock so the symbol can re-alert after cooldown.
     # The ignition gate prevents immediate re-chasing — no need to block all day.
     _alerted_today["keys"].discard(alert_key)
+
+    maybe_trigger_auto_retrain(trigger_reason=f"closed:{trade.get('underlying', 'UNKNOWN')}")
 
     log(f"[{trade['underlying']}] Closed {trade['contract']} ({reason}, {pnl_pct * 100:+.2f}%)")
 
@@ -4238,6 +4481,32 @@ def run_symbol(client, symbol):
     data["macro_penalty"] = macro_penalty
     data["effective_score"] = effective_score
 
+    if ML_GATE_ENABLED and (not NO_GATING_MODE):
+        ml_prob, ml_exp_ret, ml_source = _predict_ml_entry(symbol, side, data)
+        data["ml_probability"] = ml_prob
+        data["ml_expected_return"] = ml_exp_ret
+        data["ml_source"] = ml_source
+
+        if ml_prob is None:
+            if ML_GATE_REQUIRE_MODEL:
+                log(f"[{symbol}] ML gate: model unavailable at {ML_GATE_MODEL_PATH} — blocking entry (ML_GATE_REQUIRE_MODEL=1).")
+                return
+            log(f"[{symbol}] ML gate: model unavailable at {ML_GATE_MODEL_PATH} — pass-through (ML_GATE_REQUIRE_MODEL=0).")
+        else:
+            min_prob = max(0.0, min(1.0, ML_MIN_PROBABILITY))
+            if ml_prob < min_prob:
+                log(
+                    f"[{symbol}] ML gate: {side} blocked — win probability {ml_prob:.1%} < {min_prob:.1%} "
+                    f"(source={ml_source})."
+                )
+                return
+            if (ml_exp_ret is not None) and (ml_exp_ret < ML_MIN_EXPECTED_RETURN):
+                log(
+                    f"[{symbol}] ML gate: {side} blocked — expected return {ml_exp_ret:+.3f} "
+                    f"< {ML_MIN_EXPECTED_RETURN:+.3f} (source={ml_source})."
+                )
+                return
+
     # ── Anti-chase filters ───────────────────────────────────────────────────
     # Avoid buying when price is already too extended away from VWAP, and avoid
     # entering when the latest candle already flipped against our side.
@@ -4289,6 +4558,15 @@ def run_symbol(client, symbol):
             f"(\u0394 BULL {data['bull_score'] - data['bull_10m']:+d})"
         )
     trend_block = "\n".join(trend_lines) if trend_lines else "(insufficient history)"
+    ml_prob = data.get("ml_probability")
+    ml_exp_ret = data.get("ml_expected_return")
+    ml_source = str(data.get("ml_source", "disabled") or "disabled")
+    if ml_prob is None:
+        ml_block = "ML gate not active for this setup"
+    else:
+        prob_txt = f"{(float(ml_prob) * 100.0):.1f}%"
+        exp_txt = "n/a" if ml_exp_ret is None else f"{float(ml_exp_ret):+.3f}"
+        ml_block = f"Prob: `{prob_txt}` | Expected Return: `{exp_txt}` | Source: `{ml_source}`"
 
     message = f"""
 {header}
@@ -4306,6 +4584,9 @@ Volume / OI: `{option['volume']}` / `{option['open_interest']}`
 
 **Score Components**
 {checklist}
+
+**ML Overlay**
+{ml_block}
 
 **Score Trend**
 {trend_block}
@@ -4366,6 +4647,16 @@ def main():
             log(f"Opening no-trade window remains enforced for first {OPENING_NO_TRADE_MINUTES}m after open.")
         else:
             log("Opening no-trade window bypassed in NO_GATING_MODE.")
+
+    if AUTO_RETRAIN_MODEL_ENABLED:
+        log(
+            "Auto-retrain enabled: "
+            f"source={AUTO_RETRAIN_SOURCE}, "
+            f"min_new_closed={max(1, AUTO_RETRAIN_MIN_NEW_CLOSED_TRADES)}, "
+            f"cooldown={max(1, AUTO_RETRAIN_COOLDOWN_MINUTES)}m, "
+            f"min_samples={max(5, AUTO_RETRAIN_MIN_SAMPLES)}, "
+            f"output={AUTO_RETRAIN_OUTPUT_PATH}"
+        )
 
     init_google_sheets()
 

@@ -1,0 +1,73 @@
+{
+  "feature_order": [
+    "is_call",
+    "is_put",
+    "is_etf",
+    "is_top_stock",
+    "is_aggressive_stock",
+    "effective_score",
+    "raw_score",
+    "macro_penalty",
+    "side_score",
+    "opposite_score",
+    "dominance",
+    "delta_5m",
+    "delta_10m",
+    "momentum",
+    "volume",
+    "regime",
+    "pattern",
+    "momentum_quality",
+    "ema20_slope_pct",
+    "rsi",
+    "vol_ratio",
+    "vwap_extension_pct",
+    "watchlist_promoted"
+  ],
+  "weights": [
+    0.0,
+    0.0,
+    -0.1,
+    0.1,
+    -0.1,
+    0.02,
+    0.0,
+    -0.06,
+    0.015,
+    -0.01,
+    0.03,
+    0.04,
+    0.02,
+    0.015,
+    0.01,
+    0.01,
+    0.01,
+    0.015,
+    40.0,
+    0.0,
+    0.1,
+    -12.0,
+    0.2
+  ],
+  "bias": -2.0,
+  "threshold": 0.62,
+  "expected_return": {
+    "feature_order": [
+      "effective_score",
+      "dominance",
+      "delta_5m",
+      "momentum_quality",
+      "vwap_extension_pct",
+      "macro_penalty"
+    ],
+    "weights": [
+      0.0008,
+      0.0020,
+      0.0040,
+      0.0015,
+      -0.8,
+      -0.01
+    ],
+    "bias": -0.03
+  }
+}
