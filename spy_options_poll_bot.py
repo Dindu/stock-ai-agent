@@ -108,7 +108,7 @@ SCORE_DOMINANCE = int(os.getenv("SCORE_DOMINANCE", "20"))  # bull must lead bear
 NO_GATING_MODE = os.getenv("NO_GATING_MODE", "0") == "1"
 ENFORCE_OPENING_WINDOW_IN_NO_GATING = os.getenv("ENFORCE_OPENING_WINDOW_IN_NO_GATING", "1") == "1"
 # Stock-only tightening: require a slightly higher effective strong score.
-STOCK_STRONG_SCORE_BONUS = int(os.getenv("STOCK_STRONG_SCORE_BONUS", "5"))
+STOCK_STRONG_SCORE_BONUS = int(os.getenv("STOCK_STRONG_SCORE_BONUS", "3"))
 # Hard score gate control:
 # - When HARD_SCORE_GATE_ENABLED=0, no hard minimum score is enforced.
 # - When NO_GATING_MODE=1, the hard gate is bypassed by default unless
@@ -117,10 +117,11 @@ HARD_SCORE_GATE_ENABLED = os.getenv("HARD_SCORE_GATE_ENABLED", "1") == "1"
 HARD_SCORE_GATE_IN_NO_GATING_MODE = os.getenv("HARD_SCORE_GATE_IN_NO_GATING_MODE", "1") == "1"
 # Dynamic hard-gate tuning: adjust required score by real-time regime/momentum quality.
 DYNAMIC_HARD_GATE_ENABLED = os.getenv("DYNAMIC_HARD_GATE_ENABLED", "1") == "1"
-DYNAMIC_HARD_GATE_MAX_RELIEF = int(os.getenv("DYNAMIC_HARD_GATE_MAX_RELIEF", "8"))
+DYNAMIC_HARD_GATE_MAX_RELIEF = int(os.getenv("DYNAMIC_HARD_GATE_MAX_RELIEF", "12"))
 DYNAMIC_HARD_GATE_MAX_PENALTY = int(os.getenv("DYNAMIC_HARD_GATE_MAX_PENALTY", "4"))
 DYNAMIC_HARD_GATE_MIN_FLOOR_ETF = int(os.getenv("DYNAMIC_HARD_GATE_MIN_FLOOR_ETF", "67"))
 DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK = int(os.getenv("DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK", "70"))
+TOP_STOCK_HARD_GATE_MIN_FLOOR = int(os.getenv("TOP_STOCK_HARD_GATE_MIN_FLOOR", "66"))
 # Execution behavior controls.
 # Default: do not auto-execute WATCHLIST setups (alerts-only quality).
 EXECUTE_WATCHLIST_SIGNALS = os.getenv("EXECUTE_WATCHLIST_SIGNALS", "0") == "1"
@@ -128,8 +129,8 @@ EXECUTE_WATCHLIST_SIGNALS = os.getenv("EXECUTE_WATCHLIST_SIGNALS", "0") == "1"
 SELECTIVE_WATCHLIST_EXECUTION_ENABLED = os.getenv("SELECTIVE_WATCHLIST_EXECUTION_ENABLED", "1") == "1"
 WATCHLIST_PROMOTION_MIN_SCORE = int(os.getenv("WATCHLIST_PROMOTION_MIN_SCORE", "56"))
 WATCHLIST_PROMOTION_MIN_DOMINANCE = int(os.getenv("WATCHLIST_PROMOTION_MIN_DOMINANCE", "12"))
-WATCHLIST_PROMOTION_MIN_MOMENTUM = int(os.getenv("WATCHLIST_PROMOTION_MIN_MOMENTUM", "52"))
-WATCHLIST_PROMOTION_MIN_VOLUME = int(os.getenv("WATCHLIST_PROMOTION_MIN_VOLUME", "35"))
+WATCHLIST_PROMOTION_MIN_MOMENTUM = int(os.getenv("WATCHLIST_PROMOTION_MIN_MOMENTUM", "45"))
+WATCHLIST_PROMOTION_MIN_VOLUME = int(os.getenv("WATCHLIST_PROMOTION_MIN_VOLUME", "20"))
 WATCHLIST_PROMOTION_MIN_DELTA_5M = int(os.getenv("WATCHLIST_PROMOTION_MIN_DELTA_5M", "2"))
 # Pre-check options buying power before submitting market BUYs.
 OPTIONS_BP_BUFFER_PCT = float(os.getenv("OPTIONS_BP_BUFFER_PCT", "0.05"))
@@ -1023,12 +1024,28 @@ def dynamic_min_required_score(symbol, side, data):
         elif m["delta_5m"] <= 0:
             penalty += 1
 
+    is_top_stock = str(symbol or "").upper() in TOP_STOCK_SYMBOLS
+    if is_top_stock:
+        if m["dominance"] >= 18:
+            relief += 1
+        if m["delta_5m"] is not None and m["delta_5m"] >= 12:
+            relief += 2
+        if m["momentum"] >= 60 and m["pattern"] >= 60:
+            relief += 1
+        if m["delta_5m"] is not None and m["delta_5m"] >= 18:
+            relief += 2
+
     slope = m["ema20_slope_pct"]
     if (side == "CALL" and slope <= 0) or (side == "PUT" and slope >= 0):
         penalty += 1
 
     adjusted = int(base - min(DYNAMIC_HARD_GATE_MAX_RELIEF, relief) + min(DYNAMIC_HARD_GATE_MAX_PENALTY, penalty))
-    floor = DYNAMIC_HARD_GATE_MIN_FLOOR_ETF if symbol in ETF_SYMBOLS else DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK
+    if symbol in ETF_SYMBOLS:
+        floor = DYNAMIC_HARD_GATE_MIN_FLOOR_ETF
+    elif is_top_stock:
+        floor = TOP_STOCK_HARD_GATE_MIN_FLOOR
+    else:
+        floor = DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK
     return max(int(floor), adjusted)
 
 
@@ -1038,6 +1055,23 @@ def watchlist_execution_confirmed(symbol, side, data):
         return False, "selective watchlist execution disabled"
 
     m = _side_metric_bundle(data, side)
+    is_top_stock = str(symbol or "").upper() in TOP_STOCK_SYMBOLS
+
+    # Fast-moving megacaps can show valid continuation before momentum/volume sub-scores fully normalize.
+    if is_top_stock and m["delta_5m"] is not None:
+        accel_override = (
+            m["side_score"] >= max(WATCHLIST_PROMOTION_MIN_SCORE, SCORE_WATCH + 3)
+            and m["dominance"] >= max(10, WATCHLIST_PROMOTION_MIN_DOMINANCE - 2)
+            and m["delta_5m"] >= max(6, WATCHLIST_PROMOTION_MIN_DELTA_5M + 2)
+            and m["momentum"] >= max(30.0, WATCHLIST_PROMOTION_MIN_MOMENTUM - 12)
+            and m["regime"] >= 60
+        )
+        if accel_override:
+            return True, (
+                f"top-stock acceleration override: score={m['side_score']:.0f}, dom={m['dominance']:.0f}, "
+                f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, d5={m['delta_5m']}"
+            )
+
     if m["side_score"] < WATCHLIST_PROMOTION_MIN_SCORE:
         return False, f"score {m['side_score']:.0f} < {WATCHLIST_PROMOTION_MIN_SCORE}"
     if m["dominance"] < WATCHLIST_PROMOTION_MIN_DOMINANCE:
@@ -1169,6 +1203,30 @@ def _why_now_line(data, side):
     if delta_10m is not None:
         pieces.append(f"10mΔ {delta_10m:+d}")
     return " | ".join(pieces)
+
+
+def _classify_entry_timing(data, side):
+    """Classify entry timing using score trend and directional structure."""
+    side = str(side or "").upper()
+    delta_5m, delta_10m = _score_trend_deltas(data or {}, side)
+    side_score = int((data or {}).get("bull_score", 0)) if side == "CALL" else int((data or {}).get("bear_score", 0))
+    rsi = _safe_float_num((data or {}).get("rsi", 50.0), 50.0)
+
+    if delta_5m is not None and delta_10m is not None and delta_5m >= 8 and delta_10m >= 10:
+        return "EARLY_BREAKOUT"
+
+    if side == "CALL" and rsi >= 70 and (delta_5m is None or delta_5m <= 0):
+        return "LATE_CHASE"
+    if side == "PUT" and rsi <= 30 and (delta_5m is None or delta_5m <= 0):
+        return "LATE_CHASE"
+
+    if side_score >= 80 and delta_5m is not None and delta_5m <= -4:
+        return "LATE_CHASE"
+
+    if delta_5m is not None and delta_5m >= 2:
+        return "TREND_CONTINUATION"
+
+    return "MEAN_REVERSION_RISK"
 
 
 def _tier_rank(tier):
@@ -3003,6 +3061,9 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
     entry_price = fill_price
     side = option.get("side", signal.split()[-1])  # "CALL" or "PUT"
     target_pct, stop_pct = adaptive_target_stop_pcts(data or {})
+    underlying_entry_price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
+    delta_5m, delta_10m = _score_trend_deltas(data or {}, side)
+    entry_timing = _classify_entry_timing(data or {}, side)
     return {
         "underlying": symbol,
         "signal":     signal,
@@ -3022,6 +3083,13 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "partial_target": entry_price * (1 + max(0.01, PARTIAL_TP_PCT)),
         "entry_momentum_quality": _safe_float_num((data or {}).get("momentum_quality", 0.0), 0.0),
         "entry_vol_ratio": _safe_float_num((data or {}).get("vol_ratio", 1.0), 1.0),
+        "underlying_entry_price": underlying_entry_price,
+        "entry_bull_score": int((data or {}).get("bull_score", 0) or 0),
+        "entry_bear_score": int((data or {}).get("bear_score", 0) or 0),
+        "entry_delta_5m": delta_5m,
+        "entry_delta_10m": delta_10m,
+        "entry_rsi": _safe_float_num((data or {}).get("rsi", 50.0), 50.0),
+        "entry_timing": entry_timing,
         "opened_at":  datetime.now(central),
         "status":     "OPEN",
         "entry_message_id": None,
@@ -3638,11 +3706,14 @@ def try_open_paper_trade(symbol, side, option, data):
         news_context_lines.append(f"\U0001f4c8 **Trending Context:** `{trending_news}`")
     news_context_block = "\n".join(news_context_lines)
     why_now_line = _why_now_line(data, trade["side"])
+    entry_timing = str(trade.get("entry_timing", "UNKNOWN") or "UNKNOWN")
+    underlying_entry_price = float(trade.get("underlying_entry_price", data.get("price", 0.0) or 0.0) or 0.0)
 
     entry_msg = send_discord(
         f"\U0001f680 **ENTRY ALERT — {entry_header} | {trade['side']} | ${trade['entry']:.2f} | {expiry_mmdd}**\n\n"
         f"------------------------------\n"
         f"\U0001f4b2 **Current Price:** `${float(data.get('price', 0.0) or 0.0):.2f}`\n"
+        f"\U0001f3af **Underlying Entry:** `${underlying_entry_price:.2f}` | Timing: `{entry_timing}`\n"
         f"\U0001f4ca **Setup:** `{setup}` | Score: `{score_line}` ({grade})\n"
         f"⚡ **Why Now:** `{why_now_line}`\n"
         f"\U0001f3af **Plan:** Entry `${trade['entry']:.2f}` | Partial `${target_1:.2f}` (+{PARTIAL_TP_PCT*100:.0f}%) | "
@@ -3662,6 +3733,7 @@ def try_open_paper_trade(symbol, side, option, data):
         pass
 
     log(f"[{symbol}] Paper trade opened: {trade['contract']} fill ${trade['entry']:.2f} "
+        f"underlying ${underlying_entry_price:.2f} timing={entry_timing} "
         f"target ${trade['target']:.2f} stop ${trade['stop']:.2f}")
     return True
 
