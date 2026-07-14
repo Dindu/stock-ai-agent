@@ -1068,15 +1068,18 @@ def watchlist_execution_confirmed(symbol, side, data):
     )
 
 
-def entry_momentum_continuation_ok(side, data):
+def entry_momentum_continuation_ok(symbol, side, data):
     """Require continuation structure to avoid weak/late entries."""
     if not ENTRY_MOMENTUM_CONTINUATION_FILTER:
         return True, "disabled"
 
     m = _side_metric_bundle(data, side)
-    if m["momentum"] < ENTRY_CONT_MIN_MOMENTUM_SCORE:
+    is_etf = str(symbol or "").upper() in ETF_SYMBOLS
+    # ETF scoring uses the legacy model and does not populate momentum category fields,
+    # so ETF continuation should rely on score-delta + EMA slope instead.
+    if (not is_etf) and m["momentum"] < ENTRY_CONT_MIN_MOMENTUM_SCORE:
         return False, f"momentum {m['momentum']:.1f} < {ENTRY_CONT_MIN_MOMENTUM_SCORE}"
-    if m["momentum_quality"] < ENTRY_CONT_MIN_MOMENTUM_QUALITY:
+    if (not is_etf) and m["momentum_quality"] < ENTRY_CONT_MIN_MOMENTUM_QUALITY:
         return False, f"momentum quality {m['momentum_quality']:.1f} < {ENTRY_CONT_MIN_MOMENTUM_QUALITY}"
     if m["delta_5m"] is None and m["side_score"] < 90:
         return False, "insufficient 5m history"
@@ -1089,6 +1092,9 @@ def entry_momentum_continuation_ok(side, data):
         return False, f"ema20 slope {slope:.5f} < +{min_slope:.5f}"
     if side == "PUT" and slope > -min_slope:
         return False, f"ema20 slope {slope:.5f} > -{min_slope:.5f}"
+
+    if is_etf:
+        return True, f"etf continuation d5={m['delta_5m']}, slope={slope:.5f}"
 
     return True, (
         f"mom={m['momentum']:.1f}, mq={m['momentum_quality']:.1f}, "
@@ -4058,7 +4064,7 @@ def run_symbol(client, symbol):
 
     # Stricter continuation check to avoid late or fading entries.
     if not NO_GATING_MODE:
-        cont_ok, cont_reason = entry_momentum_continuation_ok(side, data)
+        cont_ok, cont_reason = entry_momentum_continuation_ok(symbol, side, data)
         if not cont_ok:
             log(f"[{symbol}] Momentum continuation filter: {side} blocked — {cont_reason}.")
             return
