@@ -3839,6 +3839,7 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         color=DISCORD_COLOR_CALL if pnl_pct > 0 else DISCORD_COLOR_PUT,
     )
 
+    sheets_reason = f"{reason} [{'PROFIT' if pnl_pct > 0 else 'LOSS'} {pnl_pct * 100:+.2f}%]"
     row = {
         "opened_at": trade["opened_at"],
         "closed_at": closed_at,
@@ -3849,7 +3850,7 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         "entry":      trade["entry"],
         "exit":       exit_price,
         "pnl_pct":    pnl_pct * 100,
-        "reason":     reason,
+        "reason":     sheets_reason,
         "score":      trade["score"],
     }
     try:
