@@ -67,7 +67,7 @@ TOP_STOCK_SYMBOLS = {
     "ADBE", "HOOD", "ORCL", "SOFI", "WMT",
 }
 AGGRESSIVE_STOCK_SYMBOLS = {"TSLA", "AMD", "PLTR", "SMCI", "COIN", "SOFI", "GOOGL"}
-DEFAULT_SYMBOLS = "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,META,TSLA,AMD,PLTR,NFLX,GOOGL,AVGO,MSTR,INTC,COIN,SPCX,ADBE,HOOD,ORCL,SOFI,WMT,JPM,BAC,XOM,COST,CRM,UBER,TSM"
+DEFAULT_SYMBOLS = "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,META,TSLA,AMD,PLTR,NFLX,GOOGL,AVGO,MSTR,INTC,COIN,SPCX,ADBE,HOOD,ORCL,SOFI,WMT,JPM,BAC,XOM,COST,CRM,IREN,TSM"
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
 ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")
 ALPACA_TRADING_BASE_URL = os.getenv("ALPACA_TRADING_BASE_URL", "https://paper-api.alpaca.markets")
@@ -1142,7 +1142,14 @@ def entry_momentum_continuation_ok(symbol, side, data):
     # so ETF continuation should rely on score-delta + EMA slope instead.
     if (not is_etf) and m["momentum"] < ENTRY_CONT_MIN_MOMENTUM_SCORE:
         return False, f"momentum {m['momentum']:.1f} < {ENTRY_CONT_MIN_MOMENTUM_SCORE}"
-    if (not is_etf) and m["momentum_quality"] < ENTRY_CONT_MIN_MOMENTUM_QUALITY:
+    # For top stocks where ignition was freshly confirmed with a large delta,
+    # skip the momentum quality check — the ignition burst itself proves momentum.
+    # MQ lags on fast movers because EMA20 slope takes bars to reflect the move.
+    is_top_stock = str(symbol or "").upper() in TOP_STOCK_SYMBOLS
+    ignition_confirmed = bool((data or {}).get("ignition_confirmed", False))
+    ignition_delta = int((data or {}).get("ignition_delta", 0))
+    skip_mq = is_top_stock and ignition_confirmed and ignition_delta >= IGNITION_MIN_DELTA
+    if (not is_etf) and (not skip_mq) and m["momentum_quality"] < ENTRY_CONT_MIN_MOMENTUM_QUALITY:
         return False, f"momentum quality {m['momentum_quality']:.1f} < {ENTRY_CONT_MIN_MOMENTUM_QUALITY}"
     if m["delta_5m"] is None and m["side_score"] < 90:
         return False, "insufficient 5m history"
@@ -3979,7 +3986,7 @@ def try_open_paper_trade(symbol, side, option, data):
 
     setup = "MOMENTUM BREAKOUT" if score >= 90 else "TREND CONTINUATION"
     ai_label = "HIGH" if score >= 90 else "MEDIUM" if score >= 80 else "LOW"
-    grade = "A" if score >= 90 else "B" if score >= 80 else "C"
+    grade = "A" if score >= 90 else "B" if score >= 80 else "C" if score >= 70 else "D"
     stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT)) * 100.0
     target_pct = float(trade.get("target_pct", PROFIT_TARGET_PCT)) * 100.0
     target_1 = float(trade.get("partial_target", trade['entry'] * (1 + max(0.01, PARTIAL_TP_PCT))))
@@ -4019,7 +4026,8 @@ def try_open_paper_trade(symbol, side, option, data):
         f"------------------------------\n"
         f"\U0001f4b2 **Current Price:** `${float(data.get('price', 0.0) or 0.0):.2f}`\n"
         f"\U0001f3af **Underlying Entry:** `${underlying_entry_price:.2f}` | Timing: `{entry_timing}`\n"
-        f"\U0001f4ca **Setup:** `{setup}` | Score: `{score_line}` ({grade})\n"
+        f"\U0001f4ca **Setup:** `{setup}` | Score: `{score_line}`\n"
+        f"\U0001f3c6 **Entry Grade:** `{grade}` {'🟢' if grade == 'A' else '🔵' if grade == 'B' else '🟡' if grade == 'C' else '🔴'}\n"
         f"⚡ **Why Now:** `{why_now_line}`\n"
         f"\U0001f3af **Plan:** Entry `${trade['entry']:.2f}` | Partial `${target_1:.2f}` (+{PARTIAL_TP_PCT*100:.0f}%) | "
         f"Final `${target_2:.2f}` (+{target_pct:.0f}%) | Stop `-{stop_pct:.0f}%`\n"
@@ -4438,6 +4446,10 @@ def run_symbol(client, symbol):
             f"[{symbol}] \U0001f680 Ignition confirmed: {side} score {past_score} \u2192 {now_score} "
             f"(\u0394 +{delta}) over last {IGNITION_LOOKBACK_S}s."
         )
+        # Tag the data dict so downstream filters know ignition was freshly confirmed.
+        if isinstance(data, dict):
+            data["ignition_confirmed"] = True
+            data["ignition_delta"] = int(delta)
 
     # Stricter continuation check to avoid late or fading entries.
     if not NO_GATING_MODE:
