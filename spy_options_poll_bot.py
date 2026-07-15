@@ -192,6 +192,7 @@ AUTO_RETRAIN_MIN_NEW_CLOSED_TRADES = int(os.getenv("AUTO_RETRAIN_MIN_NEW_CLOSED_
 AUTO_RETRAIN_COOLDOWN_MINUTES = int(os.getenv("AUTO_RETRAIN_COOLDOWN_MINUTES", "60"))
 AUTO_RETRAIN_SOURCE = os.getenv("AUTO_RETRAIN_SOURCE", "csv").strip().lower()
 AUTO_RETRAIN_INPUT_PATH = os.getenv("AUTO_RETRAIN_INPUT_PATH", "trade_results.csv")
+AUTO_RETRAIN_SHEET_TAB = os.getenv("AUTO_RETRAIN_SHEET_TAB", "Trades")
 AUTO_RETRAIN_OUTPUT_PATH = os.getenv("AUTO_RETRAIN_OUTPUT_PATH", "models/entry_model.json")
 AUTO_RETRAIN_MIN_SAMPLES = int(os.getenv("AUTO_RETRAIN_MIN_SAMPLES", "20"))
 ALERT_ONLY_COOLDOWN_MINUTES = int(os.getenv("ALERT_ONLY_COOLDOWN_MINUTES", "20"))
@@ -2194,8 +2195,9 @@ def _run_auto_retrain_job(trigger_reason=""):
     cmd = [
         sys.executable,
         "train_entry_model.py",
-        "--source", str(AUTO_RETRAIN_SOURCE or "csv"),
+        "--source", str(AUTO_RETRAIN_SOURCE or "sheets"),
         "--input", str(AUTO_RETRAIN_INPUT_PATH or "trade_results.csv"),
+        "--sheet-tab", str(AUTO_RETRAIN_SHEET_TAB or "Trades"),
         "--output", str(AUTO_RETRAIN_OUTPUT_PATH or "models/entry_model.json"),
         "--min-samples", str(max(5, int(AUTO_RETRAIN_MIN_SAMPLES))),
     ]
