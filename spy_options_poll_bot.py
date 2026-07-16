@@ -258,6 +258,15 @@ MIN_POSITION_QTY  = int(os.getenv("MIN_POSITION_QTY",  "5"))
 MAX_POSITION_QTY  = int(os.getenv("MAX_POSITION_QTY",  "10"))
 CONFIDENCE_POSITIONING = os.getenv("CONFIDENCE_POSITIONING", "1") == "1"
 CONFIDENCE_STEP_SCORE  = int(os.getenv("CONFIDENCE_STEP_SCORE", "5"))
+# Grade-based position sizing: qty scales A(6) → B(4) → C(3) → D(2) by entry score.
+GRADE_BASED_QTY   = os.getenv("GRADE_BASED_QTY",   "1") == "1"
+GRADE_QTY_A       = int(os.getenv("GRADE_QTY_A",    "6"))   # highest confidence
+GRADE_QTY_B       = int(os.getenv("GRADE_QTY_B",    "4"))
+GRADE_QTY_C       = int(os.getenv("GRADE_QTY_C",    "3"))
+GRADE_QTY_D       = int(os.getenv("GRADE_QTY_D",    "2"))   # lowest confidence
+GRADE_SCORE_A     = int(os.getenv("GRADE_SCORE_A",  "95"))  # score >= 95 → A
+GRADE_SCORE_B     = int(os.getenv("GRADE_SCORE_B",  "88"))  # score >= 88 → B
+GRADE_SCORE_C     = int(os.getenv("GRADE_SCORE_C",  "83"))  # score >= 83 → C  (typical gate)
 TRADE_LOG_FILE    = os.getenv("TRADE_LOG_FILE", "trade_results.csv")
 
 # Option quality filters (stock-only tightened defaults; ETFs remain baseline).
@@ -1373,7 +1382,27 @@ def _maybe_send_transition_alert(symbol, data):
 
 
 def position_qty_from_score(score, dominance=0):
-    """Return position size based on score and confidence dominance."""
+    """Return position size based on entry score grade.
+
+    Grade A (score >= GRADE_SCORE_A) -> GRADE_QTY_A  (e.g. 6 contracts)
+    Grade B (score >= GRADE_SCORE_B) -> GRADE_QTY_B  (e.g. 4 contracts)
+    Grade C (score >= GRADE_SCORE_C) -> GRADE_QTY_C  (e.g. 3 contracts)
+    Grade D (below C threshold)      -> GRADE_QTY_D  (e.g. 2 contracts)
+    """
+    if GRADE_BASED_QTY:
+        score_int = int(score)
+        if score_int >= GRADE_SCORE_A:
+            grade, qty = "A", GRADE_QTY_A
+        elif score_int >= GRADE_SCORE_B:
+            grade, qty = "B", GRADE_QTY_B
+        elif score_int >= GRADE_SCORE_C:
+            grade, qty = "C", GRADE_QTY_C
+        else:
+            grade, qty = "D", GRADE_QTY_D
+        log(f"[SIZING] score={score_int} → Grade {grade} → {qty} contracts")
+        return qty
+
+    # Legacy: confidence-boost sizing off score delta.
     base_qty = max(MIN_POSITION_QTY, min(MAX_POSITION_QTY, BASE_POSITION_QTY))
     if not CONFIDENCE_POSITIONING:
         return base_qty
