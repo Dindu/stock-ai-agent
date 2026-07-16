@@ -637,7 +637,10 @@ def update_alert_close_to_sheets(row, trade):
             existing.extend([""] * (needed - len(existing)))
 
         qty = int(row.get("qty", 0) or 0)
-        pnl_dollar = round((float(row["exit"]) - float(row["entry"])) * float(qty) * 100.0, 2)
+        if "_combined_pnl_dollar" in row:
+            pnl_dollar = round(float(row["_combined_pnl_dollar"]), 2)
+        else:
+            pnl_dollar = round((float(row["exit"]) - float(row["entry"])) * float(qty) * 100.0, 2)
         pnl_pct = round(float(row["pnl_pct"]), 2)
         closed_at = row.get("closed_at")
         closed_text = (
@@ -728,7 +731,10 @@ def log_trade_to_sheets(row, trade, final_close=True):
             else ""
         )
         qty = int(row.get("qty", 1) or 1)
-        pnl_dollar = round((row["exit"] - row["entry"]) * 100 * float(max(1, qty)), 2)
+        if "_combined_pnl_dollar" in row:
+            pnl_dollar = round(float(row["_combined_pnl_dollar"]), 2)
+        else:
+            pnl_dollar = round((row["exit"] - row["entry"]) * 100 * float(max(1, qty)), 2)
         pnl_pct = round(row["pnl_pct"], 2)
         trade_id = trade.get("trade_id", "")
         now = datetime.now(central).strftime("%Y-%m-%d %H:%M:%S")
@@ -2745,7 +2751,7 @@ def _rehydrate_perf_from_sheets(today):
         exit_dt = _parse_datetime_any(row[7] if len(row) > 7 else "")
         status = str(row[9] if len(row) > 9 else "").strip().upper()
 
-        if entry_dt and entry_dt.date() == today:
+        if entry_dt and entry_dt.date() == today and status != "PARTIAL":
             snap["entries"] = int(snap.get("entries", 0)) + 1
 
         if status != "CLOSED" or not exit_dt or exit_dt.date() != today:
@@ -2883,8 +2889,13 @@ def _record_trade_open_for_perf(now_ct=None):
     _perf_stats["entries"] = int(_perf_stats.get("entries", 0)) + 1
 
 
-def _record_trade_close_for_perf(trade, exit_price, pnl_pct, now_ct=None):
-    """Record one closed trade in today's in-memory performance counters."""
+def _record_trade_close_for_perf(trade, exit_price, pnl_pct, now_ct=None, final_close=True):
+    """Record one closed trade in today's in-memory performance counters.
+
+    final_close=False: partial exit — contributes to realized dollar P&L but does
+    not increment closed/wins/losses (those are counted once on the final leg).
+    pnl_pct for the final close should be the combined net pnl across all legs.
+    """
     _reset_perf_stats_if_new_day(now_ct)
 
     qty = int(trade.get("qty", 0) or 0)
@@ -2892,6 +2903,16 @@ def _record_trade_close_for_perf(trade, exit_price, pnl_pct, now_ct=None):
     exit_px = float(exit_price or 0.0)
     pnl_dollar = (exit_px - entry_px) * float(max(0, qty)) * 100.0
 
+    # Always accumulate realized dollar P&L (partial exits generate real cash).
+    _perf_stats["realized_pnl_dollar"] = float(_perf_stats.get("realized_pnl_dollar", 0.0)) + pnl_dollar
+
+    if not final_close:
+        # Partial exit: contribute to realized dollar P&L but don't count as a
+        # completed trade; closed/wins/losses are tallied once on the final leg.
+        return
+
+    # Final close: count the trade and use combined pnl_pct for win/loss outcome.
+    _perf_stats["realized_pnl_pct_sum"] = float(_perf_stats.get("realized_pnl_pct_sum", 0.0)) + float(pnl_pct * 100.0)
     _perf_stats["closed"] = int(_perf_stats.get("closed", 0)) + 1
     if pnl_pct > 0:
         _perf_stats["wins"] = int(_perf_stats.get("wins", 0)) + 1
@@ -2907,8 +2928,6 @@ def _record_trade_close_for_perf(trade, exit_price, pnl_pct, now_ct=None):
         if pnl_dollar < float(_perf_stats.get("worst_loss_dollar", 0.0)):
             _perf_stats["worst_loss_dollar"] = pnl_dollar
             _perf_stats["worst_loss_symbol"] = str(trade.get("underlying", "") or "")
-    _perf_stats["realized_pnl_dollar"] = float(_perf_stats.get("realized_pnl_dollar", 0.0)) + pnl_dollar
-    _perf_stats["realized_pnl_pct_sum"] = float(_perf_stats.get("realized_pnl_pct_sum", 0.0)) + float(pnl_pct * 100.0)
 
 
 def maybe_send_hourly_perf_report(now_ct=None):
@@ -3828,8 +3847,28 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
             strike_val = float(parsed_strike)
     strike_text = str(int(strike_val)) if abs(strike_val - int(strike_val)) < 1e-9 else f"{strike_val:.2f}"
     exit_header = f"{trade['underlying']} strike {strike_text}"
-    exit_type_label = "Profit" if pnl_pct > 0 else "Loss"
-    grade = "A" if pnl_pct >= 0.20 else "B" if pnl_pct >= 0.10 else "C" if pnl_pct >= -0.10 else "D"
+
+    # Compute blended (combined) P&L if this is a final close after a partial exit.
+    _prev_partial_qty = int(trade.get("partial_close_qty", 0) or 0)
+    _prev_partial_px = float(trade.get("partial_exit_px", 0.0) or 0.0)
+    _combined_dollar = 0.0
+    combined_pnl_pct = pnl_pct
+    combined_note = ""
+    if final_close and _prev_partial_qty > 0 and _prev_partial_px > 0 and entry_px > 0:
+        _total_orig_qty = close_qty_int + _prev_partial_qty
+        _partial_dollar = (_prev_partial_px - entry_px) * _prev_partial_qty * 100.0
+        _final_dollar = (exit_px - entry_px) * close_qty_int * 100.0
+        _combined_dollar = _partial_dollar + _final_dollar
+        combined_pnl_pct = _combined_dollar / (entry_px * _total_orig_qty * 100.0)
+        _prev_partial_pct = float(trade.get("partial_pnl_pct", 0.0) or 0.0)
+        combined_note = (
+            f"\n\U0001f500 **Partial leg:** `{_prev_partial_pct * 100:+.2f}%` on `{_prev_partial_qty}` contracts"
+            f"\n\U0001f4ca **Net combined:** `${_combined_dollar:+.2f}` (`{combined_pnl_pct * 100:+.2f}%`) on `{_total_orig_qty}` contracts"
+        )
+
+    outcome_label = "PROFIT" if combined_pnl_pct > 0 else "LOSS"
+    exit_type_label = "Profit" if combined_pnl_pct > 0 else "Loss"
+    grade = "A" if combined_pnl_pct >= 0.20 else "B" if combined_pnl_pct >= 0.10 else "C" if combined_pnl_pct >= -0.10 else "D"
 
     send_discord(
         f"\U0001f534 **{exit_type_label} — {exit_header} | {trade['side']} - {pnl_pct * 100:+.2f}%**\n"
@@ -3839,16 +3878,23 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         f"\U0001f4e6 **Qty:** closed `{close_qty_int}/{current_qty}`"
         f" | remaining `{remaining_qty}`\n"
         f"\U0001f4ca **Trade:** `${entry_px:.2f} -> ${exit_px:.2f}` | `{duration_min}m`\n"
-        f"\U0001f4c9 **Result:** `{reason}`\n"
+        f"\U0001f4c9 **Result:** `{reason}`{combined_note}\n"
         f"\U0001f9e0 **Summary:** `{trade['underlying']} {trade['side']} closed by rules`\n"
         f"\U0001f3c6 **Grade:** `{grade}`\n\n"
         f"\U0001f4cc **Outcome:** `{outcome_label} (RULES FOLLOWED)`\n"
         f"Opened: `{trade['opened_at']:%Y-%m-%d %H:%M:%S %Z}`\n"
         f"Closed: `{closed_at:%Y-%m-%d %H:%M:%S %Z}`",
-        color=DISCORD_COLOR_CALL if pnl_pct > 0 else DISCORD_COLOR_PUT,
+        color=DISCORD_COLOR_CALL if combined_pnl_pct > 0 else DISCORD_COLOR_PUT,
     )
 
-    sheets_reason = f"{reason} [{'PROFIT' if pnl_pct > 0 else 'LOSS'} {pnl_pct * 100:+.2f}%]"
+    # Exit Reason in Google Sheets: PROFIT or LOSS with P&L figures only.
+    if final_close and _prev_partial_qty > 0 and _prev_partial_px > 0 and entry_px > 0:
+        _sheets_label = "PROFIT" if combined_pnl_pct > 0 else "LOSS"
+        sheets_reason = f"{_sheets_label} ({combined_pnl_pct * 100:+.2f}% / ${_combined_dollar:+.2f})"
+    else:
+        _leg_dollar = (exit_px - entry_px) * close_qty_int * 100.0
+        _sheets_label = "PROFIT" if pnl_pct > 0 else "LOSS"
+        sheets_reason = f"{_sheets_label} ({pnl_pct * 100:+.2f}% / ${_leg_dollar:+.2f})"
     row = {
         "opened_at": trade["opened_at"],
         "closed_at": closed_at,
@@ -3873,15 +3919,27 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         log(f"CSV write failed: {e}")
 
     if final_close:
-        update_alert_close_to_sheets(row, trade)
-    log_trade_to_sheets(row, trade, final_close=final_close)
+        # Build an alerts/sheets row with combined P&L so Alerts + Trades sheets
+        # reflect the net trade outcome, not just the final leg.
+        combined_row = dict(row)
+        if _prev_partial_qty > 0 and _prev_partial_px > 0 and entry_px > 0:
+            combined_row["pnl_pct"] = round(combined_pnl_pct * 100, 2)
+            combined_row["_combined_pnl_dollar"] = round(_combined_dollar, 2)
+        update_alert_close_to_sheets(combined_row, trade)
+        log_trade_to_sheets(combined_row, trade, final_close=True)
+    else:
+        log_trade_to_sheets(row, trade, final_close=False)
     perf_trade = dict(trade)
     perf_trade["qty"] = close_qty_int
-    _record_trade_close_for_perf(perf_trade, exit_price, pnl_pct, closed_at)
+    _record_trade_close_for_perf(perf_trade, exit_price, combined_pnl_pct, closed_at, final_close=final_close)
 
     if (not final_close) and close_qty_int < current_qty:
         trade["qty"] = max(0, current_qty - close_qty_int)
         trade["partial_taken"] = True
+        # Store partial leg data so the final close can compute combined P&L.
+        trade["partial_close_qty"] = close_qty_int
+        trade["partial_exit_px"] = float(exit_price)
+        trade["partial_pnl_pct"] = pnl_pct
         log(f"[{trade['underlying']}] Partial close executed: {close_qty_int} closed, {trade['qty']} remaining.")
         return
 
