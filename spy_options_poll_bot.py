@@ -287,6 +287,9 @@ ENTRY_PREMIUM_EXCEPTION_SCORE = int(os.getenv("ENTRY_PREMIUM_EXCEPTION_SCORE", "
 ENTRY_PREMIUM_EXCEPTION_MIN_IGNITION_DELTA = int(os.getenv("ENTRY_PREMIUM_EXCEPTION_MIN_IGNITION_DELTA", "20"))
 EARLY_IGNITION_PHASE_FILTER = os.getenv("EARLY_IGNITION_PHASE_FILTER", "1") == "1"
 EARLY_IGNITION_MIN_DELTA_5M = int(os.getenv("EARLY_IGNITION_MIN_DELTA_5M", "2"))
+ENTRY_MIN_IGNITION_DELTA = int(os.getenv("ENTRY_MIN_IGNITION_DELTA", "18"))
+ETF_ENTRY_MIN_OPTION_OI = int(os.getenv("ETF_ENTRY_MIN_OPTION_OI", "8000"))
+STOCK_ENTRY_MIN_OPTION_OI = int(os.getenv("STOCK_ENTRY_MIN_OPTION_OI", "4000"))
 ENTRY_ALLOWED_SETUPS = {
     s.strip().upper()
     for s in os.getenv(
@@ -2156,6 +2159,9 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
     if ENTRY_ALLOWED_SETUPS and entry_timing not in ENTRY_ALLOWED_SETUPS:
         return False, f"setup {entry_timing} not in allowed setups"
 
+    if ignition_delta < ENTRY_MIN_IGNITION_DELTA:
+        return False, f"ignition delta {ignition_delta} < {ENTRY_MIN_IGNITION_DELTA}"
+
     if EARLY_IGNITION_PHASE_FILTER:
         if entry_timing == "LATE_CHASE":
             return False, "late-chase timing"
@@ -2165,6 +2171,11 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
     dte = _safe_int_num((option or {}).get("dte", 0), 0)
     if MAX_DTE > 0 and dte > MAX_DTE:
         return False, f"DTE {dte} > max {MAX_DTE}"
+
+    oi = _safe_int_num((option or {}).get("open_interest", 0), 0)
+    min_oi = ETF_ENTRY_MIN_OPTION_OI if symbol in ETF_SYMBOLS else STOCK_ENTRY_MIN_OPTION_OI
+    if oi < min_oi:
+        return False, f"open interest {oi} < {min_oi}"
 
     bid = _safe_float_num((option or {}).get("bid", 0.0), 0.0)
     max_bid = ETF_MAX_OPTION_BID if symbol in ETF_SYMBOLS else STOCK_MAX_OPTION_BID
