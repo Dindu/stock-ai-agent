@@ -223,7 +223,7 @@ ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
 # Set to 0 to keep the bot in pure alert mode (no orders submitted, no tracking).
 ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "1"
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))  # take-profit at +20%
-STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.20"))  # stop-loss at -20%
+STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.10"))  # stop-loss at -20%
 # Adaptive exit profile (expectancy-focused, not trade-count suppression).
 PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "0.12"))
 PARTIAL_CLOSE_FRACTION = float(os.getenv("PARTIAL_CLOSE_FRACTION", "0.50"))
