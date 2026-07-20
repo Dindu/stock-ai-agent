@@ -102,7 +102,7 @@ CLOSING_NO_TRADE_MINUTES = int(os.getenv("CLOSING_NO_TRADE_MINUTES", "30"))
 LOOKBACK_BARS = 120
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
 MIN_DTE = int(os.getenv("MIN_DTE", "1"))   # Minimum DTE (exclude 0DTE)
-MAX_DTE = int(os.getenv("MAX_DTE", "14"))  # Max DTE window; set <=0 for no upper bound
+MAX_DTE = int(os.getenv("MAX_DTE", "3"))  # Max DTE window; set <=0 for no upper bound
 VOLUME_MULTIPLIER = 1.5
 
 # Scoring thresholds (0-100)
@@ -150,12 +150,13 @@ IGNITION_PRIOR_MAX  = int(os.getenv("IGNITION_PRIOR_MAX",  "74"))  # Block only 
 IGNITION_LOOKBACK_S = int(os.getenv("IGNITION_LOOKBACK_S", "300"))  # how far back to compare (default 5 min)
 IGNITION_DELTA_80_89 = int(os.getenv("IGNITION_DELTA_80_89", "20"))
 IGNITION_DELTA_90_94 = int(os.getenv("IGNITION_DELTA_90_94", "15"))
-IGNITION_DELTA_95_PLUS = int(os.getenv("IGNITION_DELTA_95_PLUS", "0"))
+IGNITION_DELTA_95_PLUS = int(os.getenv("IGNITION_DELTA_95_PLUS", "10"))
 # Continuation override: allow one strong alert even if the trend is already hot,
 # as long as score remains very strong and has not faded over lookback.
 IGNITION_CONTINUATION_ENABLED = os.getenv("IGNITION_CONTINUATION_ENABLED", "1") == "1"
 IGNITION_CONTINUATION_MIN_SCORE = int(os.getenv("IGNITION_CONTINUATION_MIN_SCORE", "85"))
-IGNITION_CONTINUATION_MIN_DELTA = int(os.getenv("IGNITION_CONTINUATION_MIN_DELTA", "0"))
+IGNITION_CONTINUATION_MIN_DELTA = int(os.getenv("IGNITION_CONTINUATION_MIN_DELTA", "10"))
+STRICT_IGNITION_NO_BYPASS = os.getenv("STRICT_IGNITION_NO_BYPASS", "1") == "1"
 
 # RSI exhaustion filter: don't buy CALLs when RSI is overbought or PUTs when oversold.
 # Set RSI_FILTER=0 to disable.
@@ -273,10 +274,19 @@ TRADE_LOG_FILE    = os.getenv("TRADE_LOG_FILE", "trade_results.csv")
 # Option quality filters (stock-only tightened defaults; ETFs remain baseline).
 ETF_MIN_OPTION_BID = float(os.getenv("ETF_MIN_OPTION_BID", "0.15"))
 ETF_MAX_OPTION_SPREAD_PCT = float(os.getenv("ETF_MAX_OPTION_SPREAD_PCT", "0.30"))
+ETF_MAX_OPTION_BID = float(os.getenv("ETF_MAX_OPTION_BID", "8.00"))
 STOCK_MIN_OPTION_BID = float(os.getenv("STOCK_MIN_OPTION_BID", "0.20"))
 STOCK_MAX_OPTION_SPREAD_PCT = float(os.getenv("STOCK_MAX_OPTION_SPREAD_PCT", "0.25"))
+STOCK_MAX_OPTION_BID = float(os.getenv("STOCK_MAX_OPTION_BID", "8.00"))
 STOCK_MIN_OPTION_VOLUME = int(os.getenv("STOCK_MIN_OPTION_VOLUME", "10"))
 STOCK_MIN_OPTION_OPEN_INTEREST = int(os.getenv("STOCK_MIN_OPTION_OPEN_INTEREST", "50"))
+ENTRY_EXPENSIVE_EXTENSION_FILTER = os.getenv("ENTRY_EXPENSIVE_EXTENSION_FILTER", "1") == "1"
+ENTRY_EXPENSIVE_EXTENSION_BID_FLOOR = float(os.getenv("ENTRY_EXPENSIVE_EXTENSION_BID_FLOOR", "4.00"))
+ENTRY_EXPENSIVE_EXTENSION_VWAP_RATIO = float(os.getenv("ENTRY_EXPENSIVE_EXTENSION_VWAP_RATIO", "0.80"))
+ENTRY_PREMIUM_EXCEPTION_SCORE = int(os.getenv("ENTRY_PREMIUM_EXCEPTION_SCORE", "95"))
+ENTRY_PREMIUM_EXCEPTION_MIN_IGNITION_DELTA = int(os.getenv("ENTRY_PREMIUM_EXCEPTION_MIN_IGNITION_DELTA", "20"))
+EARLY_IGNITION_PHASE_FILTER = os.getenv("EARLY_IGNITION_PHASE_FILTER", "1") == "1"
+EARLY_IGNITION_MIN_DELTA_5M = int(os.getenv("EARLY_IGNITION_MIN_DELTA_5M", "2"))
 
 # Google Sheets tracking — bot creates/finds a spreadsheet by name automatically.
 GOOGLE_SPREADSHEET_NAME   = os.getenv("GOOGLE_SPREADSHEET_NAME", "SPY Options Bot Log")
@@ -1497,12 +1507,12 @@ def analyze(df, client, symbol):
     """Compute weighted Bull/Bear scores (0-100) from independent factor groups.
 
     Factor weights:
-        Trend Score       : 25%
-        Momentum Score    : 20%
-        Volume Score      : 15%
+        Trend Score       : 30%
+        Momentum Score    : 25%
+        Volume Score      : 5%
         Market Regime     : 15%
-        Relative Strength : 10%
-        Pattern Quality   : 10%
+        Relative Strength : 5%
+        Pattern Quality   : 15%
         Option Liquidity  : 5% (underlying liquidity proxy pre-contract)
     """
     if len(df) < 55:
@@ -2094,6 +2104,52 @@ def _safe_int_num(v, default=0):
         return int(float(v))
     except Exception:
         return default
+
+
+def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
+    """Final must-pass checklist after an option contract has been selected."""
+    if not option:
+        return False, "missing option contract"
+
+    if STRICT_IGNITION_NO_BYPASS and IGNITION_REQUIRED and not bool((data or {}).get("ignition_confirmed", False)):
+        return False, "ignition not freshly confirmed"
+
+    entry_timing = _classify_entry_timing(data or {}, side)
+    delta_5m, _ = _score_trend_deltas(data or {}, side)
+    ignition_delta = _safe_int_num((data or {}).get("ignition_delta", 0), 0)
+    effective_score = _safe_int_num((data or {}).get("effective_score", (data or {}).get("score", 0)), 0)
+
+    if EARLY_IGNITION_PHASE_FILTER:
+        if entry_timing == "LATE_CHASE":
+            return False, "late-chase timing"
+        if delta_5m is not None and delta_5m < EARLY_IGNITION_MIN_DELTA_5M:
+            return False, f"5m score delta {delta_5m:+d} < +{EARLY_IGNITION_MIN_DELTA_5M}"
+
+    dte = _safe_int_num((option or {}).get("dte", 0), 0)
+    if MAX_DTE > 0 and dte > MAX_DTE:
+        return False, f"DTE {dte} > max {MAX_DTE}"
+
+    bid = _safe_float_num((option or {}).get("bid", 0.0), 0.0)
+    max_bid = ETF_MAX_OPTION_BID if symbol in ETF_SYMBOLS else STOCK_MAX_OPTION_BID
+    if bid > max_bid:
+        exceptional_setup = (
+            effective_score >= ENTRY_PREMIUM_EXCEPTION_SCORE
+            and ignition_delta >= ENTRY_PREMIUM_EXCEPTION_MIN_IGNITION_DELTA
+            and entry_timing == "EARLY_BREAKOUT"
+        )
+        if not exceptional_setup:
+            return False, f"bid ${bid:.2f} > ${max_bid:.2f} max without exceptional early ignition"
+
+    if ENTRY_EXPENSIVE_EXTENSION_FILTER:
+        ext_pct = _safe_float_num((data or {}).get("vwap_extension_pct", 0.0), 0.0)
+        ext_limit = max(0.0, float(max_ext_from_vwap) * max(0.0, ENTRY_EXPENSIVE_EXTENSION_VWAP_RATIO))
+        if bid >= ENTRY_EXPENSIVE_EXTENSION_BID_FLOOR and ext_pct >= ext_limit:
+            return False, (
+                f"expensive late entry: bid ${bid:.2f} with VWAP extension {ext_pct*100:.2f}% "
+                f">= {ext_limit*100:.2f}%"
+            )
+
+    return True, "entry checklist passed"
 
 
 def _ml_sigmoid(x):
@@ -4485,8 +4541,8 @@ def run_symbol(client, symbol):
                     f"[{symbol}] Ignition warmup: using partial history ({len(history)} samples) "
                     f"{past_score} \u2192 {now_score} (\u0394 +{delta})."
                 )
-            elif now_score >= 90:
-                # Perfect-score cold start: allow instead of waiting 5 minutes.
+            elif now_score >= 90 and not STRICT_IGNITION_NO_BYPASS:
+                # Optional perfect-score cold start override when strict ignition is disabled.
                 past_score = now_score
                 delta = 0
                 log(
@@ -4503,11 +4559,17 @@ def run_symbol(client, symbol):
             delta = now_score - past_score
         continuation_override = False
         # Perfect-score override: score ≥ 90 fires regardless of prior level.
-        if now_score >= 90:
+        if now_score >= 90 and not STRICT_IGNITION_NO_BYPASS:
             log(
                 f"[{symbol}] \U0001f525 Perfect-score override: {side} score {now_score} \u2265 90 "
                 "\u2014 ignition gate bypassed."
             )
+        elif now_score >= 90 and STRICT_IGNITION_NO_BYPASS and delta < required_delta:
+            log(
+                f"[{symbol}] Ignition gate: perfect-score bypass disabled — {side} delta only +{delta} "
+                f"(need +{required_delta})."
+            )
+            return
         elif past_score >= IGNITION_PRIOR_MAX:
             if (
                 IGNITION_CONTINUATION_ENABLED
@@ -4640,6 +4702,14 @@ def run_symbol(client, symbol):
         if (not NO_GATING_MODE) and ALERT_ONLY_COOLDOWN_MINUTES > 0:
             _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
         log(f"[{symbol}] {data['signal']} setup detected, but no valid 1DTE+ option found — skipping (real trades only).")
+        return
+
+    entry_ok, entry_reason = entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap)
+    if not entry_ok:
+        if (not NO_GATING_MODE) and ALERT_ONLY_COOLDOWN_MINUTES > 0:
+            _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
+        _alerted_today["keys"].discard(alert_key)
+        log(f"[{symbol}] Entry quality checklist blocked {side} — {entry_reason}.")
         return
 
     emoji = "\U0001f7e2" if side == "CALL" else "\U0001f534"
