@@ -287,6 +287,14 @@ ENTRY_PREMIUM_EXCEPTION_SCORE = int(os.getenv("ENTRY_PREMIUM_EXCEPTION_SCORE", "
 ENTRY_PREMIUM_EXCEPTION_MIN_IGNITION_DELTA = int(os.getenv("ENTRY_PREMIUM_EXCEPTION_MIN_IGNITION_DELTA", "20"))
 EARLY_IGNITION_PHASE_FILTER = os.getenv("EARLY_IGNITION_PHASE_FILTER", "1") == "1"
 EARLY_IGNITION_MIN_DELTA_5M = int(os.getenv("EARLY_IGNITION_MIN_DELTA_5M", "2"))
+ENTRY_ALLOWED_SETUPS = {
+    s.strip().upper()
+    for s in os.getenv(
+        "ENTRY_ALLOWED_SETUPS",
+        "EARLY_BREAKOUT,FIRST_PULLBACK,VWAP_RECLAIM,MOMENTUM_CONTINUATION,BREAKDOWN,BREAKDOWN_RETEST,VWAP_REJECT",
+    ).split(",")
+    if s.strip()
+}
 
 # Google Sheets tracking — bot creates/finds a spreadsheet by name automatically.
 GOOGLE_SPREADSHEET_NAME   = os.getenv("GOOGLE_SPREADSHEET_NAME", "SPY Options Bot Log")
@@ -393,12 +401,12 @@ _ALERTS_HEADERS = [
     "Score Components",
     "VWAP", "EMA20", "EMA50", "PDH", "PDL", "Recent High", "Recent Low",
     "Bar Volume", "Bar Vol Avg",
-    "Trade Status", "P&L ($)", "P&L %", "Exit Reason", "Closed At (CT)", "Updated At (CT)",
+    "Trade Status", "P&L ($)", "P&L %", "Exit Reason", "Closed At (CT)", "Updated At (CT)", "Setup Type",
 ]
 _TRADES_HEADERS = [
     "Trade ID", "Symbol", "Entry Price", "Exit Price", "Strike", "Direction",
     "Entry Time", "Exit Time", "Exit Reason", "Status", "Options Expiration",
-    "Alpaca Order ID", "P&L", "P&L %", "Duration", "Created At", "Updated At",
+    "Alpaca Order ID", "P&L", "P&L %", "Duration", "Created At", "Updated At", "Setup Type",
 ]
 
 
@@ -596,6 +604,7 @@ def log_alert_to_sheets(symbol, data, option):
             "",
             "",
             now_ct,
+            str(data.get("setup_type", _classify_entry_timing(data, data.get("side", ""))) or "UNKNOWN"),
         ]
         ws = _gsheet.worksheet("Alerts")
         ws.append_row(row, value_input_option="USER_ENTERED")
@@ -723,6 +732,7 @@ def log_trade_open_to_sheets(trade):
             "",                                                 # Duration
             opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),  # Created At
             opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),  # Updated At
+            trade.get("setup_type", trade.get("entry_timing", "UNKNOWN")),
         ]
         ws = _gsheet.worksheet("Trades")
         ws.append_row(sheet_row, value_input_option="USER_ENTERED")
@@ -777,6 +787,7 @@ def log_trade_to_sheets(row, trade, final_close=True):
             duration,                                           # Duration (min)
             opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),  # Created At
             now,                                                # Updated At
+            trade.get("setup_type", trade.get("entry_timing", "UNKNOWN")),
         ]
 
         ws = _gsheet.worksheet("Trades")
@@ -1269,14 +1280,37 @@ def _why_now_line(data, side):
 
 
 def _classify_entry_timing(data, side):
-    """Classify entry timing using score trend and directional structure."""
+    """Classify the setup type using score trend and directional structure."""
     side = str(side or "").upper()
     delta_5m, delta_10m = _score_trend_deltas(data or {}, side)
     side_score = int((data or {}).get("bull_score", 0)) if side == "CALL" else int((data or {}).get("bear_score", 0))
     rsi = _safe_float_num((data or {}).get("rsi", 50.0), 50.0)
+    price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
+    vwap = _safe_float_num((data or {}).get("vwap", 0.0), 0.0)
+    ema20 = _safe_float_num((data or {}).get("ema20", 0.0), 0.0)
+    recent_high = _safe_float_num((data or {}).get("recent_high", 0.0), 0.0)
+    recent_low = _safe_float_num((data or {}).get("recent_low", 0.0), 0.0)
+    ext_pct = _safe_float_num((data or {}).get("vwap_extension_pct", 0.0), 0.0)
+    vwap_distance_prev = _safe_float_num((data or {}).get("vwap_distance_prev", 0.0), 0.0)
+    bullish_candle = bool((data or {}).get("bullish_candle", False))
+    bearish_candle = bool((data or {}).get("bearish_candle", False))
+    moving_away_bullish = bool(price > vwap and (price - vwap) > vwap_distance_prev)
+    moving_away_bearish = bool(price < vwap and (price - vwap) < vwap_distance_prev)
 
-    if delta_5m is not None and delta_10m is not None and delta_5m >= 8 and delta_10m >= 10:
+    if side == "CALL" and delta_5m is not None and delta_10m is not None and delta_5m >= 8 and delta_10m >= 10 and price >= recent_high and bullish_candle and moving_away_bullish:
         return "EARLY_BREAKOUT"
+    if side == "PUT" and delta_5m is not None and delta_10m is not None and delta_5m >= 8 and delta_10m >= 10 and price <= recent_low and bearish_candle and moving_away_bearish:
+        return "BREAKDOWN"
+
+    if side == "CALL" and price > vwap and vwap_distance_prev <= 0 and bullish_candle and delta_5m is not None and delta_5m >= 2:
+        return "VWAP_RECLAIM"
+    if side == "PUT" and price < vwap and vwap_distance_prev >= 0 and bearish_candle and delta_5m is not None and delta_5m >= 2:
+        return "VWAP_REJECT"
+
+    if side == "CALL" and price > ema20 and price > vwap and bullish_candle and ext_pct <= (MAX_EXT_FROM_VWAP * 0.60) and delta_5m is not None and 2 <= delta_5m <= 7:
+        return "FIRST_PULLBACK"
+    if side == "PUT" and price < ema20 and price < vwap and bearish_candle and ext_pct <= (MAX_EXT_FROM_VWAP * 0.60) and delta_5m is not None and 2 <= delta_5m <= 7:
+        return "BREAKDOWN_RETEST"
 
     if side == "CALL" and rsi >= 70 and (delta_5m is None or delta_5m <= 0):
         return "LATE_CHASE"
@@ -1287,7 +1321,7 @@ def _classify_entry_timing(data, side):
         return "LATE_CHASE"
 
     if delta_5m is not None and delta_5m >= 2:
-        return "TREND_CONTINUATION"
+        return "MOMENTUM_CONTINUATION"
 
     return "MEAN_REVERSION_RISK"
 
@@ -2118,6 +2152,9 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
     delta_5m, _ = _score_trend_deltas(data or {}, side)
     ignition_delta = _safe_int_num((data or {}).get("ignition_delta", 0), 0)
     effective_score = _safe_int_num((data or {}).get("effective_score", (data or {}).get("score", 0)), 0)
+
+    if ENTRY_ALLOWED_SETUPS and entry_timing not in ENTRY_ALLOWED_SETUPS:
+        return False, f"setup {entry_timing} not in allowed setups"
 
     if EARLY_IGNITION_PHASE_FILTER:
         if entry_timing == "LATE_CHASE":
@@ -3503,6 +3540,7 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "entry_delta_10m": delta_10m,
         "entry_rsi": _safe_float_num((data or {}).get("rsi", 50.0), 50.0),
         "entry_timing": entry_timing,
+        "setup_type": entry_timing,
         "opened_at":  datetime.now(central),
         "status":     "OPEN",
         "entry_message_id": None,
@@ -4130,7 +4168,7 @@ def try_open_paper_trade(symbol, side, option, data):
         trade["alerts_row"] = int(alert_row)
     log_trade_open_to_sheets(trade)
 
-    setup = "MOMENTUM BREAKOUT" if score >= 90 else "TREND CONTINUATION"
+    setup = str(trade.get("setup_type", trade.get("entry_timing", "UNKNOWN")) or "UNKNOWN")
     ai_label = "HIGH" if score >= 90 else "MEDIUM" if score >= 80 else "LOW"
     grade = "A" if score >= 90 else "B" if score >= 80 else "C" if score >= 70 else "D"
     stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT)) * 100.0
