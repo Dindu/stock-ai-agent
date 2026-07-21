@@ -612,7 +612,8 @@ def log_alert_to_sheets(symbol, data, option):
         ws = _gsheet.worksheet("Alerts")
         ws.append_row(row, value_input_option="USER_ENTERED")
         alert_row = len(ws.col_values(1))
-        log(f"[{symbol}] Alert logged to Google Sheets.")
+        oi = _safe_int_num((option or {}).get("open_interest", 0), 0)
+        log(f"[{symbol}] Alert logged to Google Sheets (ignition={delta:+d} OI={oi:,}).")
         return alert_row
     except Exception as e:
         log(f"[{symbol}] Google Sheets alert log failed: {e}")
@@ -737,11 +738,14 @@ def log_trade_open_to_sheets(trade):
             opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),  # Updated At
             trade.get("setup_type", trade.get("entry_timing", "UNKNOWN")),
         ]
+        # Store entry_ignition_delta and entry_option_oi for future analysis
+        trade["sheets_entry_ignition"] = trade.get("entry_ignition_delta", 0)
+        trade["sheets_entry_oi"] = trade.get("entry_option_oi", 0)
         ws = _gsheet.worksheet("Trades")
         ws.append_row(sheet_row, value_input_option="USER_ENTERED")
         # Store the row index so close can update it in-place.
         trade["sheets_row"] = len(ws.get_all_values())
-        log(f"[{trade['underlying']}] Trade {trade_id} opened → Google Sheets row {trade['sheets_row']}.")
+        log(f"[{trade['underlying']}] Trade {trade_id} opened → Google Sheets row {trade['sheets_row']} (ignition={trade.get('entry_ignition_delta', 0)} OI={trade.get('entry_option_oi', 0)}).")
     except Exception as e:
         log(f"[{trade['underlying']}] Google Sheets open log failed: {e}")
 
@@ -3525,6 +3529,8 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
     underlying_entry_price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
     delta_5m, delta_10m = _score_trend_deltas(data or {}, side)
     entry_timing = _classify_entry_timing(data or {}, side)
+    ignition_delta = _safe_int_num((data or {}).get("ignition_delta", 0), 0)
+    option_oi = _safe_int_num((option or {}).get("open_interest", 0), 0)
     return {
         "underlying": symbol,
         "signal":     signal,
@@ -3552,6 +3558,8 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "entry_rsi": _safe_float_num((data or {}).get("rsi", 50.0), 50.0),
         "entry_timing": entry_timing,
         "setup_type": entry_timing,
+        "entry_ignition_delta": ignition_delta,
+        "entry_option_oi": option_oi,
         "opened_at":  datetime.now(central),
         "status":     "OPEN",
         "entry_message_id": None,
@@ -4214,6 +4222,8 @@ def try_open_paper_trade(symbol, side, option, data):
     news_context_block = "\n".join(news_context_lines)
     why_now_line = _why_now_line(data, trade["side"])
     entry_timing = str(trade.get("entry_timing", "UNKNOWN") or "UNKNOWN")
+    entry_ignition_delta = int(trade.get("entry_ignition_delta", 0) or 0)
+    entry_option_oi = int(trade.get("entry_option_oi", 0) or 0)
     underlying_entry_price = float(trade.get("underlying_entry_price", data.get("price", 0.0) or 0.0) or 0.0)
 
     entry_msg = send_discord(
@@ -4221,6 +4231,7 @@ def try_open_paper_trade(symbol, side, option, data):
         f"------------------------------\n"
         f"\U0001f4b2 **Current Price:** `${float(data.get('price', 0.0) or 0.0):.2f}`\n"
         f"\U0001f3af **Underlying Entry:** `${underlying_entry_price:.2f}` | Timing: `{entry_timing}`\n"
+        f"⚡ **Ignition:** `{entry_ignition_delta:+d}` | **OI:** `{entry_option_oi:,}`\n"
         f"\U0001f4ca **Setup:** `{setup}` | Score: `{score_line}`\n"
         f"\U0001f3c6 **Entry Grade:** `{grade}` {'🟢' if grade == 'A' else '🔵' if grade == 'B' else '🟡' if grade == 'C' else '🔴'}\n"
         f"⚡ **Why Now:** `{why_now_line}`\n"
@@ -4242,6 +4253,7 @@ def try_open_paper_trade(symbol, side, option, data):
 
     log(f"[{symbol}] Paper trade opened: {trade['contract']} fill ${trade['entry']:.2f} "
         f"underlying ${underlying_entry_price:.2f} timing={entry_timing} "
+        f"ignition={entry_ignition_delta:+d} OI={entry_option_oi:,} "
         f"target ${trade['target']:.2f} stop ${trade['stop']:.2f}")
     return True
 
