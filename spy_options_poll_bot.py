@@ -145,7 +145,7 @@ OPTIONS_BP_BUFFER_PCT = float(os.getenv("OPTIONS_BP_BUFFER_PCT", "0.05"))
 # CALL example: 5 minutes ago BULL was below IGNITION_PRIOR_MAX, now it has gained at least IGNITION_MIN_DELTA.
 # Set IGNITION_REQUIRED=0 in env to disable and revert to absolute-score-only firing.
 IGNITION_REQUIRED   = os.getenv("IGNITION_REQUIRED", "1") == "1"
-IGNITION_MIN_DELTA  = int(os.getenv("IGNITION_MIN_DELTA",  "25"))  # Raised: require a stronger burst to confirm real ignition
+IGNITION_MIN_DELTA  = int(os.getenv("IGNITION_MIN_DELTA",  "15"))  # Relaxed from 25 (was too tight, failing at +15/+25)
 IGNITION_PRIOR_MAX  = int(os.getenv("IGNITION_PRIOR_MAX",  "74"))  # Block only if already at STRONG level (≥75); allows breakouts from 70
 IGNITION_LOOKBACK_S = int(os.getenv("IGNITION_LOOKBACK_S", "300"))  # how far back to compare (default 5 min)
 IGNITION_DELTA_80_89 = int(os.getenv("IGNITION_DELTA_80_89", "20"))
@@ -180,7 +180,7 @@ CANDLE_CONFIRMATION = os.getenv("CANDLE_CONFIRMATION", "1") == "1"
 ENTRY_MOMENTUM_CONTINUATION_FILTER = os.getenv("ENTRY_MOMENTUM_CONTINUATION_FILTER", "1") == "1"
 ENTRY_CONT_MIN_MOMENTUM_SCORE = float(os.getenv("ENTRY_CONT_MIN_MOMENTUM_SCORE", "52"))
 ENTRY_CONT_MIN_DELTA_5M = int(os.getenv("ENTRY_CONT_MIN_DELTA_5M", "1"))
-ENTRY_CONT_MIN_EMA20_SLOPE_PCT = float(os.getenv("ENTRY_CONT_MIN_EMA20_SLOPE_PCT", "0.00015"))
+ENTRY_CONT_MIN_EMA20_SLOPE_PCT = float(os.getenv("ENTRY_CONT_MIN_EMA20_SLOPE_PCT", "0.0001"))  # Relaxed from 0.00015 (was too tight)
 ENTRY_CONT_MIN_MOMENTUM_QUALITY = float(os.getenv("ENTRY_CONT_MIN_MOMENTUM_QUALITY", "8.0"))
 # ML entry gate (optional): model reads current rule-engine features and returns win probability.
 ML_GATE_ENABLED = os.getenv("ML_GATE_ENABLED", "0") == "1"
@@ -287,8 +287,8 @@ ENTRY_PREMIUM_EXCEPTION_SCORE = int(os.getenv("ENTRY_PREMIUM_EXCEPTION_SCORE", "
 ENTRY_PREMIUM_EXCEPTION_MIN_IGNITION_DELTA = int(os.getenv("ENTRY_PREMIUM_EXCEPTION_MIN_IGNITION_DELTA", "20"))
 EARLY_IGNITION_PHASE_FILTER = os.getenv("EARLY_IGNITION_PHASE_FILTER", "1") == "1"
 EARLY_IGNITION_MIN_DELTA_5M = int(os.getenv("EARLY_IGNITION_MIN_DELTA_5M", "2"))
-ENTRY_MIN_IGNITION_DELTA = int(os.getenv("ENTRY_MIN_IGNITION_DELTA", "18"))
-ETF_ENTRY_MIN_OPTION_OI = int(os.getenv("ETF_ENTRY_MIN_OPTION_OI", "8000"))
+ENTRY_MIN_IGNITION_DELTA = int(os.getenv("ENTRY_MIN_IGNITION_DELTA", "15"))  # Relaxed from 18 (was blocking +15 deltas)
+ETF_ENTRY_MIN_OPTION_OI = int(os.getenv("ETF_ENTRY_MIN_OPTION_OI", "5000"))  # Relaxed from 8000 (SPY has 4487 OI)
 STOCK_ENTRY_MIN_OPTION_OI = int(os.getenv("STOCK_ENTRY_MIN_OPTION_OI", "4000"))
 ENTRY_ALLOWED_SETUPS = {
     s.strip().upper()
@@ -1606,6 +1606,28 @@ def analyze(df, client, symbol):
 
     is_etf = symbol in ETF_SYMBOLS
 
+    # Momentum calculation applies to both ETFs and stocks (moved outside if/else).
+    def _clamp01(x):
+        return max(0.0, min(1.0, float(x)))
+
+    def _to_100(x):
+        return _clamp01(x) * 100.0
+
+    # Short-term return proxy for momentum.
+    close_5 = float(df["close"].iloc[-6]) if len(df) >= 6 else price
+    ret_5 = ((price / close_5) - 1.0) if close_5 > 0 else 0.0
+
+    momentum_bull = _to_100((
+        (_clamp01((rsi - 50.0) / 20.0)) * 0.45
+        + (_clamp01(ret_5 / 0.01)) * 0.35
+        + ((1.0 if moving_away_bullish else 0.0) * 0.20)
+    ))
+    momentum_bear = _to_100((
+        (_clamp01((50.0 - rsi) / 20.0)) * 0.45
+        + (_clamp01((-ret_5) / 0.01)) * 0.35
+        + ((1.0 if moving_away_bearish else 0.0) * 0.20)
+    ))
+
     if is_etf:
         # ETFs keep the legacy scoring model unchanged.
         bull_breakdown = {}
@@ -1643,22 +1665,12 @@ def analyze(df, client, symbol):
             bear_score += 10; bear_breakdown["VWAP direction bearish"] = 10
 
         trend_bull = trend_bear = 0.0
-        momentum_bull = momentum_bear = 0.0
         volume_bull = volume_bear = 0.0
         regime_bull = regime_bear = 0.0
         rel_bull = rel_bear = 0.0
         pattern_bull = pattern_bear = 0.0
         option_liq_score = 0.0
     else:
-        def _clamp01(x):
-            return max(0.0, min(1.0, float(x)))
-
-        def _to_100(x):
-            return _clamp01(x) * 100.0
-
-        # Short-term return proxy for momentum.
-        close_5 = float(df["close"].iloc[-6]) if len(df) >= 6 else price
-        ret_5 = ((price / close_5) - 1.0) if close_5 > 0 else 0.0
 
         # Underlying liquidity proxy used before contract lookup.
         dollar_vol_now = price * volume
@@ -1685,17 +1697,6 @@ def analyze(df, client, symbol):
             + (1.0 if price < ema50 else 0.0)
             + (1.0 if ema20_falling else 0.0)
         ) / 4.0)
-
-        momentum_bull = _to_100((
-            (_clamp01((rsi - 50.0) / 20.0)) * 0.45
-            + (_clamp01(ret_5 / 0.01)) * 0.35
-            + ((1.0 if moving_away_bullish else 0.0) * 0.20)
-        ))
-        momentum_bear = _to_100((
-            (_clamp01((50.0 - rsi) / 20.0)) * 0.45
-            + (_clamp01((-ret_5) / 0.01)) * 0.35
-            + ((1.0 if moving_away_bearish else 0.0) * 0.20)
-        ))
 
         volume_bull = _to_100((
             (_clamp01((vol_ratio - 1.0) / 1.0)) * 0.50
