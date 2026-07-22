@@ -336,6 +336,9 @@ _gsheet: "gspread.Spreadsheet | None" = None
 _last_gsheet_init_attempt: "datetime | None" = None
 # Last known SPY VWAP side: 'bull', 'bear', or None (populated by run_symbol each cycle).
 _spy_vwap_cache: "dict" = {"side": None, "updated_at": None}
+# Ignition confirmation buffer: (symbol, side) -> {"score": int, "delta": int, "at": datetime}
+# An ignition must be seen twice (two consecutive scans) before an entry is allowed.
+_ignition_pending: "dict[tuple, dict]" = {}
 # Cached trending stocks and reasons from Alpaca screener/news.
 _trending_cache: "dict" = {"updated_at": None, "symbols": [], "reasons": {}}
 # Cached tradability/profile checks for trending candidates.
@@ -4670,6 +4673,29 @@ def run_symbol(client, symbol):
             f"[{symbol}] \U0001f680 Ignition confirmed: {side} score {past_score} \u2192 {now_score} "
             f"(\u0394 +{delta}) over last {IGNITION_LOOKBACK_S}s."
         )
+
+        # ── Ignition confirmation buffer ─────────────────────────────────────
+        # Require the elevated score to persist for one more polling cycle before
+        # entering. A single-bar spike (e.g. "Higher high" fires once then gone)
+        # will fail this check because the score reverts before the next scan.
+        key = (symbol, side)
+        pending = _ignition_pending.get(key)
+        if pending is None or pending["score"] < now_score - 5:
+            # First time we see this ignition — park it and wait for confirmation.
+            _ignition_pending[key] = {"score": now_score, "delta": int(delta), "at": datetime.now(central)}
+            log(
+                f"[{symbol}] Ignition buffer: {side} score {now_score} (\u0394 +{delta}) parked — "
+                f"waiting for confirmation on next scan before entering."
+            )
+            return
+        else:
+            # Confirmed: score still elevated on a second consecutive scan.
+            age_s = (datetime.now(central) - pending["at"]).total_seconds()
+            log(
+                f"[{symbol}] Ignition buffer confirmed: {side} score still {now_score} after {age_s:.0f}s — proceeding to entry."
+            )
+            _ignition_pending.pop(key, None)
+
         # Tag the data dict so downstream filters know ignition was freshly confirmed.
         if isinstance(data, dict):
             data["ignition_confirmed"] = True
