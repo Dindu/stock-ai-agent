@@ -4619,6 +4619,16 @@ def run_symbol(client, symbol):
                 return
         else:
             delta = now_score - past_score
+
+        # ─── SAFETY: Block entries when momentum is REVERSING (negative delta) ───
+        # Even if score is high, negative delta = exhaustion / late entry risk.
+        if delta < 0 and not NO_GATING_MODE:
+            log(
+                f"[{symbol}] Anti-chase gate: {side} blocked — momentum reversing "
+                f"({past_score} \u2192 {now_score}, \u0394 {delta:+d}). High risk of exhaustion."
+            )
+            return
+
         continuation_override = False
         # Perfect-score override: score ≥ 90 fires regardless of prior level.
         if now_score >= 90 and not STRICT_IGNITION_NO_BYPASS:
