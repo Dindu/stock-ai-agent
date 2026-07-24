@@ -19,6 +19,7 @@ import subprocess
 import threading
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from datetime import datetime, date, timedelta, timezone
 
@@ -97,6 +98,10 @@ WS_SYMBOL_MIN_EVAL_SECONDS = int(os.getenv("WS_SYMBOL_MIN_EVAL_SECONDS", "5"))
 WS_EXIT_CHECK_SECONDS = int(os.getenv("WS_EXIT_CHECK_SECONDS", "5"))
 WS_LOOP_SLEEP_SECONDS = float(os.getenv("WS_LOOP_SLEEP_SECONDS", "0.5"))
 WS_FULL_SCAN_INTERVAL_SECONDS = int(os.getenv("WS_FULL_SCAN_INTERVAL_SECONDS", "30"))
+SCAN_PREFETCH_PARALLEL_ENABLED = os.getenv("SCAN_PREFETCH_PARALLEL_ENABLED", "1") == "1"
+SCAN_PREFETCH_MAX_WORKERS = max(1, int(os.getenv("SCAN_PREFETCH_MAX_WORKERS", "8")))
+ENABLE_SCAN_TIMING_LOGS = os.getenv("ENABLE_SCAN_TIMING_LOGS", "1") == "1"
+SCAN_SYMBOL_LOG_THRESHOLD_MS = float(os.getenv("SCAN_SYMBOL_LOG_THRESHOLD_MS", "250"))
 OPENING_NO_TRADE_MINUTES = int(os.getenv("OPENING_NO_TRADE_MINUTES", "15"))
 CLOSING_NO_TRADE_MINUTES = int(os.getenv("CLOSING_NO_TRADE_MINUTES", "30"))
 LOOKBACK_BARS = 120
@@ -2134,6 +2139,39 @@ def fetch_bars(client, symbol):
 
     bars = bars[["open", "high", "low", "close", "volume"]].tail(LOOKBACK_BARS)
     return bars
+
+
+def prefetch_bars_parallel(client, symbols):
+    """Fetch bars for multiple symbols concurrently to reduce scan latency."""
+    ordered_symbols = list(dict.fromkeys(symbols or []))
+    if not ordered_symbols:
+        return {}
+    started_at = time.perf_counter()
+    if (not SCAN_PREFETCH_PARALLEL_ENABLED) or len(ordered_symbols) == 1:
+        bars_by_symbol = {sym: fetch_bars(client, sym) for sym in ordered_symbols}
+        if ENABLE_SCAN_TIMING_LOGS:
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            log(f"[SCAN] Prefetched {len(ordered_symbols)} symbol(s) serially in {elapsed_ms:.1f}ms.")
+        return bars_by_symbol
+
+    bars_by_symbol = {}
+    max_workers = min(SCAN_PREFETCH_MAX_WORKERS, len(ordered_symbols))
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="bars") as executor:
+        future_map = {executor.submit(fetch_bars, client, sym): sym for sym in ordered_symbols}
+        for future in as_completed(future_map):
+            sym = future_map[future]
+            try:
+                bars_by_symbol[sym] = future.result()
+            except Exception as e:
+                log(f"[{sym}] Parallel bars fetch failed: {type(e).__name__}: {e}")
+                bars_by_symbol[sym] = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    if ENABLE_SCAN_TIMING_LOGS:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        log(
+            f"[SCAN] Prefetched {len(ordered_symbols)} symbol(s) in {elapsed_ms:.1f}ms "
+            f"with {max_workers} worker(s)."
+        )
+    return bars_by_symbol
 
 
 def _alpaca_data_headers():
@@ -4315,6 +4353,7 @@ def run_cycle(client):
     if not market_open_now():
         log("Market closed — skipping.")
         return
+    cycle_started_at = time.perf_counter()
 
     _reset_perf_stats_if_new_day(datetime.now(central))
 
@@ -4333,14 +4372,22 @@ def run_cycle(client):
             symbols_to_scan.append(sym)
 
     symbols_to_scan = _order_symbols_by_priority(symbols_to_scan)
+    prefetched_bars = prefetch_bars_parallel(client, symbols_to_scan)
+    symbol_eval_ms = []
 
     for symbol in symbols_to_scan:
+        symbol_started_at = time.perf_counter()
         try:
-            run_symbol(client, symbol)
+            run_symbol(client, symbol, prefetched_bars=prefetched_bars.get(symbol))
         except Exception:
             log(f"[{symbol}] Cycle error:")
             traceback.print_exc()
             sys.stdout.flush()
+        finally:
+            elapsed_ms = (time.perf_counter() - symbol_started_at) * 1000.0
+            symbol_eval_ms.append(elapsed_ms)
+            if ENABLE_SCAN_TIMING_LOGS and elapsed_ms >= SCAN_SYMBOL_LOG_THRESHOLD_MS:
+                log(f"[SCAN] {symbol} evaluation took {elapsed_ms:.1f}ms.")
 
     try:
         track_open_trades()
@@ -4363,6 +4410,14 @@ def run_cycle(client):
         maybe_send_midday_briefing(client, datetime.now(central))
     except Exception as e:
         log(f"Midday briefing error: {e}")
+
+    if ENABLE_SCAN_TIMING_LOGS:
+        total_ms = (time.perf_counter() - cycle_started_at) * 1000.0
+        avg_ms = (sum(symbol_eval_ms) / len(symbol_eval_ms)) if symbol_eval_ms else 0.0
+        log(
+            f"[SCAN] Poll cycle complete: {len(symbols_to_scan)} symbol(s), "
+            f"avg eval {avg_ms:.1f}ms, total {total_ms:.1f}ms."
+        )
 
 
 async def _on_stock_trade_tick(trade):
@@ -4462,18 +4517,34 @@ def run_websocket_cycle(client):
             next_full_scan_at = now_ct + timedelta(seconds=full_scan_gap)
 
         symbols_to_run = _order_symbols_by_priority(symbols_to_run)
+        prefetched_bars = prefetch_bars_parallel(client, symbols_to_run)
+        batch_started_at = time.perf_counter()
+        symbol_eval_ms = []
 
         for symbol in symbols_to_run:
+            symbol_started_at = time.perf_counter()
             try:
-                run_symbol(client, symbol)
+                run_symbol(client, symbol, prefetched_bars=prefetched_bars.get(symbol))
             except Exception:
                 log(f"[{symbol}] WebSocket cycle error:")
                 traceback.print_exc()
                 sys.stdout.flush()
             finally:
+                elapsed_ms = (time.perf_counter() - symbol_started_at) * 1000.0
+                symbol_eval_ms.append(elapsed_ms)
+                if ENABLE_SCAN_TIMING_LOGS and elapsed_ms >= SCAN_SYMBOL_LOG_THRESHOLD_MS:
+                    log(f"[SCAN] {symbol} evaluation took {elapsed_ms:.1f}ms.")
                 _ws_last_eval_at[symbol] = datetime.now(central)
                 with _ws_pending_lock:
                     _ws_pending_symbols.discard(symbol)
+
+        if ENABLE_SCAN_TIMING_LOGS and symbols_to_run:
+            total_ms = (time.perf_counter() - batch_started_at) * 1000.0
+            avg_ms = (sum(symbol_eval_ms) / len(symbol_eval_ms)) if symbol_eval_ms else 0.0
+            log(
+                f"[SCAN] WebSocket batch complete: {len(symbols_to_run)} symbol(s), "
+                f"avg eval {avg_ms:.1f}ms, total {total_ms:.1f}ms."
+            )
 
         if now_ct >= next_exit_check_at:
             try:
@@ -4502,8 +4573,8 @@ def run_websocket_cycle(client):
         time.sleep(loop_sleep)
 
 
-def run_symbol(client, symbol):
-    bars = fetch_bars(client, symbol)
+def run_symbol(client, symbol, prefetched_bars=None):
+    bars = prefetched_bars if prefetched_bars is not None else fetch_bars(client, symbol)
     log(f"[{symbol}] Fetched {len(bars)} bars.")
     if len(bars) < 55:
         log(f"[{symbol}] Bars: {len(bars)}/55 — warming up.")
