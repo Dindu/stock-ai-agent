@@ -258,6 +258,7 @@ TARGET_OPTION_DELTA_MAX = float(os.getenv("TARGET_OPTION_DELTA_MAX", "0.50"))
 OPTION_RANK_SPREAD_WEIGHT = float(os.getenv("OPTION_RANK_SPREAD_WEIGHT", "0.50"))
 OPTION_RANK_LIQUIDITY_WEIGHT = float(os.getenv("OPTION_RANK_LIQUIDITY_WEIGHT", "0.35"))
 OPTION_RANK_DELTA_WEIGHT = float(os.getenv("OPTION_RANK_DELTA_WEIGHT", "0.15"))
+OPTION_RELAXED_FALLBACK_ALERT_ONLY = os.getenv("OPTION_RELAXED_FALLBACK_ALERT_ONLY", "1") == "1"
 # Legacy profit-protection env vars are retained for backward compatibility,
 # but are intentionally not used in exit logic.
 PROFIT_PROTECT_ARM_PCT = float(os.getenv("PROFIT_PROTECT_ARM_PCT", "0.04"))
@@ -1989,8 +1990,12 @@ def analyze(df, client, symbol):
 
     return side, data
 
-def get_option_contract(symbol, signal, underlying_price):
-    """Fetch the nearest available >=MIN_DTE option contract from Alpaca (live data, no yfinance)."""
+def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_from_vwap=None):
+    """Fetch the best available >=MIN_DTE option contract from Alpaca.
+
+    When ``data`` and ``max_ext_from_vwap`` are provided, run entry-quality prechecks
+    during candidate selection so we rank only contracts that are actually tradeable.
+    """
     if _option_client is None or _trading_client is None:
         print(f"[{symbol}] Option/trading client not initialised — cannot fetch contracts.", flush=True)
         return None
@@ -2074,6 +2079,7 @@ def get_option_contract(symbol, signal, underlying_price):
                 rejection_logged += 1
 
         passed_candidates = []
+        relaxed_fallback_candidates = []
 
         for candidate in contracts:
             contract_sym = candidate.symbol
@@ -2134,7 +2140,7 @@ def get_option_contract(symbol, signal, underlying_price):
                 continue
 
             slippage_est = max(0.0, ask - bid)
-            passed_candidates.append({
+            option_candidate = {
                 "contract":      contract_sym,
                 "expiry":        exp_date.strftime("%Y-%m-%d"),
                 "dte":           dte,
@@ -2148,7 +2154,26 @@ def get_option_contract(symbol, signal, underlying_price):
                 "spread_pct":    spread_pct,
                 "slippage_est":  slippage_est,
                 "side":          signal,  # stored so close_trade can build the alert_key
-            })
+            }
+
+            if data is not None and max_ext_from_vwap is not None:
+                precheck_ok, precheck_reason = entry_contract_quality_ok(
+                    symbol,
+                    signal,
+                    data,
+                    option_candidate,
+                    max_ext_from_vwap,
+                )
+                if not precheck_ok:
+                    option_candidate["_entry_precheck_reason"] = str(precheck_reason)
+                    relaxed_fallback_candidates.append(option_candidate)
+                    _reject(
+                        f"[{symbol}] Contract {contract_sym} rejected — entry-quality precheck failed: "
+                        f"{precheck_reason}."
+                    )
+                    continue
+
+            passed_candidates.append(option_candidate)
 
         if passed_candidates:
             ranked = sorted(passed_candidates, key=option_candidate_rank, reverse=True)
@@ -2161,6 +2186,23 @@ def get_option_contract(symbol, signal, underlying_price):
                 flush=True,
             )
             return best
+
+        if (
+            OPTION_RELAXED_FALLBACK_ALERT_ONLY
+            and data is not None
+            and max_ext_from_vwap is not None
+            and relaxed_fallback_candidates
+        ):
+            ranked_relaxed = sorted(relaxed_fallback_candidates, key=option_candidate_rank, reverse=True)
+            best_relaxed = dict(ranked_relaxed[0])
+            best_relaxed["_selection_mode"] = "RELAXED_FALLBACK"
+            print(
+                f"[{symbol}] Relaxed fallback contract selected for alert-only path: "
+                f"{best_relaxed['contract']} strike={best_relaxed['strike']} expiry={best_relaxed['expiry']} "
+                f"reason={best_relaxed.get('_entry_precheck_reason', 'entry precheck failed')}",
+                flush=True,
+            )
+            return best_relaxed
 
         if rejection_total > rejection_logged:
             print(f"[{symbol}] ... {rejection_total - rejection_logged} additional contract rejection(s) omitted.", flush=True)
@@ -4979,11 +5021,37 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if not NO_GATING_MODE:
         _alerted_today["keys"].add(alert_key)
 
-    option = get_option_contract(symbol, side, data["price"])
+    option = get_option_contract(
+        symbol,
+        side,
+        data["price"],
+        data=data,
+        max_ext_from_vwap=max_ext_from_vwap,
+    )
     if not option:
         if (not NO_GATING_MODE) and ALERT_ONLY_COOLDOWN_MINUTES > 0:
             _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
         log(f"[{symbol}] {data['signal']} setup detected, but no valid 1DTE+ option found — skipping (real trades only).")
+        return
+
+    if str((option or {}).get("_selection_mode", "")).upper() == "RELAXED_FALLBACK":
+        fallback_reason = str((option or {}).get("_entry_precheck_reason", "entry precheck failed") or "entry precheck failed")
+        send_discord(
+            (
+                f"⚠️ **ENTRY WATCHLIST-ONLY — {symbol} {side}**\n\n"
+                f"Selected fallback contract: `{option['contract']}` (strike `{option['strike']}`, expiry `{option['expiry']}`)\n"
+                f"Reason auto-trade blocked: `{fallback_reason}`\n"
+                f"Status: `ALERT ONLY` (no order submitted)"
+            ),
+            color=DISCORD_COLOR_WARN,
+        )
+        if (not NO_GATING_MODE) and ALERT_ONLY_COOLDOWN_MINUTES > 0:
+            _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
+        _alerted_today["keys"].discard(alert_key)
+        log(
+            f"[{symbol}] Relaxed fallback selected {option['contract']} for watchlist-only alert; "
+            f"execution skipped ({fallback_reason})."
+        )
         return
 
     entry_ok, entry_reason = entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap)
