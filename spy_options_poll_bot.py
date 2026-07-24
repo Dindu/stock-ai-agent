@@ -103,6 +103,11 @@ SCAN_PREFETCH_MAX_WORKERS = max(1, int(os.getenv("SCAN_PREFETCH_MAX_WORKERS", "8
 ENABLE_SCAN_TIMING_LOGS = os.getenv("ENABLE_SCAN_TIMING_LOGS", "1") == "1"
 SCAN_SYMBOL_LOG_THRESHOLD_MS = float(os.getenv("SCAN_SYMBOL_LOG_THRESHOLD_MS", "250"))
 OPENING_NO_TRADE_MINUTES = int(os.getenv("OPENING_NO_TRADE_MINUTES", "15"))
+OPENING_EXCEPTION_ENABLED = os.getenv("OPENING_EXCEPTION_ENABLED", "1") == "1"
+OPENING_EXCEPTION_MIN_SCORE = int(os.getenv("OPENING_EXCEPTION_MIN_SCORE", "85"))
+OPENING_EXCEPTION_MIN_DOMINANCE = int(os.getenv("OPENING_EXCEPTION_MIN_DOMINANCE", "50"))
+OPENING_EXCEPTION_MIN_SIDE_DELTA_5M = int(os.getenv("OPENING_EXCEPTION_MIN_SIDE_DELTA_5M", "8"))
+OPENING_EXCEPTION_MIN_VOL_RATIO = float(os.getenv("OPENING_EXCEPTION_MIN_VOL_RATIO", "1.20"))
 CLOSING_NO_TRADE_MINUTES = int(os.getenv("CLOSING_NO_TRADE_MINUTES", "30"))
 LOOKBACK_BARS = 120
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
@@ -119,7 +124,7 @@ SCORE_DOMINANCE = int(os.getenv("SCORE_DOMINANCE", "20"))  # bull must lead bear
 NO_GATING_MODE = os.getenv("NO_GATING_MODE", "0") == "1"
 ENFORCE_OPENING_WINDOW_IN_NO_GATING = os.getenv("ENFORCE_OPENING_WINDOW_IN_NO_GATING", "1") == "1"
 # Stock-only tightening: require a slightly higher effective strong score.
-STOCK_STRONG_SCORE_BONUS = int(os.getenv("STOCK_STRONG_SCORE_BONUS", "5"))
+STOCK_STRONG_SCORE_BONUS = int(os.getenv("STOCK_STRONG_SCORE_BONUS", "3"))
 # Hard score gate control:
 # - When HARD_SCORE_GATE_ENABLED=0, no hard minimum score is enforced.
 # - When NO_GATING_MODE=1, the hard gate is bypassed by default unless
@@ -143,6 +148,8 @@ WATCHLIST_PROMOTION_MIN_DOMINANCE = int(os.getenv("WATCHLIST_PROMOTION_MIN_DOMIN
 WATCHLIST_PROMOTION_MIN_MOMENTUM = int(os.getenv("WATCHLIST_PROMOTION_MIN_MOMENTUM", "35"))
 WATCHLIST_PROMOTION_MIN_VOLUME = int(os.getenv("WATCHLIST_PROMOTION_MIN_VOLUME", "30"))
 WATCHLIST_PROMOTION_MIN_DELTA_5M = int(os.getenv("WATCHLIST_PROMOTION_MIN_DELTA_5M", "2"))
+TOP_STOCK_WATCHLIST_REL_STRENGTH_MIN = float(os.getenv("TOP_STOCK_WATCHLIST_REL_STRENGTH_MIN", "5.0"))
+TOP_STOCK_WATCHLIST_PATTERN_MIN = float(os.getenv("TOP_STOCK_WATCHLIST_PATTERN_MIN", "60.0"))
 # Pre-check options buying power before submitting market BUYs.
 OPTIONS_BP_BUFFER_PCT = float(os.getenv("OPTIONS_BP_BUFFER_PCT", "0.05"))
 
@@ -154,7 +161,7 @@ IGNITION_MIN_DELTA  = int(os.getenv("IGNITION_MIN_DELTA",  "15"))  # Relaxed fro
 IGNITION_PRIOR_MAX  = int(os.getenv("IGNITION_PRIOR_MAX",  "74"))  # Block only if already at STRONG level (≥75); allows breakouts from 70
 IGNITION_LOOKBACK_S = int(os.getenv("IGNITION_LOOKBACK_S", "300"))  # how far back to compare (default 5 min)
 IGNITION_DELTA_80_89 = int(os.getenv("IGNITION_DELTA_80_89", "20"))
-IGNITION_DELTA_90_94 = int(os.getenv("IGNITION_DELTA_90_94", "15"))
+IGNITION_DELTA_90_94 = int(os.getenv("IGNITION_DELTA_90_94", "14"))
 IGNITION_DELTA_95_PLUS = int(os.getenv("IGNITION_DELTA_95_PLUS", "10"))
 # Continuation override: allow one strong alert even if the trend is already hot,
 # as long as score remains very strong and has not faded over lookback.
@@ -1133,6 +1140,40 @@ def dynamic_min_required_score(symbol, side, data):
     return max(int(floor), adjusted)
 
 
+def opening_window_exception_ok(symbol, side, data):
+    """Allow rare opening-window entries only for extreme, liquid opening moves."""
+    if not OPENING_EXCEPTION_ENABLED:
+        return False, "disabled"
+    if symbol not in ETF_SYMBOLS and symbol not in TOP_STOCK_SYMBOLS:
+        return False, "symbol not in ETF/top-stock allowlist"
+    if str((data or {}).get("tier", "")).upper() != "STRONG":
+        return False, "tier not STRONG"
+
+    m = _side_metric_bundle(data, side)
+    side_delta_5m, _ = _score_trend_deltas(data or {}, side)
+    vol_ratio = _safe_float_num((data or {}).get("vol_ratio", 1.0), 1.0)
+    price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
+    vwap = _safe_float_num((data or {}).get("vwap", 0.0), 0.0)
+
+    if m["side_score"] < OPENING_EXCEPTION_MIN_SCORE:
+        return False, f"score {m['side_score']:.0f} < {OPENING_EXCEPTION_MIN_SCORE}"
+    if m["dominance"] < OPENING_EXCEPTION_MIN_DOMINANCE:
+        return False, f"dominance {m['dominance']:.0f} < {OPENING_EXCEPTION_MIN_DOMINANCE}"
+    if side_delta_5m is None or side_delta_5m < OPENING_EXCEPTION_MIN_SIDE_DELTA_5M:
+        return False, f"side 5m delta {side_delta_5m} < {OPENING_EXCEPTION_MIN_SIDE_DELTA_5M}"
+    if vol_ratio < OPENING_EXCEPTION_MIN_VOL_RATIO:
+        return False, f"vol_ratio {vol_ratio:.2f} < {OPENING_EXCEPTION_MIN_VOL_RATIO:.2f}"
+    if side == "CALL" and price <= vwap:
+        return False, "price not above VWAP"
+    if side == "PUT" and price >= vwap:
+        return False, "price not below VWAP"
+
+    return True, (
+        f"score={m['side_score']:.0f}, dom={m['dominance']:.0f}, "
+        f"d5={side_delta_5m}, volx={vol_ratio:.2f}"
+    )
+
+
 def watchlist_execution_confirmed(symbol, side, data):
     """Promote WATCH tier to executable only when continuation quality is strong."""
     if not SELECTIVE_WATCHLIST_EXECUTION_ENABLED:
@@ -1140,6 +1181,10 @@ def watchlist_execution_confirmed(symbol, side, data):
 
     m = _side_metric_bundle(data, side)
     is_top_stock = str(symbol or "").upper() in TOP_STOCK_SYMBOLS
+    rel_strength = _safe_float_num(
+        (data or {}).get("relative_strength_score_bull", 0.0) if side == "CALL" else (data or {}).get("relative_strength_score_bear", 0.0),
+        0.0,
+    )
 
     # Fast-moving megacaps can show valid continuation before momentum/volume sub-scores fully normalize.
     if is_top_stock and m["delta_5m"] is not None:
@@ -1154,6 +1199,22 @@ def watchlist_execution_confirmed(symbol, side, data):
             return True, (
                 f"top-stock acceleration override: score={m['side_score']:.0f}, dom={m['dominance']:.0f}, "
                 f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, d5={m['delta_5m']}"
+            )
+
+        regime_light_override = (
+            m["side_score"] >= max(WATCHLIST_PROMOTION_MIN_SCORE - 1, SCORE_WATCH + 2)
+            and m["dominance"] >= max(10, WATCHLIST_PROMOTION_MIN_DOMINANCE - 2)
+            and m["delta_5m"] >= max(4, WATCHLIST_PROMOTION_MIN_DELTA_5M + 1)
+            and m["momentum"] >= max(30.0, WATCHLIST_PROMOTION_MIN_MOMENTUM - 12)
+            and m["volume"] >= max(25.0, WATCHLIST_PROMOTION_MIN_VOLUME - 5)
+            and rel_strength >= TOP_STOCK_WATCHLIST_REL_STRENGTH_MIN
+            and m["pattern"] >= TOP_STOCK_WATCHLIST_PATTERN_MIN
+        )
+        if regime_light_override:
+            return True, (
+                f"top-stock regime-light override: score={m['side_score']:.0f}, dom={m['dominance']:.0f}, "
+                f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, rel={rel_strength:.1f}, "
+                f"pattern={m['pattern']:.1f}, d5={m['delta_5m']}"
             )
 
     if m["side_score"] < WATCHLIST_PROMOTION_MIN_SCORE:
@@ -4659,11 +4720,18 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if enforce_opening_window:
         opening_block_minutes = opening_no_trade_minutes_remaining()
         if opening_block_minutes > 0:
-            log(
-                f"[{symbol}] Opening volatility filter: skipping {data['signal']} during first "
-                f"{OPENING_NO_TRADE_MINUTES}m after open ({opening_block_minutes}m remaining)."
-            )
-            return
+            opening_ok, opening_reason = opening_window_exception_ok(symbol, side, data)
+            if opening_ok:
+                log(
+                    f"[{symbol}] Opening volatility override: allowing {data['signal']} during first "
+                    f"{OPENING_NO_TRADE_MINUTES}m after open — {opening_reason}."
+                )
+            else:
+                log(
+                    f"[{symbol}] Opening volatility filter: skipping {data['signal']} during first "
+                    f"{OPENING_NO_TRADE_MINUTES}m after open ({opening_block_minutes}m remaining; {opening_reason})."
+                )
+                return
 
     # One STRONG CALL alert and one STRONG PUT alert max per (symbol, side) per day.
     # After a trade closes, a cooldown allows the same setup to re-trigger.
