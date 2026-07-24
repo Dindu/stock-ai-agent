@@ -3738,6 +3738,11 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "max_pnl_pct": 0.0,
         "partial_taken": False,
         "partial_target": entry_price * (1 + max(0.01, PARTIAL_TP_PCT)),
+        "partial_close_qty": 0,
+        "partial_exit_px": 0.0,
+        "partial_pnl_pct": 0.0,
+        "partial_realized_dollar": 0.0,
+        "partial_realized_cost": 0.0,
         "entry_momentum_quality": _safe_float_num((data or {}).get("momentum_quality", 0.0), 0.0),
         "entry_vol_ratio": _safe_float_num((data or {}).get("vol_ratio", 1.0), 1.0),
         "underlying_entry_price": underlying_entry_price,
@@ -3896,6 +3901,11 @@ def sync_open_trades_from_alpaca():
             "max_pnl_pct": prev.get("max_pnl_pct", 0.0) if prev else 0.0,
             "partial_taken": bool(prev.get("partial_taken", False)) if prev else False,
             "partial_target": prev.get("partial_target", p["entry"] * (1 + max(0.01, PARTIAL_TP_PCT))) if prev else p["entry"] * (1 + max(0.01, PARTIAL_TP_PCT)),
+            "partial_close_qty": int(prev.get("partial_close_qty", 0) or 0) if prev else 0,
+            "partial_exit_px": float(prev.get("partial_exit_px", 0.0) or 0.0) if prev else 0.0,
+            "partial_pnl_pct": float(prev.get("partial_pnl_pct", 0.0) or 0.0) if prev else 0.0,
+            "partial_realized_dollar": float(prev.get("partial_realized_dollar", 0.0) or 0.0) if prev else 0.0,
+            "partial_realized_cost": float(prev.get("partial_realized_cost", 0.0) or 0.0) if prev else 0.0,
             "entry_momentum_quality": prev.get("entry_momentum_quality", 0.0) if prev else 0.0,
             "entry_vol_ratio": prev.get("entry_vol_ratio", 1.0) if prev else 1.0,
             "opened_at": prev.get("opened_at", datetime.now(central)) if prev else datetime.now(central),
@@ -4184,16 +4194,27 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     # Compute blended (combined) P&L if this is a final close after a partial exit.
     _prev_partial_qty = int(trade.get("partial_close_qty", 0) or 0)
     _prev_partial_px = float(trade.get("partial_exit_px", 0.0) or 0.0)
+    _prev_partial_dollar = float(trade.get("partial_realized_dollar", 0.0) or 0.0)
+    _prev_partial_cost = float(trade.get("partial_realized_cost", 0.0) or 0.0)
     _combined_dollar = 0.0
+    _combined_cost = 0.0
     combined_pnl_pct = pnl_pct
     combined_note = ""
-    if final_close and _prev_partial_qty > 0 and _prev_partial_px > 0 and entry_px > 0:
+    if final_close and _prev_partial_qty > 0 and entry_px > 0:
+        # Backward compatibility for trades opened before cumulative partial
+        # accounting fields were introduced.
+        if (_prev_partial_cost <= 0 or _prev_partial_dollar == 0.0) and _prev_partial_px > 0:
+            _prev_partial_dollar = (_prev_partial_px - entry_px) * _prev_partial_qty * 100.0
+            _prev_partial_cost = entry_px * _prev_partial_qty * 100.0
+
         _total_orig_qty = close_qty_int + _prev_partial_qty
-        _partial_dollar = (_prev_partial_px - entry_px) * _prev_partial_qty * 100.0
         _final_dollar = (exit_px - entry_px) * close_qty_int * 100.0
-        _combined_dollar = _partial_dollar + _final_dollar
-        combined_pnl_pct = _combined_dollar / (entry_px * _total_orig_qty * 100.0)
-        _prev_partial_pct = float(trade.get("partial_pnl_pct", 0.0) or 0.0)
+        _final_cost = entry_px * close_qty_int * 100.0
+        _combined_dollar = _prev_partial_dollar + _final_dollar
+        _combined_cost = _prev_partial_cost + _final_cost
+        if _combined_cost > 0:
+            combined_pnl_pct = _combined_dollar / _combined_cost
+        _prev_partial_pct = (_prev_partial_dollar / _prev_partial_cost) if _prev_partial_cost > 0 else float(trade.get("partial_pnl_pct", 0.0) or 0.0)
         combined_note = (
             f"\n\U0001f500 **Partial leg:** `{_prev_partial_pct * 100:+.2f}%` on `{_prev_partial_qty}` contracts"
             f"\n\U0001f4ca **Net combined:** `${_combined_dollar:+.2f}` (`{combined_pnl_pct * 100:+.2f}%`) on `{_total_orig_qty}` contracts"
@@ -4221,7 +4242,7 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     )
 
     # Exit Reason in Google Sheets: PROFIT or LOSS with P&L figures only.
-    if final_close and _prev_partial_qty > 0 and _prev_partial_px > 0 and entry_px > 0:
+    if final_close and _prev_partial_qty > 0 and _combined_cost > 0:
         _sheets_label = "PROFIT" if combined_pnl_pct > 0 else "LOSS"
         sheets_reason = f"{_sheets_label} ({combined_pnl_pct * 100:+.2f}% / ${_combined_dollar:+.2f})"
     else:
@@ -4255,7 +4276,7 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         # Build an alerts/sheets row with combined P&L so Alerts + Trades sheets
         # reflect the net trade outcome, not just the final leg.
         combined_row = dict(row)
-        if _prev_partial_qty > 0 and _prev_partial_px > 0 and entry_px > 0:
+        if _prev_partial_qty > 0 and _combined_cost > 0:
             combined_row["pnl_pct"] = round(combined_pnl_pct * 100, 2)
             combined_row["_combined_pnl_dollar"] = round(_combined_dollar, 2)
         update_alert_close_to_sheets(combined_row, trade)
@@ -4267,12 +4288,18 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     _record_trade_close_for_perf(perf_trade, exit_price, combined_pnl_pct, closed_at, final_close=final_close)
 
     if (not final_close) and close_qty_int < current_qty:
+        partial_leg_dollar = (exit_px - entry_px) * close_qty_int * 100.0
+        partial_leg_cost = entry_px * close_qty_int * 100.0
         trade["qty"] = max(0, current_qty - close_qty_int)
         trade["partial_taken"] = True
         # Store partial leg data so the final close can compute combined P&L.
-        trade["partial_close_qty"] = close_qty_int
+        trade["partial_close_qty"] = int(trade.get("partial_close_qty", 0) or 0) + close_qty_int
         trade["partial_exit_px"] = float(exit_price)
-        trade["partial_pnl_pct"] = pnl_pct
+        trade["partial_realized_dollar"] = float(trade.get("partial_realized_dollar", 0.0) or 0.0) + partial_leg_dollar
+        trade["partial_realized_cost"] = float(trade.get("partial_realized_cost", 0.0) or 0.0) + partial_leg_cost
+        total_partial_cost = float(trade.get("partial_realized_cost", 0.0) or 0.0)
+        total_partial_dollar = float(trade.get("partial_realized_dollar", 0.0) or 0.0)
+        trade["partial_pnl_pct"] = (total_partial_dollar / total_partial_cost) if total_partial_cost > 0 else pnl_pct
         log(f"[{trade['underlying']}] Partial close executed: {close_qty_int} closed, {trade['qty']} remaining.")
         return
 
