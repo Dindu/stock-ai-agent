@@ -182,6 +182,8 @@ ENTRY_CONT_MIN_MOMENTUM_SCORE = float(os.getenv("ENTRY_CONT_MIN_MOMENTUM_SCORE",
 ENTRY_CONT_MIN_DELTA_5M = int(os.getenv("ENTRY_CONT_MIN_DELTA_5M", "1"))
 ENTRY_CONT_MIN_EMA20_SLOPE_PCT = float(os.getenv("ENTRY_CONT_MIN_EMA20_SLOPE_PCT", "0.0001"))  # Relaxed from 0.00015 (was too tight)
 ENTRY_CONT_MIN_MOMENTUM_QUALITY = float(os.getenv("ENTRY_CONT_MIN_MOMENTUM_QUALITY", "8.0"))
+ENTRY_MAX_TREND_AGE_BARS = int(os.getenv("ENTRY_MAX_TREND_AGE_BARS", "4"))
+ENTRY_1DTE_MIN_DELTA = float(os.getenv("ENTRY_1DTE_MIN_DELTA", "0.40"))
 # ML entry gate (optional): model reads current rule-engine features and returns win probability.
 ML_GATE_ENABLED = os.getenv("ML_GATE_ENABLED", "0") == "1"
 ML_GATE_MODEL_PATH = os.getenv("ML_GATE_MODEL_PATH", "models/entry_model.json")
@@ -1304,12 +1306,18 @@ def _classify_entry_timing(data, side):
     vwap_distance_prev = _safe_float_num((data or {}).get("vwap_distance_prev", 0.0), 0.0)
     bullish_candle = bool((data or {}).get("bullish_candle", False))
     bearish_candle = bool((data or {}).get("bearish_candle", False))
+    fresh_breakout = bool((data or {}).get("fresh_breakout", False))
+    fresh_breakdown = bool((data or {}).get("fresh_breakdown", False))
+    trend_age_bars = _safe_int_num(
+        (data or {}).get("bull_trend_age_bars", 0) if side == "CALL" else (data or {}).get("bear_trend_age_bars", 0),
+        0,
+    )
     moving_away_bullish = bool(price > vwap and (price - vwap) > vwap_distance_prev)
     moving_away_bearish = bool(price < vwap and (price - vwap) < vwap_distance_prev)
 
-    if side == "CALL" and delta_5m is not None and delta_10m is not None and delta_5m >= 8 and delta_10m >= 10 and price >= recent_high and bullish_candle and moving_away_bullish:
+    if side == "CALL" and delta_5m is not None and delta_10m is not None and delta_5m >= 8 and delta_10m >= 10 and fresh_breakout and bullish_candle and moving_away_bullish:
         return "EARLY_BREAKOUT"
-    if side == "PUT" and delta_5m is not None and delta_10m is not None and delta_5m >= 8 and delta_10m >= 10 and price <= recent_low and bearish_candle and moving_away_bearish:
+    if side == "PUT" and delta_5m is not None and delta_10m is not None and delta_5m >= 8 and delta_10m >= 10 and fresh_breakdown and bearish_candle and moving_away_bearish:
         return "BREAKDOWN"
 
     if side == "CALL" and price > vwap and vwap_distance_prev <= 0 and bullish_candle and delta_5m is not None and delta_5m >= 2:
@@ -1325,6 +1333,9 @@ def _classify_entry_timing(data, side):
     if side == "CALL" and rsi >= 70 and (delta_5m is None or delta_5m <= 0):
         return "LATE_CHASE"
     if side == "PUT" and rsi <= 30 and (delta_5m is None or delta_5m <= 0):
+        return "LATE_CHASE"
+
+    if trend_age_bars > ENTRY_MAX_TREND_AGE_BARS and delta_5m is not None and delta_5m <= 0:
         return "LATE_CHASE"
 
     if side_score >= 80 and delta_5m is not None and delta_5m <= -4:
@@ -1575,6 +1586,7 @@ def analyze(df, client, symbol):
     ema50 = float(latest["EMA50"])
     volume = float(latest["volume"])
     vol_avg = float(latest["VOL_AVG"])
+    prev_close = float(previous["close"])
 
     if pd.isna(vol_avg):
         return "NO TRADE", None
@@ -1606,6 +1618,23 @@ def analyze(df, client, symbol):
     recent_window = df.iloc[-(RECENT_HIGH_LOOKBACK + 1):-1]
     recent_high = float(recent_window["high"].max()) if len(recent_window) else price
     recent_low = float(recent_window["low"].min()) if len(recent_window) else price
+    fresh_breakout = prev_close <= recent_high and price > recent_high
+    fresh_breakdown = prev_close >= recent_low and price < recent_low
+
+    bull_trend_mask = (df["close"] > df["VWAP"]) & (df["close"] > df["EMA20"]) & (df["close"] > df["EMA50"])
+    bear_trend_mask = (df["close"] < df["VWAP"]) & (df["close"] < df["EMA20"]) & (df["close"] < df["EMA50"])
+
+    def _consecutive_true_count(mask):
+        count = 0
+        for value in reversed(mask.tolist()):
+            if bool(value):
+                count += 1
+            else:
+                break
+        return count
+
+    bull_trend_age_bars = _consecutive_true_count(bull_trend_mask)
+    bear_trend_age_bars = _consecutive_true_count(bear_trend_mask)
 
     is_etf = symbol in ETF_SYMBOLS
 
@@ -1854,6 +1883,10 @@ def analyze(df, client, symbol):
         "pdl": pdl,
         "recent_high": recent_high,
         "recent_low": recent_low,
+        "fresh_breakout": fresh_breakout,
+        "fresh_breakdown": fresh_breakdown,
+        "bull_trend_age_bars": bull_trend_age_bars,
+        "bear_trend_age_bars": bear_trend_age_bars,
         "vwap_distance_now": vwap_distance_now,
         "vwap_distance_prev": vwap_distance_prev,
         "vwap_extension_pct": (abs(vwap_distance_now) / vwap) if vwap else 0.0,
@@ -2163,6 +2196,11 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
     delta_5m, _ = _score_trend_deltas(data or {}, side)
     ignition_delta = _safe_int_num((data or {}).get("ignition_delta", 0), 0)
     effective_score = _safe_int_num((data or {}).get("effective_score", (data or {}).get("score", 0)), 0)
+    trend_age_bars = _safe_int_num(
+        (data or {}).get("bull_trend_age_bars", 0) if side == "CALL" else (data or {}).get("bear_trend_age_bars", 0),
+        0,
+    )
+    fresh_break = bool((data or {}).get("fresh_breakout", False)) if side == "CALL" else bool((data or {}).get("fresh_breakdown", False))
 
     if ENTRY_ALLOWED_SETUPS and entry_timing not in ENTRY_ALLOWED_SETUPS:
         return False, f"setup {entry_timing} not in allowed setups"
@@ -2175,6 +2213,10 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
             return False, "late-chase timing"
         if delta_5m is not None and delta_5m < EARLY_IGNITION_MIN_DELTA_5M:
             return False, f"5m score delta {delta_5m:+d} < +{EARLY_IGNITION_MIN_DELTA_5M}"
+        if entry_timing in {"EARLY_BREAKOUT", "BREAKDOWN"} and not fresh_break:
+            return False, "stale break: move already broke earlier bars"
+        if entry_timing == "MOMENTUM_CONTINUATION" and trend_age_bars > ENTRY_MAX_TREND_AGE_BARS:
+            return False, f"continuation too mature ({trend_age_bars} trend bars)"
 
     dte = _safe_int_num((option or {}).get("dte", 0), 0)
     if MAX_DTE > 0 and dte > MAX_DTE:
@@ -2186,6 +2228,7 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
         return False, f"open interest {oi} < {min_oi}"
 
     bid = _safe_float_num((option or {}).get("bid", 0.0), 0.0)
+    opt_delta = abs(_safe_float_num((option or {}).get("delta", 0.0), 0.0))
     max_bid = ETF_MAX_OPTION_BID if symbol in ETF_SYMBOLS else STOCK_MAX_OPTION_BID
     if bid > max_bid:
         exceptional_setup = (
@@ -2195,6 +2238,9 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
         )
         if not exceptional_setup:
             return False, f"bid ${bid:.2f} > ${max_bid:.2f} max without exceptional early ignition"
+
+    if dte == 1 and opt_delta < ENTRY_1DTE_MIN_DELTA:
+        return False, f"1DTE delta {opt_delta:.2f} < {ENTRY_1DTE_MIN_DELTA:.2f}"
 
     if ENTRY_EXPENSIVE_EXTENSION_FILTER:
         ext_pct = _safe_float_num((data or {}).get("vwap_extension_pct", 0.0), 0.0)
