@@ -5400,20 +5400,11 @@ def run_symbol(client, symbol, prefetched_bars=None):
 
     if str((option or {}).get("_selection_mode", "")).upper() == "RELAXED_FALLBACK":
         fallback_reason = str((option or {}).get("_entry_precheck_reason", "entry precheck failed") or "entry precheck failed")
-        send_discord(
-            (
-                f"⚠️ **ENTRY WATCHLIST-ONLY — {symbol} {side}**\n\n"
-                f"Selected fallback contract: `{option['contract']}` (strike `{option['strike']}`, expiry `{option['expiry']}`)\n"
-                f"Reason auto-trade blocked: `{fallback_reason}`\n"
-                f"Status: `ALERT ONLY` (no order submitted)"
-            ),
-            color=DISCORD_COLOR_WARN,
-        )
         if (not NO_GATING_MODE) and ALERT_ONLY_COOLDOWN_MINUTES > 0:
             _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
         _alerted_today["keys"].discard(alert_key)
         log(
-            f"[{symbol}] Relaxed fallback selected {option['contract']} for watchlist-only alert; "
+            f"[{symbol}] Relaxed fallback selected {option['contract']}; watchlist-only Discord alert suppressed, "
             f"execution skipped ({fallback_reason})."
         )
         return
