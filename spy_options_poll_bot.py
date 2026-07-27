@@ -310,7 +310,11 @@ ENTRY_MIN_IGNITION_DELTA = int(os.getenv("ENTRY_MIN_IGNITION_DELTA", "15"))  # R
 ETF_ENTRY_MIN_OPTION_OI = int(os.getenv("ETF_ENTRY_MIN_OPTION_OI", "5000"))  # Relaxed from 8000 (SPY has 4487 OI)
 STOCK_ENTRY_MIN_OPTION_OI = int(os.getenv("STOCK_ENTRY_MIN_OPTION_OI", "4000"))
 PROMOTED_ETF_ENTRY_MIN_OPTION_OI = int(os.getenv("PROMOTED_ETF_ENTRY_MIN_OPTION_OI", "1500"))
+PROMOTED_STOCK_ENTRY_MIN_OPTION_OI = int(os.getenv("PROMOTED_STOCK_ENTRY_MIN_OPTION_OI", "100"))
 PROMOTED_CONT_MIN_MOMENTUM_SCORE = float(os.getenv("PROMOTED_CONT_MIN_MOMENTUM_SCORE", "36"))
+PROMOTED_MIN_DOMINANCE = int(os.getenv("PROMOTED_MIN_DOMINANCE", "20"))
+PROMOTED_MIN_DELTA_5M = int(os.getenv("PROMOTED_MIN_DELTA_5M", "2"))
+PROMOTED_MIN_MOMENTUM_QUALITY = float(os.getenv("PROMOTED_MIN_MOMENTUM_QUALITY", "7.0"))
 ENTRY_ALLOWED_SETUPS = {
     s.strip().upper()
     for s in os.getenv(
@@ -1441,6 +1445,7 @@ def entry_momentum_continuation_ok(symbol, side, data):
         (not is_etf)
         and RECALL_FIRST_MODE
         and watchlist_promoted
+        and bool((data or {}).get("promoted_quality_ok", False))
         and ignition_confirmed
         and ignition_delta >= max(10, ENTRY_MIN_IGNITION_DELTA - 2)
         and m["dominance"] >= max(20.0, float(SCORE_DOMINANCE))
@@ -1532,6 +1537,52 @@ def _score_trend_deltas(data, side):
     delta_5m = None if past_5m is None else int(now_score - int(past_5m))
     delta_10m = None if past_10m is None else int(now_score - int(past_10m))
     return delta_5m, delta_10m
+
+
+def promoted_entry_quality_ok(symbol, side, data):
+    """Unified quality gate for promoted watchlist entries used by all relaxed paths."""
+    m = _side_metric_bundle(data or {}, side)
+    side_delta_5m, side_delta_10m = _score_trend_deltas(data or {}, side)
+    entry_timing = _classify_entry_timing(data or {}, side)
+    is_etf = str(symbol or "").upper() in ETF_SYMBOLS
+
+    allowed_timings = {
+        "FIRST_PULLBACK",
+        "VWAP_RECLAIM",
+        "HIGHER_LOW_RECLAIM",
+        "BREAKDOWN_RETEST",
+        "LOWER_HIGH_FAILURE",
+        "VWAP_REJECT",
+        "MOMENTUM_CONTINUATION",
+        "EARLY_BREAKOUT",
+        "BREAKDOWN",
+    }
+    if entry_timing not in allowed_timings:
+        return False, f"timing {entry_timing} not in promoted-quality allowlist"
+
+    min_dom = max(int(PROMOTED_MIN_DOMINANCE), int(SCORE_DOMINANCE))
+    if m["dominance"] < min_dom:
+        return False, f"dominance {m['dominance']:.0f} < {min_dom}"
+
+    min_d5 = max(int(PROMOTED_MIN_DELTA_5M), int(EARLY_IGNITION_MIN_DELTA_5M))
+    if side_delta_5m is None or side_delta_5m < min_d5:
+        return False, f"side 5m delta {side_delta_5m} < {min_d5}"
+
+    min_mq = max(float(PROMOTED_MIN_MOMENTUM_QUALITY), float(ENTRY_CONT_MIN_MOMENTUM_QUALITY) - 1.0)
+    if m["momentum_quality"] < min_mq:
+        return False, f"momentum quality {m['momentum_quality']:.1f} < {min_mq:.1f}"
+
+    min_momentum = 26.0 if is_etf else 32.0
+    if m["momentum"] < min_momentum:
+        return False, f"momentum {m['momentum']:.1f} < {min_momentum:.1f}"
+
+    if side_delta_10m is not None and side_delta_10m < 0:
+        return False, f"side 10m delta {side_delta_10m:+d} < +0 (fading)"
+
+    return True, (
+        f"timing={entry_timing}, dom={m['dominance']:.0f}, d5={side_delta_5m}, "
+        f"d10={side_delta_10m}, mom={m['momentum']:.1f}, mq={m['momentum_quality']:.1f}"
+    )
 
 
 def _why_now_line(data, side):
@@ -2612,10 +2663,24 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
         symbol in ETF_SYMBOLS
         and RECALL_FIRST_MODE
         and bool((data or {}).get("watchlist_promoted", False))
+        and bool((data or {}).get("promoted_quality_ok", False))
         and bool((data or {}).get("ignition_confirmed", False))
         and _safe_int_num((data or {}).get("ignition_delta", 0), 0) >= max(10, ENTRY_MIN_IGNITION_DELTA - 2)
     ):
         min_oi = min(min_oi, int(PROMOTED_ETF_ENTRY_MIN_OPTION_OI))
+    elif (
+        symbol not in ETF_SYMBOLS
+        and RECALL_FIRST_MODE
+        and bool((data or {}).get("watchlist_promoted", False))
+        and bool((data or {}).get("promoted_quality_ok", False))
+        and bool((data or {}).get("ignition_confirmed", False))
+        and _safe_int_num((data or {}).get("ignition_delta", 0), 0) >= max(10, ENTRY_MIN_IGNITION_DELTA - 2)
+        and _safe_int_num((data or {}).get("effective_score", 0), 0) >= max(55, SCORE_WATCH)
+        and entry_timing in {"FIRST_PULLBACK", "VWAP_RECLAIM", "HIGHER_LOW_RECLAIM", "BREAKDOWN_RETEST", "LOWER_HIGH_FAILURE", "VWAP_REJECT", "MOMENTUM_CONTINUATION"}
+        and delta_5m is not None and delta_5m >= max(2, EARLY_IGNITION_MIN_DELTA_5M)
+        and _safe_float_num((data or {}).get("momentum_quality", 0.0), 0.0) >= max(7.0, ENTRY_CONT_MIN_MOMENTUM_QUALITY - 1.0)
+    ):
+        min_oi = min(min_oi, int(PROMOTED_STOCK_ENTRY_MIN_OPTION_OI))
     if oi < min_oi:
         return False, f"open interest {oi} < {min_oi}"
 
@@ -5050,6 +5115,16 @@ def run_symbol(client, symbol, prefetched_bars=None):
             log(f"[{symbol}] WATCHLIST promoted for execution — {wl_reason}.")
     data["watchlist_promoted"] = watchlist_promoted
 
+    if watchlist_promoted and RECALL_FIRST_MODE:
+        promoted_ok, promoted_reason = promoted_entry_quality_ok(symbol, side, data)
+        data["promoted_quality_ok"] = bool(promoted_ok)
+        if not promoted_ok:
+            log(f"[{symbol}] Promoted quality gate: blocked — {promoted_reason}.")
+            return
+        log(f"[{symbol}] Promoted quality gate: passed — {promoted_reason}.")
+    else:
+        data["promoted_quality_ok"] = False
+
     # Hard minimum score gate with dynamic threshold from regime + continuation quality.
     enforce_hard_gate = HARD_SCORE_GATE_ENABLED and (
         (not NO_GATING_MODE) or HARD_SCORE_GATE_IN_NO_GATING_MODE
@@ -5144,10 +5219,11 @@ def run_symbol(client, symbol, prefetched_bars=None):
 
         is_etf = symbol in ETF_SYMBOLS
         watchlist_promoted = bool((data or {}).get("watchlist_promoted", False))
+        promoted_quality_ok = bool((data or {}).get("promoted_quality_ok", False))
         required_delta = ignition_delta_required(now_score, ignition_min_delta)
         if entry_timing in {"HIGHER_LOW_RECLAIM", "LOWER_HIGH_FAILURE"}:
             required_delta = max(3, required_delta - 6)
-        elif watchlist_promoted and RECALL_FIRST_MODE:
+        elif watchlist_promoted and RECALL_FIRST_MODE and promoted_quality_ok:
             required_delta = max(4, required_delta - 8)
         elif is_etf:
             required_delta = max(8, required_delta - 5)
@@ -5165,6 +5241,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 if now_score < 95 and delta < required_delta:
                     warmup_promoted_override = (
                         watchlist_promoted
+                        and promoted_quality_ok
                         and RECALL_FIRST_MODE
                         and now_score >= max(SCORE_WATCH + 4, 58)
                         and side_dominance >= max(12, SCORE_DOMINANCE - 2)
