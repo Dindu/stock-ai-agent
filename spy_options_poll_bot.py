@@ -1012,6 +1012,12 @@ def symbol_profile(symbol):
         "max_ext_from_vwap": MAX_EXT_FROM_VWAP,
     }
     if symbol in ETF_SYMBOLS:
+        profile.update({
+            "ignition_min_delta": max(10, IGNITION_MIN_DELTA - 5),
+            "rsi_overbought": min(80, RSI_OVERBOUGHT + 5),
+            "rsi_oversold": max(20, RSI_OVERSOLD - 5),
+            "max_ext_from_vwap": min(0.015, MAX_EXT_FROM_VWAP + 0.003),
+        })
         return profile
     if symbol in AGGRESSIVE_STOCK_SYMBOLS:
         profile.update({
@@ -1094,8 +1100,18 @@ def dynamic_min_required_score(symbol, side, data):
         return int(base)
 
     m = _side_metric_bundle(data, side)
+    entry_timing = _classify_entry_timing(data or {}, side)
     relief = 0
     penalty = 0
+
+    if entry_timing in {"FIRST_PULLBACK", "VWAP_RECLAIM", "BREAKDOWN_RETEST", "VWAP_REJECT", "MOMENTUM_CONTINUATION"}:
+        relief += 4
+
+    if symbol in ETF_SYMBOLS:
+        if m["momentum"] >= 55:
+            relief += 1
+        if m["delta_5m"] is not None and m["delta_5m"] >= 0:
+            relief += 1
 
     if m["regime"] >= 80:
         relief += 3
@@ -1132,7 +1148,7 @@ def dynamic_min_required_score(symbol, side, data):
 
     adjusted = int(base - min(DYNAMIC_HARD_GATE_MAX_RELIEF, relief) + min(DYNAMIC_HARD_GATE_MAX_PENALTY, penalty))
     if symbol in ETF_SYMBOLS:
-        floor = DYNAMIC_HARD_GATE_MIN_FLOOR_ETF
+        floor = max(62, DYNAMIC_HARD_GATE_MIN_FLOOR_ETF - 5)
     elif is_top_stock:
         floor = TOP_STOCK_HARD_GATE_MIN_FLOOR
     else:
@@ -1180,11 +1196,42 @@ def watchlist_execution_confirmed(symbol, side, data):
         return False, "selective watchlist execution disabled"
 
     m = _side_metric_bundle(data, side)
+    entry_timing = _classify_entry_timing(data or {}, side)
     is_top_stock = str(symbol or "").upper() in TOP_STOCK_SYMBOLS
     rel_strength = _safe_float_num(
         (data or {}).get("relative_strength_score_bull", 0.0) if side == "CALL" else (data or {}).get("relative_strength_score_bear", 0.0),
         0.0,
     )
+
+    if symbol in ETF_SYMBOLS and m["delta_5m"] is not None:
+        etf_override = (
+            m["side_score"] >= max(50, SCORE_WATCH - 2)
+            and m["dominance"] >= max(8, WATCHLIST_PROMOTION_MIN_DOMINANCE - 4)
+            and m["delta_5m"] >= -1
+            and m["momentum"] >= max(22.0, WATCHLIST_PROMOTION_MIN_MOMENTUM - 12)
+            and m["volume"] >= max(15.0, WATCHLIST_PROMOTION_MIN_VOLUME - 15)
+            and m["regime"] >= 45
+        )
+        if etf_override:
+            return True, (
+                f"ETF override: score={m['side_score']:.0f}, dom={m['dominance']:.0f}, "
+                f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, d5={m['delta_5m']}"
+            )
+
+    if entry_timing in {"FIRST_PULLBACK", "VWAP_RECLAIM", "BREAKDOWN_RETEST", "VWAP_REJECT", "MOMENTUM_CONTINUATION"} and m["delta_5m"] is not None:
+        pullback_override = (
+            m["side_score"] >= max(SCORE_WATCH, WATCHLIST_PROMOTION_MIN_SCORE - 6)
+            and m["dominance"] >= max(10, WATCHLIST_PROMOTION_MIN_DOMINANCE - 2)
+            and m["delta_5m"] >= 0
+            and m["momentum"] >= max(25.0, WATCHLIST_PROMOTION_MIN_MOMENTUM - 10)
+            and m["volume"] >= max(20.0, WATCHLIST_PROMOTION_MIN_VOLUME - 10)
+            and m["regime"] >= 50
+        )
+        if pullback_override:
+            return True, (
+                f"pullback/reclaim override ({entry_timing.lower()}): score={m['side_score']:.0f}, dom={m['dominance']:.0f}, "
+                f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, d5={m['delta_5m']}"
+            )
 
     # Fast-moving megacaps can show valid continuation before momentum/volume sub-scores fully normalize.
     if is_top_stock and m["delta_5m"] is not None:
@@ -1380,20 +1427,23 @@ def _classify_entry_timing(data, side):
     )
     moving_away_bullish = bool(price > vwap and (price - vwap) > vwap_distance_prev)
     moving_away_bearish = bool(price < vwap and (price - vwap) < vwap_distance_prev)
+    reclaim_ready_bull = delta_5m is not None and delta_5m >= 1 and (bullish_candle or moving_away_bullish)
+    reclaim_ready_bear = delta_5m is not None and delta_5m >= 1 and (bearish_candle or moving_away_bearish)
+    pullback_ready = delta_5m is not None and 1 <= delta_5m <= 7 and ext_pct <= (MAX_EXT_FROM_VWAP * 0.85)
 
     if side == "CALL" and delta_5m is not None and delta_10m is not None and delta_5m >= 8 and delta_10m >= 10 and fresh_breakout and bullish_candle and moving_away_bullish:
         return "EARLY_BREAKOUT"
     if side == "PUT" and delta_5m is not None and delta_10m is not None and delta_5m >= 8 and delta_10m >= 10 and fresh_breakdown and bearish_candle and moving_away_bearish:
         return "BREAKDOWN"
 
-    if side == "CALL" and price > vwap and vwap_distance_prev <= 0 and bullish_candle and delta_5m is not None and delta_5m >= 2:
+    if side == "CALL" and price > vwap and vwap_distance_prev <= 0 and reclaim_ready_bull:
         return "VWAP_RECLAIM"
-    if side == "PUT" and price < vwap and vwap_distance_prev >= 0 and bearish_candle and delta_5m is not None and delta_5m >= 2:
+    if side == "PUT" and price < vwap and vwap_distance_prev >= 0 and reclaim_ready_bear:
         return "VWAP_REJECT"
 
-    if side == "CALL" and price > ema20 and price > vwap and bullish_candle and ext_pct <= (MAX_EXT_FROM_VWAP * 0.60) and delta_5m is not None and 2 <= delta_5m <= 7:
+    if side == "CALL" and price > ema20 and price > vwap and pullback_ready and (bullish_candle or moving_away_bullish or trend_age_bars <= ENTRY_MAX_TREND_AGE_BARS):
         return "FIRST_PULLBACK"
-    if side == "PUT" and price < ema20 and price < vwap and bearish_candle and ext_pct <= (MAX_EXT_FROM_VWAP * 0.60) and delta_5m is not None and 2 <= delta_5m <= 7:
+    if side == "PUT" and price < ema20 and price < vwap and pullback_ready and (bearish_candle or moving_away_bearish or trend_age_bars <= ENTRY_MAX_TREND_AGE_BARS):
         return "BREAKDOWN_RETEST"
 
     if side == "CALL" and rsi >= 70 and (delta_5m is None or delta_5m <= 0):
