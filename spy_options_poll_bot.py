@@ -4889,7 +4889,10 @@ def run_symbol(client, symbol, prefetched_bars=None):
             now_score = data["bear_score"]
             past_score = data["bear_5m"]
 
+        is_etf = symbol in ETF_SYMBOLS
         required_delta = ignition_delta_required(now_score, ignition_min_delta)
+        if is_etf:
+            required_delta = max(8, required_delta - 5)
 
         if past_score is None:
             history = score_history.get(symbol, deque())
@@ -4900,11 +4903,17 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 past_score = oldest_bull if side == "CALL" else oldest_bear
                 delta = now_score - past_score
                 if now_score < 95 and delta < required_delta:
-                    log(
-                        f"[{symbol}] Ignition gate: warmup history only ({len(history)} samples), "
-                        f"{side} delta +{delta} < +{required_delta} \u2014 waiting for clearer ignition."
-                    )
-                    return
+                    if is_etf and now_score >= 75 and delta >= max(6, required_delta - 4):
+                        log(
+                            f"[{symbol}] Ignition warmup override: ETF {side} score {past_score} \u2192 {now_score} "
+                            f"(\u0394 +{delta}) accepted with relaxed delta {required_delta}."
+                        )
+                    else:
+                        log(
+                            f"[{symbol}] Ignition gate: warmup history only ({len(history)} samples), "
+                            f"{side} delta +{delta} < +{required_delta} \u2014 waiting for clearer ignition."
+                        )
+                        return
                 log(
                     f"[{symbol}] Ignition warmup: using partial history ({len(history)} samples) "
                     f"{past_score} \u2192 {now_score} (\u0394 +{delta})."
@@ -4949,7 +4958,13 @@ def run_symbol(client, symbol, prefetched_bars=None):
             )
             return
         elif past_score >= IGNITION_PRIOR_MAX:
-            if (
+            if is_etf and now_score >= 75 and delta >= max(6, required_delta - 4):
+                log(
+                    f"[{symbol}] ETF ignition continuation override: {side} remains strong "
+                    f"({past_score} -> {now_score}, \u0394 {delta:+d}) with relaxed delta {required_delta}."
+                )
+                continuation_override = True
+            elif (
                 IGNITION_CONTINUATION_ENABLED
                 and now_score >= IGNITION_CONTINUATION_MIN_SCORE
                 and delta >= IGNITION_CONTINUATION_MIN_DELTA
