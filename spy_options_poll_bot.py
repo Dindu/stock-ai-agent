@@ -3247,6 +3247,7 @@ def _rehydrate_perf_from_alpaca_orders(today):
         return None
 
     lots = {}
+    realized_by_contract = {}
     for o in orders:
         if str(o.get("status", "")).lower() != "filled":
             continue
@@ -3269,6 +3270,11 @@ def _rehydrate_perf_from_alpaca_orders(today):
         if side == "BUY":
             snap["entries"] = int(snap.get("entries", 0)) + 1
             lots.setdefault(contract, []).append([qty, price])
+            realized_by_contract.setdefault(contract, {
+                "underlying": underlying,
+                "pnl_dollar": 0.0,
+                "buy_cost": 0.0,
+            })
             continue
 
         if side != "SELL":
@@ -3292,8 +3298,28 @@ def _rehydrate_perf_from_alpaca_orders(today):
             else:
                 queue[0][0] = lot_qty
 
-        pnl_pct = ((pnl_dollar / buy_cost) * 100.0) if buy_cost > 0 else 0.0
-        _accumulate_closed_trade_stats(snap, underlying, pnl_dollar, pnl_pct)
+        if matched_qty <= 0:
+            continue
+
+        realized = realized_by_contract.setdefault(contract, {
+            "underlying": underlying,
+            "pnl_dollar": 0.0,
+            "buy_cost": 0.0,
+        })
+        realized["underlying"] = underlying
+        realized["pnl_dollar"] = float(realized.get("pnl_dollar", 0.0)) + pnl_dollar
+        realized["buy_cost"] = float(realized.get("buy_cost", 0.0)) + buy_cost
+        snap["realized_pnl_dollar"] = float(snap.get("realized_pnl_dollar", 0.0)) + pnl_dollar
+
+        # Count the trade as closed only once the remaining FIFO lots are gone.
+        if queue:
+            continue
+
+        total_pnl_dollar = float(realized.get("pnl_dollar", 0.0))
+        total_buy_cost = float(realized.get("buy_cost", 0.0))
+        pnl_pct = ((total_pnl_dollar / total_buy_cost) * 100.0) if total_buy_cost > 0 else 0.0
+        _accumulate_closed_trade_stats(snap, realized.get("underlying", underlying), total_pnl_dollar, pnl_pct)
+        realized_by_contract.pop(contract, None)
 
     return snap
 
