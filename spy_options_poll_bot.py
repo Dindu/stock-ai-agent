@@ -122,6 +122,8 @@ SCORE_DOMINANCE = int(os.getenv("SCORE_DOMINANCE", "20"))  # bull must lead bear
 # Global bypass for all entry gating layers (tier/stock strict/opening/cooldown/ignition/RSI/macro/anti-chase/candle).
 NO_GATING_MODE = os.getenv("NO_GATING_MODE", "0") == "1"
 ENFORCE_OPENING_WINDOW_IN_NO_GATING = os.getenv("ENFORCE_OPENING_WINDOW_IN_NO_GATING", "1") == "1"
+# Recall-first mode: bias the bot toward taking strong setups rather than filtering them away.
+RECALL_FIRST_MODE = os.getenv("RECALL_FIRST_MODE", "1") == "1"
 # Stock-only tightening: require a slightly higher effective strong score.
 STOCK_STRONG_SCORE_BONUS = int(os.getenv("STOCK_STRONG_SCORE_BONUS", "0"))
 # Hard score gate control:
@@ -246,6 +248,7 @@ PARTIAL_CLOSE_FRACTION = float(os.getenv("PARTIAL_CLOSE_FRACTION", "0.50"))
 TRAILING_STOP_GIVEBACK_PCT = float(os.getenv("TRAILING_STOP_GIVEBACK_PCT", "0.10"))
 MOMENTUM_FAIL_EXIT_ENABLED = os.getenv("MOMENTUM_FAIL_EXIT_ENABLED", "1") == "1"
 MOMENTUM_FAIL_MIN_PNL_PCT = float(os.getenv("MOMENTUM_FAIL_MIN_PNL_PCT", "0.06"))
+MAX_TRADE_HOLD_MINUTES = int(os.getenv("MAX_TRADE_HOLD_MINUTES", "90"))
 # Regime-aware target/stop profile.
 ADAPTIVE_EXIT_PROFILE_ENABLED = os.getenv("ADAPTIVE_EXIT_PROFILE_ENABLED", "1") == "1"
 HIGH_VOL_RATIO = float(os.getenv("HIGH_VOL_RATIO", "1.50"))
@@ -352,6 +355,8 @@ _gsheet: "gspread.Spreadsheet | None" = None
 _last_gsheet_init_attempt: "datetime | None" = None
 # Last known SPY VWAP side: 'bull', 'bear', or None (populated by run_symbol each cycle).
 _spy_vwap_cache: "dict" = {"side": None, "updated_at": None}
+# Last known QQQ VWAP side: 'bull', 'bear', or None (populated by run_symbol each cycle).
+_qqq_vwap_cache: "dict" = {"side": None, "updated_at": None}
 # Ignition confirmation buffer: (symbol, side) -> {"score": int, "delta": int, "at": datetime}
 # An ignition must be seen twice (two consecutive scans) before an entry is allowed.
 _ignition_pending: "dict[tuple, dict]" = {}
@@ -1005,6 +1010,53 @@ def _spy_vwap_side():
     return _spy_vwap_cache.get("side")
 
 
+def _qqq_vwap_side():
+    """Return the current QQQ macro side: 'bull' if QQQ > VWAP, 'bear' if QQQ < VWAP."""
+    return _qqq_vwap_cache.get("side")
+
+
+def _market_regime_scores(symbol, price, vwap, ema20, ema50, ema20_rising, ema20_falling):
+    """Blend local trend with SPY/QQQ context into bull and bear regime scores."""
+    def _clamp01(x):
+        return max(0.0, min(1.0, float(x)))
+
+    def _to_100(x):
+        return _clamp01(x) * 100.0
+
+    local_bull = (
+        (1.0 if price > vwap else 0.0)
+        + (1.0 if price > ema20 else 0.0)
+        + (1.0 if price > ema50 else 0.0)
+        + (1.0 if ema20_rising else 0.0)
+    ) / 4.0
+    local_bear = (
+        (1.0 if price < vwap else 0.0)
+        + (1.0 if price < ema20 else 0.0)
+        + (1.0 if price < ema50 else 0.0)
+        + (1.0 if ema20_falling else 0.0)
+    ) / 4.0
+
+    macro_bull_votes = 0.0
+    macro_bear_votes = 0.0
+    for side in (_spy_vwap_side(), _qqq_vwap_side()):
+        if side == "bull":
+            macro_bull_votes += 1.0
+        elif side == "bear":
+            macro_bear_votes += 1.0
+
+    macro_bull = macro_bull_votes / 2.0
+    macro_bear = macro_bear_votes / 2.0
+
+    if symbol in ETF_SYMBOLS:
+        bull = _to_100((local_bull * 0.65) + (macro_bull * 0.35))
+        bear = _to_100((local_bear * 0.65) + (macro_bear * 0.35))
+    else:
+        bull = _to_100((local_bull * 0.50) + (macro_bull * 0.35) + (0.15 if _spy_vwap_side() == "bull" else 0.0))
+        bear = _to_100((local_bear * 0.50) + (macro_bear * 0.35) + (0.15 if _spy_vwap_side() == "bear" else 0.0))
+
+    return bull, bear
+
+
 def symbol_profile(symbol):
     """Return per-symbol entry tuning so single stocks use stricter filters than ETFs."""
     profile = {
@@ -1109,6 +1161,13 @@ def dynamic_min_required_score(symbol, side, data):
     if entry_timing in {"FIRST_PULLBACK", "VWAP_RECLAIM", "BREAKDOWN_RETEST", "VWAP_REJECT", "MOMENTUM_CONTINUATION"}:
         relief += 4
 
+    if RECALL_FIRST_MODE:
+        relief += 2
+        if m["delta_5m"] is not None and m["delta_5m"] >= 0:
+            relief += 1
+        if m["regime"] >= 60:
+            relief += 1
+
     if symbol in ETF_SYMBOLS:
         if m["momentum"] >= 55:
             relief += 1
@@ -1150,11 +1209,11 @@ def dynamic_min_required_score(symbol, side, data):
 
     adjusted = int(base - min(DYNAMIC_HARD_GATE_MAX_RELIEF, relief) + min(DYNAMIC_HARD_GATE_MAX_PENALTY, penalty))
     if symbol in ETF_SYMBOLS:
-        floor = max(62, DYNAMIC_HARD_GATE_MIN_FLOOR_ETF - 5)
+        floor = max(58, DYNAMIC_HARD_GATE_MIN_FLOOR_ETF - (7 if RECALL_FIRST_MODE else 5))
     elif is_top_stock:
-        floor = TOP_STOCK_HARD_GATE_MIN_FLOOR
+        floor = max(56, TOP_STOCK_HARD_GATE_MIN_FLOOR - (6 if RECALL_FIRST_MODE else 0))
     else:
-        floor = DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK
+        floor = max(58, DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK - (4 if RECALL_FIRST_MODE else 0))
     return max(int(floor), adjusted)
 
 
@@ -1231,6 +1290,20 @@ def watchlist_execution_confirmed(symbol, side, data):
         if stock_override:
             return True, (
                 f"stock simplified mode: score={m['side_score']:.0f}, dom={m['dominance']:.0f}, "
+                f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, d5={m['delta_5m']}"
+            )
+
+    if RECALL_FIRST_MODE and m["delta_5m"] is not None:
+        recall_override = (
+            m["side_score"] >= max(45, SCORE_WATCH - 5)
+            and m["dominance"] >= max(8, WATCHLIST_PROMOTION_MIN_DOMINANCE - 4)
+            and m["delta_5m"] >= -1
+            and m["momentum"] >= max(18.0, WATCHLIST_PROMOTION_MIN_MOMENTUM - 12)
+            and m["regime"] >= 40
+        )
+        if recall_override:
+            return True, (
+                f"recall-first override: score={m['side_score']:.0f}, dom={m['dominance']:.0f}, "
                 f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, d5={m['delta_5m']}"
             )
 
@@ -1842,12 +1915,6 @@ def analyze(df, client, symbol):
         dollar_vol_avg = float(dv_series.iloc[-1]) if not pd.isna(dv_series.iloc[-1]) else 0.0
         liq_ratio = (dollar_vol_now / dollar_vol_avg) if dollar_vol_avg > 0 else 1.0
 
-        # Market regime from SPY VWAP side cache (or local SPY side when symbol is SPY).
-        if symbol == "SPY":
-            regime_side = "bull" if price > vwap else "bear"
-        else:
-            regime_side = _spy_vwap_side()
-
         # ---------------- Category scores (0-100 each side) ----------------
         trend_bull = _to_100((
             (1.0 if price > vwap else 0.0)
@@ -1873,12 +1940,7 @@ def analyze(df, client, symbol):
             + ((1.0 if strong_volume else 0.0) * 0.25)
         ))
 
-        if regime_side == "bull":
-            regime_bull, regime_bear = 100.0, 0.0
-        elif regime_side == "bear":
-            regime_bull, regime_bear = 0.0, 100.0
-        else:
-            regime_bull, regime_bear = 50.0, 50.0
+        regime_bull, regime_bear = _market_regime_scores(symbol, price, vwap, ema20, ema50, ema20_rising, ema20_falling)
 
         rel_bull = _to_100((
             ((1.0 if price > pdh else 0.0) * 0.50)
@@ -2409,7 +2471,8 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
     fresh_break = bool((data or {}).get("fresh_breakout", False)) if side == "CALL" else bool((data or {}).get("fresh_breakdown", False))
 
     if ENTRY_ALLOWED_SETUPS and entry_timing not in ENTRY_ALLOWED_SETUPS:
-        return False, f"setup {entry_timing} not in allowed setups"
+        if not (RECALL_FIRST_MODE and effective_score >= 82 and delta_5m is not None and delta_5m >= 0):
+            return False, f"setup {entry_timing} not in allowed setups"
 
     if ignition_delta < ENTRY_MIN_IGNITION_DELTA:
         return False, f"ignition delta {ignition_delta} < {ENTRY_MIN_IGNITION_DELTA}"
@@ -4178,7 +4241,12 @@ def track_open_trades():
             close_trade(trade, current_price, "MOMENTUM FAILURE", pnl_pct)
             continue
 
-        # 4) Trailing stop after partial take.
+        # 4) Time stop: if the trade has sat too long, get out before theta decay eats the thesis.
+        if MAX_TRADE_HOLD_MINUTES > 0 and held_minutes >= MAX_TRADE_HOLD_MINUTES:
+            close_trade(trade, current_price, f"TIME EXIT ({held_minutes}m)", pnl_pct)
+            continue
+
+        # 5) Trailing stop after partial take.
         max_seen = float(trade.get("max_pnl_pct", 0.0) or 0.0)
         if partial_taken and max_seen > 0 and pnl_pct <= (max_seen - max(0.02, TRAILING_STOP_GIVEBACK_PCT)):
             close_trade(trade, current_price, "TRAILING STOP", pnl_pct)
@@ -4798,6 +4866,9 @@ def run_symbol(client, symbol, prefetched_bars=None):
         if symbol == "SPY":
             _spy_vwap_cache["side"] = "bull" if data["price"] > data["vwap"] else "bear"
             _spy_vwap_cache["updated_at"] = datetime.now(central)
+        elif symbol == "QQQ":
+            _qqq_vwap_cache["side"] = "bull" if data["price"] > data["vwap"] else "bear"
+            _qqq_vwap_cache["updated_at"] = datetime.now(central)
 
         _update_symbol_opportunity_cache(symbol, data)
         _maybe_send_transition_alert(symbol, data)
@@ -4909,6 +4980,8 @@ def run_symbol(client, symbol, prefetched_bars=None):
         required_delta = ignition_delta_required(now_score, ignition_min_delta)
         if is_etf:
             required_delta = max(8, required_delta - 5)
+        elif RECALL_FIRST_MODE:
+            required_delta = max(6, required_delta - 3)
 
         if past_score is None:
             history = score_history.get(symbol, deque())
@@ -4919,9 +4992,9 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 past_score = oldest_bull if side == "CALL" else oldest_bear
                 delta = now_score - past_score
                 if now_score < 95 and delta < required_delta:
-                    if is_etf and now_score >= 75 and delta >= max(6, required_delta - 4):
+                    if ((is_etf or RECALL_FIRST_MODE) and now_score >= 75 and delta >= max(4, required_delta - 4)):
                         log(
-                            f"[{symbol}] Ignition warmup override: ETF {side} score {past_score} \u2192 {now_score} "
+                            f"[{symbol}] Ignition warmup override: {side} score {past_score} \u2192 {now_score} "
                             f"(\u0394 +{delta}) accepted with relaxed delta {required_delta}."
                         )
                     else:
@@ -4974,9 +5047,9 @@ def run_symbol(client, symbol, prefetched_bars=None):
             )
             return
         elif past_score >= IGNITION_PRIOR_MAX:
-            if is_etf and now_score >= 75 and delta >= max(6, required_delta - 4):
+            if (is_etf or RECALL_FIRST_MODE) and now_score >= 75 and delta >= max(4, required_delta - 4):
                 log(
-                    f"[{symbol}] ETF ignition continuation override: {side} remains strong "
+                    f"[{symbol}] Ignition continuation override: {side} remains strong "
                     f"({past_score} -> {now_score}, \u0394 {delta:+d}) with relaxed delta {required_delta}."
                 )
                 continuation_override = True
