@@ -5113,14 +5113,19 @@ def run_symbol(client, symbol, prefetched_bars=None):
         if side == "CALL":
             now_score = data["bull_score"]
             past_score = data["bull_5m"]
+            side_dominance = data["bull_score"] - data["bear_score"]
         else:
             now_score = data["bear_score"]
             past_score = data["bear_5m"]
+            side_dominance = data["bear_score"] - data["bull_score"]
 
         is_etf = symbol in ETF_SYMBOLS
+        watchlist_promoted = bool((data or {}).get("watchlist_promoted", False))
         required_delta = ignition_delta_required(now_score, ignition_min_delta)
         if entry_timing in {"HIGHER_LOW_RECLAIM", "LOWER_HIGH_FAILURE"}:
             required_delta = max(3, required_delta - 6)
+        elif watchlist_promoted and RECALL_FIRST_MODE:
+            required_delta = max(4, required_delta - 8)
         elif is_etf:
             required_delta = max(8, required_delta - 5)
         elif RECALL_FIRST_MODE:
@@ -5135,7 +5140,19 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 past_score = oldest_bull if side == "CALL" else oldest_bear
                 delta = now_score - past_score
                 if now_score < 95 and delta < required_delta:
-                    if ((is_etf or RECALL_FIRST_MODE or entry_timing in {"HIGHER_LOW_RECLAIM", "LOWER_HIGH_FAILURE"}) and now_score >= 70 and delta >= max(2, required_delta - 4)):
+                    warmup_promoted_override = (
+                        watchlist_promoted
+                        and RECALL_FIRST_MODE
+                        and now_score >= max(SCORE_WATCH + 4, 58)
+                        and side_dominance >= max(12, SCORE_DOMINANCE - 2)
+                        and delta >= 0
+                    )
+                    if warmup_promoted_override:
+                        log(
+                            f"[{symbol}] Ignition warmup promoted override: {side} score {past_score} -> {now_score} "
+                            f"(Δ +{delta}) accepted while lookback history is still building."
+                        )
+                    elif ((is_etf or RECALL_FIRST_MODE or entry_timing in {"HIGHER_LOW_RECLAIM", "LOWER_HIGH_FAILURE"}) and now_score >= 70 and delta >= max(2, required_delta - 4)):
                         log(
                             f"[{symbol}] Ignition warmup override: {side} score {past_score} \u2192 {now_score} "
                             f"(\u0394 +{delta}) accepted with relaxed delta {required_delta}."
