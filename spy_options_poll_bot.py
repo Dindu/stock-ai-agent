@@ -309,6 +309,8 @@ EARLY_IGNITION_MIN_DELTA_5M = int(os.getenv("EARLY_IGNITION_MIN_DELTA_5M", "2"))
 ENTRY_MIN_IGNITION_DELTA = int(os.getenv("ENTRY_MIN_IGNITION_DELTA", "15"))  # Relaxed from 18 (was blocking +15 deltas)
 ETF_ENTRY_MIN_OPTION_OI = int(os.getenv("ETF_ENTRY_MIN_OPTION_OI", "5000"))  # Relaxed from 8000 (SPY has 4487 OI)
 STOCK_ENTRY_MIN_OPTION_OI = int(os.getenv("STOCK_ENTRY_MIN_OPTION_OI", "4000"))
+PROMOTED_ETF_ENTRY_MIN_OPTION_OI = int(os.getenv("PROMOTED_ETF_ENTRY_MIN_OPTION_OI", "1500"))
+PROMOTED_CONT_MIN_MOMENTUM_SCORE = float(os.getenv("PROMOTED_CONT_MIN_MOMENTUM_SCORE", "36"))
 ENTRY_ALLOWED_SETUPS = {
     s.strip().upper()
     for s in os.getenv(
@@ -1430,16 +1432,29 @@ def entry_momentum_continuation_ok(symbol, side, data):
 
     m = _side_metric_bundle(data, side)
     is_etf = str(symbol or "").upper() in ETF_SYMBOLS
+    watchlist_promoted = bool((data or {}).get("watchlist_promoted", False))
+    ignition_confirmed = bool((data or {}).get("ignition_confirmed", False))
+    ignition_delta = int((data or {}).get("ignition_delta", 0))
+
+    min_momentum_required = float(ENTRY_CONT_MIN_MOMENTUM_SCORE)
+    if (
+        (not is_etf)
+        and RECALL_FIRST_MODE
+        and watchlist_promoted
+        and ignition_confirmed
+        and ignition_delta >= max(10, ENTRY_MIN_IGNITION_DELTA - 2)
+        and m["dominance"] >= max(20.0, float(SCORE_DOMINANCE))
+    ):
+        min_momentum_required = min(min_momentum_required, float(PROMOTED_CONT_MIN_MOMENTUM_SCORE))
+
     # ETF scoring uses the legacy model and does not populate momentum category fields,
     # so ETF continuation should rely on score-delta + EMA slope instead.
-    if (not is_etf) and m["momentum"] < ENTRY_CONT_MIN_MOMENTUM_SCORE:
-        return False, f"momentum {m['momentum']:.1f} < {ENTRY_CONT_MIN_MOMENTUM_SCORE}"
+    if (not is_etf) and m["momentum"] < min_momentum_required:
+        return False, f"momentum {m['momentum']:.1f} < {min_momentum_required:.1f}"
     # For top stocks where ignition was freshly confirmed with a large delta,
     # skip the momentum quality check — the ignition burst itself proves momentum.
     # MQ lags on fast movers because EMA20 slope takes bars to reflect the move.
     is_top_stock = str(symbol or "").upper() in TOP_STOCK_SYMBOLS
-    ignition_confirmed = bool((data or {}).get("ignition_confirmed", False))
-    ignition_delta = int((data or {}).get("ignition_delta", 0))
     skip_mq = is_top_stock and ignition_confirmed and ignition_delta >= IGNITION_MIN_DELTA
     if (not is_etf) and (not skip_mq) and m["momentum_quality"] < ENTRY_CONT_MIN_MOMENTUM_QUALITY:
         return False, f"momentum quality {m['momentum_quality']:.1f} < {ENTRY_CONT_MIN_MOMENTUM_QUALITY}"
@@ -2593,6 +2608,14 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
 
     oi = _safe_int_num((option or {}).get("open_interest", 0), 0)
     min_oi = ETF_ENTRY_MIN_OPTION_OI if symbol in ETF_SYMBOLS else STOCK_ENTRY_MIN_OPTION_OI
+    if (
+        symbol in ETF_SYMBOLS
+        and RECALL_FIRST_MODE
+        and bool((data or {}).get("watchlist_promoted", False))
+        and bool((data or {}).get("ignition_confirmed", False))
+        and _safe_int_num((data or {}).get("ignition_delta", 0), 0) >= max(10, ENTRY_MIN_IGNITION_DELTA - 2)
+    ):
+        min_oi = min(min_oi, int(PROMOTED_ETF_ENTRY_MIN_OPTION_OI))
     if oi < min_oi:
         return False, f"open interest {oi} < {min_oi}"
 
