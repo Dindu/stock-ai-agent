@@ -1269,6 +1269,7 @@ def watchlist_execution_confirmed(symbol, side, data):
         return False, "selective watchlist execution disabled"
 
     m = _side_metric_bundle(data, side)
+    has_delta = m["delta_5m"] is not None
     entry_timing = _classify_entry_timing(data or {}, side)
     is_top_stock = str(symbol or "").upper() in TOP_STOCK_SYMBOLS
     rel_strength = _safe_float_num(
@@ -1276,13 +1277,26 @@ def watchlist_execution_confirmed(symbol, side, data):
         0.0,
     )
 
-    if symbol in ETF_SYMBOLS and m["delta_5m"] is not None:
+    if RECALL_FIRST_MODE and not has_delta:
+        startup_override = (
+            m["side_score"] >= max(SCORE_WATCH + 8, WATCHLIST_PROMOTION_MIN_SCORE)
+            and m["dominance"] >= max(10, WATCHLIST_PROMOTION_MIN_DOMINANCE)
+            and m["regime"] >= 45
+            and (m["momentum"] >= max(22.0, WATCHLIST_PROMOTION_MIN_MOMENTUM - 13) or entry_timing in {"HIGHER_LOW_RECLAIM", "LOWER_HIGH_FAILURE"})
+        )
+        if startup_override:
+            return True, (
+                f"startup override: score={m['side_score']:.0f}, dom={m['dominance']:.0f}, "
+                f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, regime={m['regime']:.1f}"
+            )
+
+    if symbol in ETF_SYMBOLS and has_delta:
         etf_override = (
             m["side_score"] >= max(50, SCORE_WATCH - 2)
             and m["dominance"] >= max(8, WATCHLIST_PROMOTION_MIN_DOMINANCE - 4)
             and m["delta_5m"] >= -1
             and m["momentum"] >= max(22.0, WATCHLIST_PROMOTION_MIN_MOMENTUM - 12)
-            and m["volume"] >= max(15.0, WATCHLIST_PROMOTION_MIN_VOLUME - 15)
+            and m["volume"] >= max(10.0, WATCHLIST_PROMOTION_MIN_VOLUME - 20)
             and m["regime"] >= 45
         )
         if etf_override:
@@ -1291,7 +1305,7 @@ def watchlist_execution_confirmed(symbol, side, data):
                 f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, d5={m['delta_5m']}"
             )
 
-    if STOCK_SIMPLE_ENTRY_MODE and symbol not in ETF_SYMBOLS and m["delta_5m"] is not None:
+    if STOCK_SIMPLE_ENTRY_MODE and symbol not in ETF_SYMBOLS and has_delta:
         stock_override = (
             m["side_score"] >= max(48, SCORE_WATCH - 4)
             and m["dominance"] >= max(8, WATCHLIST_PROMOTION_MIN_DOMINANCE - 4)
@@ -1305,7 +1319,7 @@ def watchlist_execution_confirmed(symbol, side, data):
                 f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, d5={m['delta_5m']}"
             )
 
-    if RECALL_FIRST_MODE and m["delta_5m"] is not None:
+    if RECALL_FIRST_MODE and has_delta:
         recall_override = (
             m["side_score"] >= max(45, SCORE_WATCH - 5)
             and m["dominance"] >= max(8, WATCHLIST_PROMOTION_MIN_DOMINANCE - 4)
@@ -1319,13 +1333,13 @@ def watchlist_execution_confirmed(symbol, side, data):
                 f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, d5={m['delta_5m']}"
             )
 
-    if entry_timing in {"FIRST_PULLBACK", "VWAP_RECLAIM", "HIGHER_LOW_RECLAIM", "BREAKDOWN_RETEST", "LOWER_HIGH_FAILURE", "VWAP_REJECT", "MOMENTUM_CONTINUATION"} and m["delta_5m"] is not None:
+    if entry_timing in {"FIRST_PULLBACK", "VWAP_RECLAIM", "HIGHER_LOW_RECLAIM", "BREAKDOWN_RETEST", "LOWER_HIGH_FAILURE", "VWAP_REJECT", "MOMENTUM_CONTINUATION"} and has_delta:
         pullback_override = (
             m["side_score"] >= max(SCORE_WATCH, WATCHLIST_PROMOTION_MIN_SCORE - 6)
             and m["dominance"] >= max(10, WATCHLIST_PROMOTION_MIN_DOMINANCE - 2)
             and m["delta_5m"] >= 0
             and m["momentum"] >= max(25.0, WATCHLIST_PROMOTION_MIN_MOMENTUM - 10)
-            and m["volume"] >= max(20.0, WATCHLIST_PROMOTION_MIN_VOLUME - 10)
+            and m["volume"] >= max(15.0, WATCHLIST_PROMOTION_MIN_VOLUME - 15)
             and m["regime"] >= 50
         )
         if pullback_override:
@@ -1334,7 +1348,7 @@ def watchlist_execution_confirmed(symbol, side, data):
                 f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, d5={m['delta_5m']}"
             )
 
-    if entry_timing in {"HIGHER_LOW_RECLAIM", "LOWER_HIGH_FAILURE"} and m["delta_5m"] is not None:
+    if entry_timing in {"HIGHER_LOW_RECLAIM", "LOWER_HIGH_FAILURE"} and has_delta:
         structure_override = (
             m["side_score"] >= max(44, SCORE_WATCH - 6)
             and m["dominance"] >= max(6, WATCHLIST_PROMOTION_MIN_DOMINANCE - 6)
@@ -1385,11 +1399,11 @@ def watchlist_execution_confirmed(symbol, side, data):
         return False, f"dominance {m['dominance']:.0f} < {WATCHLIST_PROMOTION_MIN_DOMINANCE}"
     if m["momentum"] < WATCHLIST_PROMOTION_MIN_MOMENTUM:
         return False, f"momentum {m['momentum']:.1f} < {WATCHLIST_PROMOTION_MIN_MOMENTUM}"
-    if m["volume"] < WATCHLIST_PROMOTION_MIN_VOLUME:
+    if m["volume"] < WATCHLIST_PROMOTION_MIN_VOLUME and not (RECALL_FIRST_MODE and m["side_score"] >= max(SCORE_WATCH + 6, WATCHLIST_PROMOTION_MIN_SCORE) and m["dominance"] >= max(10, WATCHLIST_PROMOTION_MIN_DOMINANCE)):
         return False, f"volume {m['volume']:.1f} < {WATCHLIST_PROMOTION_MIN_VOLUME}"
     if m["regime"] < 60:
         return False, f"regime alignment {m['regime']:.1f} < 60"
-    if m["delta_5m"] is None and m["side_score"] < 90:
+    if m["delta_5m"] is None and m["side_score"] < 90 and not (RECALL_FIRST_MODE and m["side_score"] >= max(SCORE_WATCH + 6, WATCHLIST_PROMOTION_MIN_SCORE) and m["dominance"] >= max(10, WATCHLIST_PROMOTION_MIN_DOMINANCE)):
         return False, "insufficient 5m history for continuation"
     if m["delta_5m"] is not None and m["delta_5m"] < WATCHLIST_PROMOTION_MIN_DELTA_5M:
         return False, f"5m delta {m['delta_5m']} < {WATCHLIST_PROMOTION_MIN_DELTA_5M}"
@@ -1961,11 +1975,33 @@ def analyze(df, client, symbol):
         if moving_away_bearish:
             bear_score += 10; bear_breakdown["VWAP direction bearish"] = 10
 
-        trend_bull = trend_bear = 0.0
-        volume_bull = volume_bear = 0.0
-        regime_bull = regime_bear = 0.0
-        rel_bull = rel_bear = 0.0
-        pattern_bull = pattern_bear = 0.0
+        trend_bull = _to_100((
+            (1.0 if price > vwap else 0.0)
+            + (1.0 if price > ema20 else 0.0)
+            + (1.0 if price > ema50 else 0.0)
+            + (1.0 if ema20_rising else 0.0)
+        ) / 4.0)
+        trend_bear = _to_100((
+            (1.0 if price < vwap else 0.0)
+            + (1.0 if price < ema20 else 0.0)
+            + (1.0 if price < ema50 else 0.0)
+            + (1.0 if ema20_falling else 0.0)
+        ) / 4.0)
+        volume_bull = _to_100((
+            (_clamp01((vol_ratio - 1.0) / 1.0)) * 0.50
+            + ((1.0 if bullish_candle else 0.0) * 0.25)
+            + ((1.0 if strong_volume else 0.0) * 0.25)
+        ))
+        volume_bear = _to_100((
+            (_clamp01((vol_ratio - 1.0) / 1.0)) * 0.50
+            + ((1.0 if bearish_candle else 0.0) * 0.25)
+            + ((1.0 if strong_volume else 0.0) * 0.25)
+        ))
+        regime_bull, regime_bear = _market_regime_scores(symbol, price, vwap, ema20, ema50, ema20_rising, ema20_falling)
+        rel_bull = _to_100(((1.0 if price > recent_high else 0.0) * 0.60) + ((1.0 if price > ema50 else 0.0) * 0.40))
+        rel_bear = _to_100(((1.0 if price < recent_low else 0.0) * 0.60) + ((1.0 if price < ema50 else 0.0) * 0.40))
+        pattern_bull = _to_100(((1.0 if bullish_candle else 0.0) * 0.35) + ((1.0 if price > recent_high else 0.0) * 0.35) + ((1.0 if moving_away_bullish else 0.0) * 0.30))
+        pattern_bear = _to_100(((1.0 if bearish_candle else 0.0) * 0.35) + ((1.0 if price < recent_low else 0.0) * 0.35) + ((1.0 if moving_away_bearish else 0.0) * 0.30))
         option_liq_score = 0.0
     else:
 
