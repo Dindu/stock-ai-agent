@@ -313,7 +313,7 @@ ENTRY_ALLOWED_SETUPS = {
     s.strip().upper()
     for s in os.getenv(
         "ENTRY_ALLOWED_SETUPS",
-        "EARLY_BREAKOUT,FIRST_PULLBACK,VWAP_RECLAIM,MOMENTUM_CONTINUATION,BREAKDOWN,BREAKDOWN_RETEST,VWAP_REJECT",
+        "EARLY_BREAKOUT,FIRST_PULLBACK,VWAP_RECLAIM,HIGHER_LOW_RECLAIM,MOMENTUM_CONTINUATION,BREAKDOWN,BREAKDOWN_RETEST,LOWER_HIGH_FAILURE,VWAP_REJECT",
     ).split(",")
     if s.strip()
 }
@@ -1158,8 +1158,11 @@ def dynamic_min_required_score(symbol, side, data):
     relief = 0
     penalty = 0
 
-    if entry_timing in {"FIRST_PULLBACK", "VWAP_RECLAIM", "BREAKDOWN_RETEST", "VWAP_REJECT", "MOMENTUM_CONTINUATION"}:
+    if entry_timing in {"FIRST_PULLBACK", "VWAP_RECLAIM", "HIGHER_LOW_RECLAIM", "BREAKDOWN_RETEST", "LOWER_HIGH_FAILURE", "VWAP_REJECT", "MOMENTUM_CONTINUATION"}:
         relief += 4
+
+    if entry_timing in {"HIGHER_LOW_RECLAIM", "LOWER_HIGH_FAILURE"}:
+        relief += 3
 
     if RECALL_FIRST_MODE:
         relief += 2
@@ -1223,14 +1226,23 @@ def opening_window_exception_ok(symbol, side, data):
         return False, "disabled"
     if symbol not in ETF_SYMBOLS and symbol not in TOP_STOCK_SYMBOLS:
         return False, "symbol not in ETF/top-stock allowlist"
-    if str((data or {}).get("tier", "")).upper() != "STRONG":
-        return False, "tier not STRONG"
 
     m = _side_metric_bundle(data, side)
+    entry_timing = _classify_entry_timing(data or {}, side)
     side_delta_5m, _ = _score_trend_deltas(data or {}, side)
     vol_ratio = _safe_float_num((data or {}).get("vol_ratio", 1.0), 1.0)
     price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
     vwap = _safe_float_num((data or {}).get("vwap", 0.0), 0.0)
+
+    if str((data or {}).get("tier", "")).upper() != "STRONG":
+        early_structure_ok = (
+            entry_timing in {"HIGHER_LOW_RECLAIM", "LOWER_HIGH_FAILURE"}
+            and bool((data or {}).get("watchlist_promoted", False))
+            and m["side_score"] >= max(SCORE_WATCH, OPENING_EXCEPTION_MIN_SCORE - 25)
+            and m["dominance"] >= max(8, OPENING_EXCEPTION_MIN_DOMINANCE - 30)
+        )
+        if not early_structure_ok:
+            return False, "tier not STRONG"
 
     if m["side_score"] < OPENING_EXCEPTION_MIN_SCORE:
         return False, f"score {m['side_score']:.0f} < {OPENING_EXCEPTION_MIN_SCORE}"
@@ -1307,7 +1319,7 @@ def watchlist_execution_confirmed(symbol, side, data):
                 f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, d5={m['delta_5m']}"
             )
 
-    if entry_timing in {"FIRST_PULLBACK", "VWAP_RECLAIM", "BREAKDOWN_RETEST", "VWAP_REJECT", "MOMENTUM_CONTINUATION"} and m["delta_5m"] is not None:
+    if entry_timing in {"FIRST_PULLBACK", "VWAP_RECLAIM", "HIGHER_LOW_RECLAIM", "BREAKDOWN_RETEST", "LOWER_HIGH_FAILURE", "VWAP_REJECT", "MOMENTUM_CONTINUATION"} and m["delta_5m"] is not None:
         pullback_override = (
             m["side_score"] >= max(SCORE_WATCH, WATCHLIST_PROMOTION_MIN_SCORE - 6)
             and m["dominance"] >= max(10, WATCHLIST_PROMOTION_MIN_DOMINANCE - 2)
@@ -1319,6 +1331,20 @@ def watchlist_execution_confirmed(symbol, side, data):
         if pullback_override:
             return True, (
                 f"pullback/reclaim override ({entry_timing.lower()}): score={m['side_score']:.0f}, dom={m['dominance']:.0f}, "
+                f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, d5={m['delta_5m']}"
+            )
+
+    if entry_timing in {"HIGHER_LOW_RECLAIM", "LOWER_HIGH_FAILURE"} and m["delta_5m"] is not None:
+        structure_override = (
+            m["side_score"] >= max(44, SCORE_WATCH - 6)
+            and m["dominance"] >= max(6, WATCHLIST_PROMOTION_MIN_DOMINANCE - 6)
+            and m["delta_5m"] >= -1
+            and m["momentum"] >= max(16.0, WATCHLIST_PROMOTION_MIN_MOMENTUM - 18)
+            and m["regime"] >= 40
+        )
+        if structure_override:
+            return True, (
+                f"early-structure override ({entry_timing.lower()}): score={m['side_score']:.0f}, dom={m['dominance']:.0f}, "
                 f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, d5={m['delta_5m']}"
             )
 
@@ -1504,6 +1530,10 @@ def _classify_entry_timing(data, side):
     ema20 = _safe_float_num((data or {}).get("ema20", 0.0), 0.0)
     recent_high = _safe_float_num((data or {}).get("recent_high", 0.0), 0.0)
     recent_low = _safe_float_num((data or {}).get("recent_low", 0.0), 0.0)
+    micro_high = _safe_float_num((data or {}).get("micro_high", recent_high), recent_high)
+    micro_low = _safe_float_num((data or {}).get("micro_low", recent_low), recent_low)
+    prior_bar_high = _safe_float_num((data or {}).get("prior_bar_high", price), price)
+    prior_bar_low = _safe_float_num((data or {}).get("prior_bar_low", price), price)
     ext_pct = _safe_float_num((data or {}).get("vwap_extension_pct", 0.0), 0.0)
     vwap_distance_prev = _safe_float_num((data or {}).get("vwap_distance_prev", 0.0), 0.0)
     bullish_candle = bool((data or {}).get("bullish_candle", False))
@@ -1519,11 +1549,36 @@ def _classify_entry_timing(data, side):
     reclaim_ready_bull = delta_5m is not None and delta_5m >= 1 and (bullish_candle or moving_away_bullish)
     reclaim_ready_bear = delta_5m is not None and delta_5m >= 1 and (bearish_candle or moving_away_bearish)
     pullback_ready = delta_5m is not None and 1 <= delta_5m <= 7 and ext_pct <= (MAX_EXT_FROM_VWAP * 0.85)
+    early_reclaim_bull = (
+        side == "CALL"
+        and price > vwap
+        and price > ema20
+        and bullish_candle
+        and price > prior_bar_high
+        and micro_low >= min(vwap, ema20) * 0.997
+        and (delta_5m is None or delta_5m >= 0)
+        and ext_pct <= (MAX_EXT_FROM_VWAP * 0.75)
+    )
+    early_failure_bear = (
+        side == "PUT"
+        and price < vwap
+        and price < ema20
+        and bearish_candle
+        and price < prior_bar_low
+        and micro_high <= max(vwap, ema20) * 1.003
+        and (delta_5m is None or delta_5m >= 0)
+        and ext_pct <= (MAX_EXT_FROM_VWAP * 0.75)
+    )
 
     if side == "CALL" and delta_5m is not None and delta_10m is not None and delta_5m >= 8 and delta_10m >= 10 and fresh_breakout and bullish_candle and moving_away_bullish:
         return "EARLY_BREAKOUT"
     if side == "PUT" and delta_5m is not None and delta_10m is not None and delta_5m >= 8 and delta_10m >= 10 and fresh_breakdown and bearish_candle and moving_away_bearish:
         return "BREAKDOWN"
+
+    if early_reclaim_bull:
+        return "HIGHER_LOW_RECLAIM"
+    if early_failure_bear:
+        return "LOWER_HIGH_FAILURE"
 
     if side == "CALL" and price > vwap and vwap_distance_prev <= 0 and reclaim_ready_bull:
         return "VWAP_RECLAIM"
@@ -1825,6 +1880,11 @@ def analyze(df, client, symbol):
     recent_low = float(recent_window["low"].min()) if len(recent_window) else price
     fresh_breakout = prev_close <= recent_high and price > recent_high
     fresh_breakdown = prev_close >= recent_low and price < recent_low
+    micro_window = df.iloc[-4:-1]
+    micro_high = float(micro_window["high"].max()) if len(micro_window) else recent_high
+    micro_low = float(micro_window["low"].min()) if len(micro_window) else recent_low
+    prior_bar_high = float(previous["high"]) if not pd.isna(previous["high"]) else price
+    prior_bar_low = float(previous["low"]) if not pd.isna(previous["low"]) else price
 
     bull_trend_mask = (df["close"] > df["VWAP"]) & (df["close"] > df["EMA20"]) & (df["close"] > df["EMA50"])
     bear_trend_mask = (df["close"] < df["VWAP"]) & (df["close"] < df["EMA20"]) & (df["close"] < df["EMA50"])
@@ -2077,6 +2137,10 @@ def analyze(df, client, symbol):
         "pdl": pdl,
         "recent_high": recent_high,
         "recent_low": recent_low,
+        "micro_high": micro_high,
+        "micro_low": micro_low,
+        "prior_bar_high": prior_bar_high,
+        "prior_bar_low": prior_bar_low,
         "fresh_breakout": fresh_breakout,
         "fresh_breakdown": fresh_breakdown,
         "bull_trend_age_bars": bull_trend_age_bars,
@@ -4995,6 +5059,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
 
     # Trend-ignition filter: only fire when the move is *just starting*, not mid- or late-trend.
     if IGNITION_REQUIRED and not NO_GATING_MODE:
+        entry_timing = _classify_entry_timing(data or {}, side)
         if side == "CALL":
             now_score = data["bull_score"]
             past_score = data["bull_5m"]
@@ -5004,7 +5069,9 @@ def run_symbol(client, symbol, prefetched_bars=None):
 
         is_etf = symbol in ETF_SYMBOLS
         required_delta = ignition_delta_required(now_score, ignition_min_delta)
-        if is_etf:
+        if entry_timing in {"HIGHER_LOW_RECLAIM", "LOWER_HIGH_FAILURE"}:
+            required_delta = max(3, required_delta - 6)
+        elif is_etf:
             required_delta = max(8, required_delta - 5)
         elif RECALL_FIRST_MODE:
             required_delta = max(6, required_delta - 3)
@@ -5018,7 +5085,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 past_score = oldest_bull if side == "CALL" else oldest_bear
                 delta = now_score - past_score
                 if now_score < 95 and delta < required_delta:
-                    if ((is_etf or RECALL_FIRST_MODE) and now_score >= 75 and delta >= max(4, required_delta - 4)):
+                    if ((is_etf or RECALL_FIRST_MODE or entry_timing in {"HIGHER_LOW_RECLAIM", "LOWER_HIGH_FAILURE"}) and now_score >= 70 and delta >= max(2, required_delta - 4)):
                         log(
                             f"[{symbol}] Ignition warmup override: {side} score {past_score} \u2192 {now_score} "
                             f"(\u0394 +{delta}) accepted with relaxed delta {required_delta}."
@@ -5073,7 +5140,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
             )
             return
         elif past_score >= IGNITION_PRIOR_MAX:
-            if (is_etf or RECALL_FIRST_MODE) and now_score >= 75 and delta >= max(4, required_delta - 4):
+            if (is_etf or RECALL_FIRST_MODE or entry_timing in {"HIGHER_LOW_RECLAIM", "LOWER_HIGH_FAILURE"}) and now_score >= 70 and delta >= max(2, required_delta - 4):
                 log(
                     f"[{symbol}] Ignition continuation override: {side} remains strong "
                     f"({past_score} -> {now_score}, \u0394 {delta:+d}) with relaxed delta {required_delta}."

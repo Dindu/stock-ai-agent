@@ -248,7 +248,134 @@ The bot is best understood as:
 
 If it feels too strict, the usual reason is that several gates are stacking together. The simplified ETF and stock entry paths were added to reduce that overblocking.
 
-## 9. Key Functions To Read In Code
+## 9. Entry Pattern Matrix
+
+These are the main chart patterns the bot should prioritize across symbols.
+
+### 1. LOWER_HIGH_FAILURE
+
+Use for short entries.
+
+Required chart condition:
+- strong move down already started
+- bounce fails below VWAP or EMA20
+- current candle breaks below prior bar low
+- local micro-high stays capped under resistance
+
+Required score condition:
+- side score at least WATCH-quality
+- dominance positive for PUT side
+- regime not strongly against the short
+
+Preferred timing label:
+- `LOWER_HIGH_FAILURE`
+
+Skip when:
+- price is already flushing into fresh lows
+- extension from VWAP is already too large
+- bounce actually reclaims VWAP/EMA20
+
+### 2. HIGHER_LOW_RECLAIM
+
+Use for long entries.
+
+Required chart condition:
+- pullback holds trend structure
+- price reclaims VWAP or EMA20
+- current candle breaks above prior bar high
+- local micro-low holds near support
+
+Required score condition:
+- side score at least WATCH-quality
+- dominance positive for CALL side
+- regime not strongly against the long
+
+Preferred timing label:
+- `HIGHER_LOW_RECLAIM`
+
+Skip when:
+- price is already vertical and extended
+- reclaim is weak and immediately fading
+- move is happening straight into resistance after a long run
+
+### 3. BREAKDOWN_RETEST
+
+Use for continuation shorts.
+
+Required chart condition:
+- prior breakdown already happened
+- weak base or bounce forms
+- support fails again
+- price stays below VWAP and EMA20
+
+Required score condition:
+- score at least WATCH to SIGNAL quality
+- delta is not fading
+- bearish regime still intact
+
+Preferred timing label:
+- `BREAKDOWN_RETEST`
+
+Skip when:
+- retest is already too extended
+- bearish momentum is fading hard
+- support break happens after a capitulation flush
+
+### 4. FIRST_PULLBACK
+
+Use for clean continuation after trend confirmation.
+
+Required chart condition:
+- first real pullback after breakout or breakdown
+- pullback stays controlled
+- reclaim/continuation candle confirms direction
+
+Required score condition:
+- score at least WATCH to SIGNAL quality
+- momentum and slope still aligned
+- regime still supportive
+
+Preferred timing label:
+- `FIRST_PULLBACK`
+
+Skip when:
+- trend is already mature
+- price has already traveled too far from VWAP
+- overlap/chop dominates the structure
+
+### 5. EARLY_BREAKOUT / BREAKDOWN
+
+Use for strongest momentum expansions.
+
+Required chart condition:
+- fresh high or fresh low break
+- strong directional candle
+- price moving away from VWAP, not back into it
+
+Required score condition:
+- score already near strong territory
+- delta expansion is real
+- volume confirms
+
+Preferred timing label:
+- `EARLY_BREAKOUT`
+- `BREAKDOWN`
+
+Skip when:
+- breakout is already several candles old
+- the move is extended and chasey
+- breakout candle immediately stalls
+
+### Default Skip Conditions
+
+The bot should usually skip when the chart looks like:
+- chop / overlap / range noise
+- blowoff top or flush bottom
+- no clear reclaim or failure structure
+- weak bounce in the middle of nowhere
+- late score expansion after the real move already happened
+
+## 10. Key Functions To Read In Code
 
 ### analyze
 
