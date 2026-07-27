@@ -123,7 +123,7 @@ SCORE_DOMINANCE = int(os.getenv("SCORE_DOMINANCE", "20"))  # bull must lead bear
 NO_GATING_MODE = os.getenv("NO_GATING_MODE", "0") == "1"
 ENFORCE_OPENING_WINDOW_IN_NO_GATING = os.getenv("ENFORCE_OPENING_WINDOW_IN_NO_GATING", "1") == "1"
 # Stock-only tightening: require a slightly higher effective strong score.
-STOCK_STRONG_SCORE_BONUS = int(os.getenv("STOCK_STRONG_SCORE_BONUS", "3"))
+STOCK_STRONG_SCORE_BONUS = int(os.getenv("STOCK_STRONG_SCORE_BONUS", "0"))
 # Hard score gate control:
 # - When HARD_SCORE_GATE_ENABLED=0, no hard minimum score is enforced.
 # - When NO_GATING_MODE=1, the hard gate is bypassed by default unless
@@ -135,13 +135,15 @@ DYNAMIC_HARD_GATE_ENABLED = os.getenv("DYNAMIC_HARD_GATE_ENABLED", "1") == "1"
 DYNAMIC_HARD_GATE_MAX_RELIEF = int(os.getenv("DYNAMIC_HARD_GATE_MAX_RELIEF", "8"))
 DYNAMIC_HARD_GATE_MAX_PENALTY = int(os.getenv("DYNAMIC_HARD_GATE_MAX_PENALTY", "4"))
 DYNAMIC_HARD_GATE_MIN_FLOOR_ETF = int(os.getenv("DYNAMIC_HARD_GATE_MIN_FLOOR_ETF", "67"))
-DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK = int(os.getenv("DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK", "70"))
-TOP_STOCK_HARD_GATE_MIN_FLOOR = int(os.getenv("TOP_STOCK_HARD_GATE_MIN_FLOOR", "66"))
+DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK = int(os.getenv("DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK", "64"))
+TOP_STOCK_HARD_GATE_MIN_FLOOR = int(os.getenv("TOP_STOCK_HARD_GATE_MIN_FLOOR", "62"))
 # Execution behavior controls.
 # Default: do not auto-execute WATCHLIST setups (alerts-only quality).
 EXECUTE_WATCHLIST_SIGNALS = os.getenv("EXECUTE_WATCHLIST_SIGNALS", "0") == "1"
 # Selective watchlist execution: allow entries only when continuation confirmation passes.
 SELECTIVE_WATCHLIST_EXECUTION_ENABLED = os.getenv("SELECTIVE_WATCHLIST_EXECUTION_ENABLED", "1") == "1"
+ETF_SIMPLE_ENTRY_MODE = os.getenv("ETF_SIMPLE_ENTRY_MODE", "1") == "1"
+STOCK_SIMPLE_ENTRY_MODE = os.getenv("STOCK_SIMPLE_ENTRY_MODE", "1") == "1"
 WATCHLIST_PROMOTION_MIN_SCORE = int(os.getenv("WATCHLIST_PROMOTION_MIN_SCORE", "56"))
 WATCHLIST_PROMOTION_MIN_DOMINANCE = int(os.getenv("WATCHLIST_PROMOTION_MIN_DOMINANCE", "12"))
 WATCHLIST_PROMOTION_MIN_MOMENTUM = int(os.getenv("WATCHLIST_PROMOTION_MIN_MOMENTUM", "35"))
@@ -1215,6 +1217,20 @@ def watchlist_execution_confirmed(symbol, side, data):
         if etf_override:
             return True, (
                 f"ETF override: score={m['side_score']:.0f}, dom={m['dominance']:.0f}, "
+                f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, d5={m['delta_5m']}"
+            )
+
+    if STOCK_SIMPLE_ENTRY_MODE and symbol not in ETF_SYMBOLS and m["delta_5m"] is not None:
+        stock_override = (
+            m["side_score"] >= max(48, SCORE_WATCH - 4)
+            and m["dominance"] >= max(8, WATCHLIST_PROMOTION_MIN_DOMINANCE - 4)
+            and m["delta_5m"] >= -1
+            and m["momentum"] >= max(20.0, WATCHLIST_PROMOTION_MIN_MOMENTUM - 15)
+            and m["regime"] >= 45
+        )
+        if stock_override:
+            return True, (
+                f"stock simplified mode: score={m['side_score']:.0f}, dom={m['dominance']:.0f}, "
                 f"mom={m['momentum']:.1f}, vol={m['volume']:.1f}, d5={m['delta_5m']}"
             )
 
