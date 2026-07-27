@@ -5034,7 +5034,21 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if enforce_hard_gate:
         side_score = data["bull_score"] if side == "CALL" else data["bear_score"]
         min_required_score = dynamic_min_required_score(symbol, side, data)
-        if side_score < min_required_score:
+        if data.get("watchlist_promoted", False) and RECALL_FIRST_MODE:
+            dominance = abs(int(data.get("bull_score", 0)) - int(data.get("bear_score", 0)))
+            promoted_floor = max(50, SCORE_WATCH)
+            promoted_dom_floor = max(20, SCORE_DOMINANCE)
+            if side_score < promoted_floor or dominance < promoted_dom_floor:
+                log(
+                    f"[{symbol}] Hard score gate (promoted): {side} score/dom too weak "
+                    f"({side_score}/{dominance}) < ({promoted_floor}/{promoted_dom_floor}) - skipping."
+                )
+                return
+            log(
+                f"[{symbol}] Hard score gate relaxed (watchlist promoted): {side} {side_score} "
+                f"with dominance {dominance} (base requirement {min_required_score})."
+            )
+        elif side_score < min_required_score:
             log(
                 f"[{symbol}] Hard score gate: {side} {side_score} < {min_required_score} "
                 f"- skipping (requires >= {min_required_score})."
