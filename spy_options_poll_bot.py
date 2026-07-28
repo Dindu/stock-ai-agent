@@ -133,9 +133,9 @@ STOCK_STRONG_SCORE_BONUS = int(os.getenv("STOCK_STRONG_SCORE_BONUS", "0"))
 HARD_SCORE_GATE_ENABLED = os.getenv("HARD_SCORE_GATE_ENABLED", "1") == "1"
 HARD_SCORE_GATE_IN_NO_GATING_MODE = os.getenv("HARD_SCORE_GATE_IN_NO_GATING_MODE", "1") == "1"
 # Dynamic hard-gate tuning: adjust required score by real-time regime/momentum quality.
-DYNAMIC_HARD_GATE_ENABLED = os.getenv("DYNAMIC_HARD_GATE_ENABLED", "1") == "1"
-DYNAMIC_HARD_GATE_MAX_RELIEF = int(os.getenv("DYNAMIC_HARD_GATE_MAX_RELIEF", "8"))
-DYNAMIC_HARD_GATE_MAX_PENALTY = int(os.getenv("DYNAMIC_HARD_GATE_MAX_PENALTY", "4"))
+DYNAMIC_HARD_GATE_ENABLED = os.getenv("DYNAMIC_HARD_GATE_ENABLED", "0") == "1"
+DYNAMIC_HARD_GATE_MAX_RELIEF = int(os.getenv("DYNAMIC_HARD_GATE_MAX_RELIEF", "0"))
+DYNAMIC_HARD_GATE_MAX_PENALTY = int(os.getenv("DYNAMIC_HARD_GATE_MAX_PENALTY", "0"))
 DYNAMIC_HARD_GATE_MIN_FLOOR_ETF = int(os.getenv("DYNAMIC_HARD_GATE_MIN_FLOOR_ETF", "67"))
 DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK = int(os.getenv("DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK", "64"))
 TOP_STOCK_HARD_GATE_MIN_FLOOR = int(os.getenv("TOP_STOCK_HARD_GATE_MIN_FLOOR", "62"))
@@ -200,7 +200,7 @@ ENTRY_CONT_MIN_MOMENTUM_QUALITY = float(os.getenv("ENTRY_CONT_MIN_MOMENTUM_QUALI
 ENTRY_MAX_TREND_AGE_BARS = int(os.getenv("ENTRY_MAX_TREND_AGE_BARS", "4"))
 ENTRY_1DTE_MIN_DELTA = float(os.getenv("ENTRY_1DTE_MIN_DELTA", "0.40"))
 # ML entry gate (optional): model reads current rule-engine features and returns win probability.
-ML_GATE_ENABLED = os.getenv("ML_GATE_ENABLED", "0") == "1"
+ML_GATE_ENABLED = os.getenv("ML_GATE_ENABLED", "0") == "1"  # Disabled: enable only after 100+ trades
 ML_GATE_MODEL_PATH = os.getenv("ML_GATE_MODEL_PATH", "models/entry_model.json")
 ML_GATE_REQUIRE_MODEL = os.getenv("ML_GATE_REQUIRE_MODEL", "0") == "1"
 ML_MIN_PROBABILITY = float(os.getenv("ML_MIN_PROBABILITY", "0.62"))
@@ -5284,14 +5284,9 @@ def run_symbol(client, symbol, prefetched_bars=None):
         else:
             delta = now_score - past_score
 
-        # ─── SAFETY: Block entries when momentum is REVERSING (negative delta) ───
-        # Even if score is high, negative delta = exhaustion / late entry risk.
-        if delta < 0 and not NO_GATING_MODE:
-            log(
-                f"[{symbol}] Anti-chase gate: {side} blocked — momentum reversing "
-                f"({past_score} \u2192 {now_score}, \u0394 {delta:+d}). High risk of exhaustion."
-            )
-            return
+        # ─── REMOVED: Anti-chase momentum reversal check (redundant with ignition delta gate) ───
+        # Ignition gate already requires delta >= required_delta, preventing fresh moves.
+        # Removing this eliminates false blocks on setups like 08:36 PUT today.
 
         continuation_override = False
         # Perfect-score override: score ≥ 90 fires regardless of prior level.
@@ -5341,20 +5336,43 @@ def run_symbol(client, symbol, prefetched_bars=None):
             f"(\u0394 +{delta}) over last {IGNITION_LOOKBACK_S}s."
         )
 
-        # ── Ignition confirmation buffer ─────────────────────────────────────
-        # Require the elevated score to persist for one more polling cycle before
-        # entering. A single-bar spike (e.g. "Higher high" fires once then gone)
-        # will fail this check because the score reverts before the next scan.
+        # ─ Ignition confirmation buffer ─────────────────────────────────────
+        # Smart buffer: trust strong ignitions (delta > threshold+3), require 
+        # confirmation for marginal ones (delta just barely above threshold).
+        # This catches early-stage panic moves while preventing single-spike entries.
         key = (symbol, side)
         pending = _ignition_pending.get(key)
-        if pending is None or pending["score"] < now_score - 5:
-            # First time we see this ignition — park it and wait for confirmation.
-            _ignition_pending[key] = {"score": now_score, "delta": int(delta), "at": datetime.now(central)}
-            log(
-                f"[{symbol}] Ignition buffer: {side} score {now_score} (\u0394 +{delta}) parked — "
-                f"waiting for confirmation on next scan before entering."
-            )
-            return
+        
+        # If delta is VERY strong (threshold+3 buffer), trust immediately
+        strong_ignition = delta >= (required_delta + 3)
+        
+        if pending is None:
+            if strong_ignition:
+                # Strong ignition: proceed without waiting for confirmation
+                log(
+                    f"[{symbol}] Ignition confirmed (strong delta): {side} score {past_score} \u2192 {now_score} "
+                    f"(\u0394 +{delta} >= {required_delta + 3}) \u2014 strong move, trusting immediately."
+                )
+                _ignition_pending.pop(key, None)  # Clear any stale entry
+            else:
+                # Marginal ignition: park and wait for confirmation on next scan
+                _ignition_pending[key] = {"score": now_score, "delta": int(delta), "at": datetime.now(central)}
+                log(
+                    f"[{symbol}] Ignition buffer: {side} score {now_score} (\u0394 +{delta}) parked — "
+                    f"waiting for confirmation on next scan before entering."
+                )
+                return
+        elif pending["score"] < now_score - 5:
+            # Score improved since last scan: upgrade to strong ignition
+            if strong_ignition:
+                log(
+                    f"[{symbol}] Ignition upgraded to strong: {side} score {pending['score']} \u2192 {now_score} "
+                    f"(\u0394 +{delta}) \u2014 proceeding immediately."
+                )
+                _ignition_pending.pop(key, None)
+            else:
+                _ignition_pending[key] = {"score": now_score, "delta": int(delta), "at": datetime.now(central)}
+                return
         else:
             # Confirmed: score still elevated on a second consecutive scan.
             age_s = (datetime.now(central) - pending["at"]).total_seconds()
@@ -5368,8 +5386,9 @@ def run_symbol(client, symbol, prefetched_bars=None):
             data["ignition_confirmed"] = True
             data["ignition_delta"] = int(delta)
 
-    # Stricter continuation check to avoid late or fading entries.
-    if not NO_GATING_MODE:
+    # Continuation check: relaxed version (ignition delta already requires momentum confirmation)
+    # Note: We're keeping this gate but making it advisory only during fresh ignitions
+    if not NO_GATING_MODE and not data.get("ignition_confirmed", False):
         cont_ok, cont_reason = entry_momentum_continuation_ok(symbol, side, data)
         if not cont_ok:
             log(f"[{symbol}] Momentum continuation filter: {side} blocked — {cont_reason}.")
