@@ -1155,9 +1155,15 @@ def _side_metric_bundle(data, side):
 
 def dynamic_min_required_score(symbol, side, data):
     """Return a dynamic hard minimum score using regime and continuation quality."""
-    base = SCORE_STRONG + 1 if symbol in ETF_SYMBOLS else SCORE_STRONG + max(0, STOCK_STRONG_SCORE_BONUS)
+    is_top_stock = str(symbol or "").upper() in TOP_STOCK_SYMBOLS
     if not DYNAMIC_HARD_GATE_ENABLED:
-        return int(base)
+        # Use the well-tuned floor constants directly (ETF=67, TopStock=62, Stock=64)
+        if symbol in ETF_SYMBOLS:
+            return DYNAMIC_HARD_GATE_MIN_FLOOR_ETF
+        elif is_top_stock:
+            return TOP_STOCK_HARD_GATE_MIN_FLOOR
+        else:
+            return DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK
 
     m = _side_metric_bundle(data, side)
     entry_timing = _classify_entry_timing(data or {}, side)
@@ -2238,7 +2244,14 @@ def analyze(df, client, symbol):
     
     # ========== Decision with Context Validation ==========
     # Keep label thresholds aligned with downstream hard-entry gates.
-    strong_threshold = SCORE_STRONG if is_etf else (SCORE_STRONG + max(0, STOCK_STRONG_SCORE_BONUS))
+    # Use the same well-tuned floors: ETF=67, TopStock=62, Stock=64
+    _is_top_stock = symbol in TOP_STOCK_SYMBOLS
+    if is_etf:
+        strong_threshold = DYNAMIC_HARD_GATE_MIN_FLOOR_ETF
+    elif _is_top_stock:
+        strong_threshold = TOP_STOCK_HARD_GATE_MIN_FLOOR
+    else:
+        strong_threshold = DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK
     # The dominant side must lead by SCORE_DOMINANCE points; otherwise NO TRADE.
     diff = bull_score - bear_score
 
