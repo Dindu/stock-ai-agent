@@ -2175,40 +2175,65 @@ def analyze(df, client, symbol):
     # Validate that market structure SUPPORTS the proposed direction
     # Note: price, vwap, rsi are already computed above from latest/calculate_indicators
     
-    # Distance to key levels (%)
+    # Distance to VWAP (%)
     price_to_vwap_pct = (price - vwap) / vwap * 100 if vwap > 0 else 0
-    
-    # Calculate momentum (price 5 bars ago vs now)
+
+    # Momentum: price change over last 5 bars (direction of move)
     if len(df) >= 6:
         close_5 = float(df["close"].iloc[-6])
         momentum_pct = (price - close_5) / close_5 * 100 if close_5 > 0 else 0
     else:
         momentum_pct = 0
-    
-    # Check recent support/resistance
-    recent_high = float(df["high"].iloc[-10:].max())
-    recent_low = float(df["low"].iloc[-10:].min())
-    
+
+    # Short-term momentum: last 2 bars (is move TURNING?)
+    if len(df) >= 3:
+        close_2 = float(df["close"].iloc[-3])
+        momentum_2bar = (price - close_2) / close_2 * 100 if close_2 > 0 else 0
+    else:
+        momentum_2bar = 0
+
     def validate_call_context():
-        """CALLs only valid if price above VWAP with positive momentum (not failed bounce)"""
-        # Red flags that reject CALL
-        if price_to_vwap_pct < -2.5:  # Price significantly below VWAP = downtrend
-            return False, f"CALL rejected: price {price_to_vwap_pct:.1f}% below VWAP (downtrend)"
-        if momentum_pct < -1.0:  # Negative momentum = still falling
-            return False, f"CALL rejected: momentum {momentum_pct:.1f}% (still falling)"
-        if rsi < 25:  # Panic-sold = weak bounce potential
-            return False, f"CALL rejected: RSI {rsi:.0f} (panic-sold, bounce will fail)"
+        """
+        CALL valid in two scenarios:
+        1. Uptrend: price above VWAP with positive momentum (breakout/continuation)
+        2. Recovery: price below VWAP but momentum is TURNING positive (V-shaped rebound)
+           - Must be recovering (5-bar momentum turning), not just one green bar
+        Reject only when price is falling AND showing no reversal signs.
+        """
+        # HARD REJECT: momentum still clearly negative (move hasn't reversed)
+        if momentum_pct < -1.5 and momentum_2bar < -0.3:
+            return False, f"CALL rejected: still falling (5bar {momentum_pct:.1f}%, 2bar {momentum_2bar:.1f}%)"
+        # HARD REJECT: price deep below VWAP AND momentum not recovering
+        if price_to_vwap_pct < -3.0 and momentum_pct < 0:
+            return False, f"CALL rejected: deep downtrend {price_to_vwap_pct:.1f}% below VWAP, no recovery"
+        # ALLOW: Recovery trade - oversold + momentum turning positive
+        if rsi < 35 and momentum_2bar > 0.1:
+            return True, f"CALL allowed: recovery trade RSI {rsi:.0f} + turning momentum {momentum_2bar:.1f}%"
+        # ALLOW: Uptrend - price near/above VWAP with positive momentum
+        if price_to_vwap_pct > -1.0 and momentum_pct > -0.3:
+            return True, "CALL context valid: uptrend/neutral"
         return True, "CALL context valid"
-    
+
     def validate_put_context():
-        """PUTs only valid if price below VWAP with negative momentum (not weak dip)"""
-        # Red flags that reject PUT
-        if price_to_vwap_pct > 2.5:  # Price significantly above VWAP = uptrend
-            return False, f"PUT rejected: price {price_to_vwap_pct:.1f}% above VWAP (uptrend)"
-        if momentum_pct > 1.0:  # Positive momentum = still rising
-            return False, f"PUT rejected: momentum {momentum_pct:.1f}% (still rising)"
-        if rsi > 75:  # Euphoric = weak selloff potential
-            return False, f"PUT rejected: RSI {rsi:.0f} (euphoric, selloff will fail)"
+        """
+        PUT valid in two scenarios:
+        1. Downtrend: price below VWAP with negative momentum (breakdown/continuation)
+        2. Reversal: price above VWAP but momentum is TURNING negative (distribution top)
+           - Must be reversing, not just one red bar
+        Reject only when price is rising AND showing no reversal signs.
+        """
+        # HARD REJECT: momentum still clearly positive (move hasn't reversed)
+        if momentum_pct > 1.5 and momentum_2bar > 0.3:
+            return False, f"PUT rejected: still rising (5bar {momentum_pct:.1f}%, 2bar {momentum_2bar:.1f}%)"
+        # HARD REJECT: price deep above VWAP AND momentum not reversing
+        if price_to_vwap_pct > 3.0 and momentum_pct > 0:
+            return False, f"PUT rejected: deep uptrend {price_to_vwap_pct:.1f}% above VWAP, no reversal"
+        # ALLOW: Reversal trade - overbought + momentum turning negative
+        if rsi > 65 and momentum_2bar < -0.1:
+            return True, f"PUT allowed: reversal trade RSI {rsi:.0f} + turning momentum {momentum_2bar:.1f}%"
+        # ALLOW: Downtrend - price near/below VWAP with negative momentum
+        if price_to_vwap_pct < 1.0 and momentum_pct < 0.3:
+            return True, "PUT context valid: downtrend/neutral"
         return True, "PUT context valid"
     
     # ========== Decision with Context Validation ==========
