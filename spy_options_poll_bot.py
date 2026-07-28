@@ -2173,10 +2173,7 @@ def analyze(df, client, symbol):
     # ========== MARKET CONTEXT VALIDATION ==========
     # Don't take CALLs in downtrends or PUTs in uptrends just because score is high
     # Validate that market structure SUPPORTS the proposed direction
-    
-    price = float(df["close"].iloc[-1])
-    vwap = float(df["VWAP"].iloc[-1])
-    rsi = float(df["RSI"].iloc[-1])
+    # Note: price, vwap, rsi are already computed above from latest/calculate_indicators
     
     # Distance to key levels (%)
     price_to_vwap_pct = (price - vwap) / vwap * 100 if vwap > 0 else 0
