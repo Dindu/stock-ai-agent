@@ -2170,20 +2170,82 @@ def analyze(df, client, symbol):
             "Option Liquidity (5%)": round(option_liq_score * 0.05, 1),
         }
 
-    # ---------------- Decision ----------------
+    # ========== MARKET CONTEXT VALIDATION ==========
+    # Don't take CALLs in downtrends or PUTs in uptrends just because score is high
+    # Validate that market structure SUPPORTS the proposed direction
+    
+    price = float(df["close"].iloc[-1])
+    vwap = float(df["VWAP"].iloc[-1])
+    rsi = float(df["RSI"].iloc[-1])
+    
+    # Distance to key levels (%)
+    price_to_vwap_pct = (price - vwap) / vwap * 100 if vwap > 0 else 0
+    
+    # Calculate momentum (price 5 bars ago vs now)
+    if len(df) >= 6:
+        close_5 = float(df["close"].iloc[-6])
+        momentum_pct = (price - close_5) / close_5 * 100 if close_5 > 0 else 0
+    else:
+        momentum_pct = 0
+    
+    # Check recent support/resistance
+    recent_high = float(df["high"].iloc[-10:].max())
+    recent_low = float(df["low"].iloc[-10:].min())
+    
+    def validate_call_context():
+        """CALLs only valid if price above VWAP with positive momentum (not failed bounce)"""
+        # Red flags that reject CALL
+        if price_to_vwap_pct < -2.5:  # Price significantly below VWAP = downtrend
+            return False, f"CALL rejected: price {price_to_vwap_pct:.1f}% below VWAP (downtrend)"
+        if momentum_pct < -1.0:  # Negative momentum = still falling
+            return False, f"CALL rejected: momentum {momentum_pct:.1f}% (still falling)"
+        if rsi < 25:  # Panic-sold = weak bounce potential
+            return False, f"CALL rejected: RSI {rsi:.0f} (panic-sold, bounce will fail)"
+        return True, "CALL context valid"
+    
+    def validate_put_context():
+        """PUTs only valid if price below VWAP with negative momentum (not weak dip)"""
+        # Red flags that reject PUT
+        if price_to_vwap_pct > 2.5:  # Price significantly above VWAP = uptrend
+            return False, f"PUT rejected: price {price_to_vwap_pct:.1f}% above VWAP (uptrend)"
+        if momentum_pct > 1.0:  # Positive momentum = still rising
+            return False, f"PUT rejected: momentum {momentum_pct:.1f}% (still rising)"
+        if rsi > 75:  # Euphoric = weak selloff potential
+            return False, f"PUT rejected: RSI {rsi:.0f} (euphoric, selloff will fail)"
+        return True, "PUT context valid"
+    
+    # ========== Decision with Context Validation ==========
     # Keep label thresholds aligned with downstream hard-entry gates.
     strong_threshold = SCORE_STRONG if is_etf else (SCORE_STRONG + max(0, STOCK_STRONG_SCORE_BONUS))
     # The dominant side must lead by SCORE_DOMINANCE points; otherwise NO TRADE.
     diff = bull_score - bear_score
 
     if bull_score >= strong_threshold and diff >= SCORE_DOMINANCE:
-        side, score, tier, signal = "CALL", bull_score, "STRONG", "STRONG CALL"
+        call_valid, call_reason = validate_call_context()
+        if call_valid:
+            side, score, tier, signal = "CALL", bull_score, "STRONG", "STRONG CALL"
+        else:
+            side, score, tier, signal = "NO TRADE", bull_score, "REJECTED", f"STRONG_CALL_CONTEXT_FAIL"
+            print(f"[{symbol}] {call_reason} | Score was {bull_score} (above threshold)", flush=True)
     elif bear_score >= strong_threshold and -diff >= SCORE_DOMINANCE:
-        side, score, tier, signal = "PUT", bear_score, "STRONG", "STRONG PUT"
+        put_valid, put_reason = validate_put_context()
+        if put_valid:
+            side, score, tier, signal = "PUT", bear_score, "STRONG", "STRONG PUT"
+        else:
+            side, score, tier, signal = "NO TRADE", bear_score, "REJECTED", f"STRONG_PUT_CONTEXT_FAIL"
+            print(f"[{symbol}] {put_reason} | Score was {bear_score} (above threshold)", flush=True)
     elif bull_score >= SCORE_SIGNAL and diff >= SCORE_DOMINANCE:
-        side, score, tier, signal = "CALL", bull_score, "SIGNAL", "CALL"
+        call_valid, _ = validate_call_context()
+        if call_valid:
+            side, score, tier, signal = "CALL", bull_score, "SIGNAL", "CALL"
+        else:
+            side, score, tier, signal = "NO TRADE", bull_score, "REJECTED", "SIGNAL_CALL_CONTEXT_FAIL"
     elif bear_score >= SCORE_SIGNAL and -diff >= SCORE_DOMINANCE:
-        side, score, tier, signal = "PUT", bear_score, "SIGNAL", "PUT"
+        put_valid, _ = validate_put_context()
+        if put_valid:
+            side, score, tier, signal = "PUT", bear_score, "SIGNAL", "PUT"
+        else:
+            side, score, tier, signal = "NO TRADE", bear_score, "REJECTED", "SIGNAL_PUT_CONTEXT_FAIL"
     elif bull_score >= SCORE_WATCH and bull_score > bear_score:
         side, score, tier, signal = "CALL", bull_score, "WATCH", "WATCHLIST"
     elif bear_score >= SCORE_WATCH and bear_score > bull_score:
