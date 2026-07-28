@@ -2212,13 +2212,20 @@ def analyze(df, client, symbol):
         # HARD REJECT: price deep below VWAP AND momentum not recovering
         if price_to_vwap_pct < -3.0 and momentum_pct < 0:
             return False, f"CALL rejected: deep downtrend {price_to_vwap_pct:.1f}% below VWAP, no recovery"
-        # ALLOW: Recovery trade - oversold + momentum turning positive
-        if rsi < 35 and momentum_2bar > 0.1:
-            return True, f"CALL allowed: recovery trade RSI {rsi:.0f} + turning momentum {momentum_2bar:.1f}%"
-        # ALLOW: Uptrend - price near/above VWAP with positive momentum
-        if price_to_vwap_pct > -1.0 and momentum_pct > -0.3:
-            return True, "CALL context valid: uptrend/neutral"
-        return True, "CALL context valid"
+        # ALLOW: Recovery trade - oversold + momentum turning positive with follow-through
+        if rsi <= 35 and momentum_2bar >= 0.2 and momentum_pct >= -0.5:
+            return True, (
+                f"CALL allowed: recovery trade RSI {rsi:.0f}, "
+                f"2bar {momentum_2bar:.2f}%, 5bar {momentum_pct:.2f}%"
+            )
+        # ALLOW: Trend/breakout trade - near/above VWAP and momentum aligned
+        if price_to_vwap_pct >= -0.8 and momentum_2bar >= 0.05 and momentum_pct >= 0.0:
+            return True, "CALL context valid: trend aligned"
+        # REJECT: no clear bullish structure yet
+        return False, (
+            f"CALL rejected: low conviction (VWAP {price_to_vwap_pct:.1f}%, "
+            f"2bar {momentum_2bar:.2f}%, 5bar {momentum_pct:.2f}%, RSI {rsi:.0f})"
+        )
 
     def validate_put_context():
         """
@@ -2234,13 +2241,20 @@ def analyze(df, client, symbol):
         # HARD REJECT: price deep above VWAP AND momentum not reversing
         if price_to_vwap_pct > 3.0 and momentum_pct > 0:
             return False, f"PUT rejected: deep uptrend {price_to_vwap_pct:.1f}% above VWAP, no reversal"
-        # ALLOW: Reversal trade - overbought + momentum turning negative
-        if rsi > 65 and momentum_2bar < -0.1:
-            return True, f"PUT allowed: reversal trade RSI {rsi:.0f} + turning momentum {momentum_2bar:.1f}%"
-        # ALLOW: Downtrend - price near/below VWAP with negative momentum
-        if price_to_vwap_pct < 1.0 and momentum_pct < 0.3:
-            return True, "PUT context valid: downtrend/neutral"
-        return True, "PUT context valid"
+        # ALLOW: Reversal trade - overbought + momentum turning negative with follow-through
+        if rsi >= 65 and momentum_2bar <= -0.2 and momentum_pct <= 0.5:
+            return True, (
+                f"PUT allowed: reversal trade RSI {rsi:.0f}, "
+                f"2bar {momentum_2bar:.2f}%, 5bar {momentum_pct:.2f}%"
+            )
+        # ALLOW: Trend/breakdown trade - near/below VWAP and momentum aligned
+        if price_to_vwap_pct <= 0.8 and momentum_2bar <= -0.05 and momentum_pct <= 0.0:
+            return True, "PUT context valid: trend aligned"
+        # REJECT: no clear bearish structure yet
+        return False, (
+            f"PUT rejected: low conviction (VWAP {price_to_vwap_pct:.1f}%, "
+            f"2bar {momentum_2bar:.2f}%, 5bar {momentum_pct:.2f}%, RSI {rsi:.0f})"
+        )
     
     # ========== Decision with Context Validation ==========
     # Keep label thresholds aligned with downstream hard-entry gates.
