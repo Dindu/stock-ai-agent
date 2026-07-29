@@ -324,6 +324,14 @@ ENTRY_ALLOWED_SETUPS = {
     if s.strip()
 }
 
+# Stricter confirmation for recovery-style CALL entries to reduce weak bounce losses.
+RECOVERY_CALL_STRICT_ENABLED = os.getenv("RECOVERY_CALL_STRICT_ENABLED", "1") == "1"
+RECOVERY_CALL_MIN_MOMENTUM_SCORE = float(os.getenv("RECOVERY_CALL_MIN_MOMENTUM_SCORE", "50"))
+RECOVERY_CALL_MIN_MOMENTUM_QUALITY = float(os.getenv("RECOVERY_CALL_MIN_MOMENTUM_QUALITY", "8.5"))
+RECOVERY_CALL_MIN_DELTA_5M = int(os.getenv("RECOVERY_CALL_MIN_DELTA_5M", "3"))
+RECOVERY_CALL_MIN_RSI = float(os.getenv("RECOVERY_CALL_MIN_RSI", "30"))
+RECOVERY_CALL_MIN_VWAP_DISTANCE = float(os.getenv("RECOVERY_CALL_MIN_VWAP_DISTANCE", "-0.008"))
+
 # Google Sheets tracking — bot creates/finds a spreadsheet by name automatically.
 GOOGLE_SPREADSHEET_NAME   = os.getenv("GOOGLE_SPREADSHEET_NAME", "SPY Options Bot Log")
 GOOGLE_SPREADSHEET_ID     = os.getenv("GOOGLE_SPREADSHEET_ID", "")  # paste sheet ID from URL to use existing sheet
@@ -2763,6 +2771,32 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
             return False, "stale break: move already broke earlier bars"
         if entry_timing == "MOMENTUM_CONTINUATION" and trend_age_bars > ENTRY_MAX_TREND_AGE_BARS:
             return False, f"continuation too mature ({trend_age_bars} trend bars)"
+
+    if RECOVERY_CALL_STRICT_ENABLED and side == "CALL" and entry_timing in {"FIRST_PULLBACK", "VWAP_RECLAIM", "HIGHER_LOW_RECLAIM"}:
+        m = _side_metric_bundle(data or {}, side)
+        rsi_now = _safe_float_num((data or {}).get("rsi", 50.0), 50.0)
+        vwap_now = _safe_float_num((data or {}).get("vwap", 0.0), 0.0)
+        price_now = _safe_float_num((data or {}).get("price", 0.0), 0.0)
+        vwap_dist = ((price_now - vwap_now) / vwap_now) if vwap_now > 0 else 0.0
+
+        if m["momentum"] < RECOVERY_CALL_MIN_MOMENTUM_SCORE:
+            return False, (
+                f"recovery-call momentum {m['momentum']:.1f} < {RECOVERY_CALL_MIN_MOMENTUM_SCORE:.1f}"
+            )
+        if m["momentum_quality"] < RECOVERY_CALL_MIN_MOMENTUM_QUALITY:
+            return False, (
+                f"recovery-call momentum quality {m['momentum_quality']:.1f} < {RECOVERY_CALL_MIN_MOMENTUM_QUALITY:.1f}"
+            )
+        if m["delta_5m"] is None or m["delta_5m"] < RECOVERY_CALL_MIN_DELTA_5M:
+            return False, (
+                f"recovery-call 5m score delta {m['delta_5m']} < +{RECOVERY_CALL_MIN_DELTA_5M}"
+            )
+        if rsi_now < RECOVERY_CALL_MIN_RSI:
+            return False, f"recovery-call RSI {rsi_now:.1f} < {RECOVERY_CALL_MIN_RSI:.1f}"
+        if vwap_dist < RECOVERY_CALL_MIN_VWAP_DISTANCE:
+            return False, (
+                f"recovery-call too far below VWAP ({vwap_dist*100:.2f}% < {RECOVERY_CALL_MIN_VWAP_DISTANCE*100:.2f}%)"
+            )
 
     dte = _safe_int_num((option or {}).get("dte", 0), 0)
     if MAX_DTE > 0 and dte > MAX_DTE:
