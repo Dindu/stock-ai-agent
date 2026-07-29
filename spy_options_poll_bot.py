@@ -862,6 +862,55 @@ def log_trade_to_sheets(row, trade, final_close=True):
         log(f"[{row['underlying']}] Google Sheets trade close update failed: {e}")
 
 
+def _partial_totals_from_trades_sheet(trade):
+    """Return cumulative partial-leg dollar/cost totals for a trade_id from Trades sheet.
+
+    This is a restart-safe fallback when in-memory partial fields are missing.
+    """
+    trade_id = str(trade.get("trade_id", "") or "").strip()
+    if not trade_id:
+        return 0, 0.0, 0.0
+    if _gsheet is None and not ensure_google_sheets_ready():
+        return 0, 0.0, 0.0
+
+    try:
+        ws = _gsheet.worksheet("Trades")
+        values = ws.get_all_values()
+        if not values:
+            return 0, 0.0, 0.0
+
+        headers = values[0]
+        idx = {name: i for i, name in enumerate(headers)}
+        tid_idx = idx.get("Trade ID")
+        status_idx = idx.get("Status")
+        pnl_d_idx = idx.get("P&L")
+        pnl_pct_idx = idx.get("P&L %")
+        if None in (tid_idx, status_idx, pnl_d_idx, pnl_pct_idx):
+            return 0, 0.0, 0.0
+
+        partial_rows = 0
+        total_dollar = 0.0
+        total_cost = 0.0
+        for row in values[1:]:
+            if tid_idx >= len(row) or status_idx >= len(row):
+                continue
+            if str(row[tid_idx]).strip() != trade_id:
+                continue
+            if str(row[status_idx]).strip().upper() != "PARTIAL":
+                continue
+
+            pnl_d = _safe_float_num(row[pnl_d_idx] if pnl_d_idx < len(row) else 0.0, 0.0)
+            pnl_pct = _safe_float_num(row[pnl_pct_idx] if pnl_pct_idx < len(row) else 0.0, 0.0)
+            total_dollar += float(pnl_d)
+            if abs(float(pnl_pct)) > 1e-9:
+                total_cost += float(pnl_d) / (float(pnl_pct) / 100.0)
+            partial_rows += 1
+
+        return partial_rows, float(total_dollar), float(total_cost)
+    except Exception:
+        return 0, 0.0, 0.0
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -4759,11 +4808,20 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     _prev_partial_px = float(trade.get("partial_exit_px", 0.0) or 0.0)
     _prev_partial_dollar = float(trade.get("partial_realized_dollar", 0.0) or 0.0)
     _prev_partial_cost = float(trade.get("partial_realized_cost", 0.0) or 0.0)
+    # Restart-safe fallback: if in-memory partial state is missing, reconstruct
+    # cumulative partial totals from the existing Trades partial rows.
+    if final_close and _prev_partial_qty <= 0 and abs(_prev_partial_dollar) < 1e-9:
+        partial_rows, partial_dollar, partial_cost = _partial_totals_from_trades_sheet(trade)
+        if partial_rows > 0:
+            _prev_partial_dollar = float(partial_dollar)
+            _prev_partial_cost = float(partial_cost)
+            if entry_px > 0 and _prev_partial_cost > 0:
+                _prev_partial_qty = int(round(_prev_partial_cost / (entry_px * 100.0)))
     _combined_dollar = 0.0
     _combined_cost = 0.0
     combined_pnl_pct = pnl_pct
     combined_note = ""
-    if final_close and _prev_partial_qty > 0 and entry_px > 0:
+    if final_close and (_prev_partial_qty > 0 or abs(_prev_partial_dollar) > 1e-9) and entry_px > 0:
         # Backward compatibility for trades opened before cumulative partial
         # accounting fields were introduced.
         if (_prev_partial_cost <= 0 or _prev_partial_dollar == 0.0) and _prev_partial_px > 0:
