@@ -246,6 +246,15 @@ STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.10"))  # stop-loss a
 PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "0.12"))
 PARTIAL_CLOSE_FRACTION = float(os.getenv("PARTIAL_CLOSE_FRACTION", "0.50"))
 TRAILING_STOP_GIVEBACK_PCT = float(os.getenv("TRAILING_STOP_GIVEBACK_PCT", "0.10"))
+# High-conviction runner profile (applies only when entry quality is strong).
+RUNNER_EXIT_PROFILE_ENABLED = os.getenv("RUNNER_EXIT_PROFILE_ENABLED", "1") == "1"
+RUNNER_MIN_SCORE = int(os.getenv("RUNNER_MIN_SCORE", "75"))
+RUNNER_MIN_MOMENTUM_QUALITY = float(os.getenv("RUNNER_MIN_MOMENTUM_QUALITY", "8.5"))
+RUNNER_MIN_IGNITION_DELTA = int(os.getenv("RUNNER_MIN_IGNITION_DELTA", "16"))
+RUNNER_TARGET_PCT = float(os.getenv("RUNNER_TARGET_PCT", "0.24"))
+RUNNER_PARTIAL_TP_PCT = float(os.getenv("RUNNER_PARTIAL_TP_PCT", "0.14"))
+RUNNER_PARTIAL_CLOSE_FRACTION = float(os.getenv("RUNNER_PARTIAL_CLOSE_FRACTION", "0.35"))
+RUNNER_TRAILING_GIVEBACK_PCT = float(os.getenv("RUNNER_TRAILING_GIVEBACK_PCT", "0.08"))
 MOMENTUM_FAIL_EXIT_ENABLED = os.getenv("MOMENTUM_FAIL_EXIT_ENABLED", "1") == "1"
 MOMENTUM_FAIL_MIN_PNL_PCT = float(os.getenv("MOMENTUM_FAIL_MIN_PNL_PCT", "0.06"))
 MAX_TRADE_HOLD_MINUTES = int(os.getenv("MAX_TRADE_HOLD_MINUTES", "90"))
@@ -1511,6 +1520,51 @@ def adaptive_target_stop_pcts(data):
     if vol_ratio <= LOW_VOL_RATIO:
         return max(0.01, LOW_VOL_TARGET_PCT), max(0.01, LOW_VOL_STOP_PCT)
     return base_target, base_stop
+
+
+def runner_exit_profile_for_trade(signal, score, data, base_target_pct):
+    """Return per-trade exit settings that let high-conviction winners run longer."""
+    default_partial_tp = max(0.01, PARTIAL_TP_PCT)
+    default_partial_fraction = max(0.1, min(0.9, PARTIAL_CLOSE_FRACTION))
+    default_trailing = max(0.02, TRAILING_STOP_GIVEBACK_PCT)
+
+    if not RUNNER_EXIT_PROFILE_ENABLED:
+        return {
+            "runner_profile": False,
+            "target_pct": float(base_target_pct),
+            "partial_tp_pct": default_partial_tp,
+            "partial_close_fraction": default_partial_fraction,
+            "trailing_giveback_pct": default_trailing,
+        }
+
+    signal_txt = str(signal or "").upper()
+    entry_mq = _safe_float_num((data or {}).get("momentum_quality", 0.0), 0.0)
+    ignition_delta = _safe_int_num((data or {}).get("ignition_delta", 0), 0)
+    is_strong = signal_txt.startswith("STRONG ")
+
+    qualifies = (
+        is_strong
+        and int(score or 0) >= RUNNER_MIN_SCORE
+        and entry_mq >= RUNNER_MIN_MOMENTUM_QUALITY
+        and ignition_delta >= RUNNER_MIN_IGNITION_DELTA
+    )
+
+    if not qualifies:
+        return {
+            "runner_profile": False,
+            "target_pct": float(base_target_pct),
+            "partial_tp_pct": default_partial_tp,
+            "partial_close_fraction": default_partial_fraction,
+            "trailing_giveback_pct": default_trailing,
+        }
+
+    return {
+        "runner_profile": True,
+        "target_pct": max(float(base_target_pct), max(0.01, RUNNER_TARGET_PCT)),
+        "partial_tp_pct": max(default_partial_tp, max(0.01, RUNNER_PARTIAL_TP_PCT)),
+        "partial_close_fraction": min(default_partial_fraction, max(0.1, min(0.9, RUNNER_PARTIAL_CLOSE_FRACTION))),
+        "trailing_giveback_pct": min(default_trailing, max(0.02, RUNNER_TRAILING_GIVEBACK_PCT)),
+    }
 
 
 def option_candidate_rank(candidate):
@@ -4204,6 +4258,11 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
     entry_price = fill_price
     side = option.get("side", signal.split()[-1])  # "CALL" or "PUT"
     target_pct, stop_pct = adaptive_target_stop_pcts(data or {})
+    runner_profile = runner_exit_profile_for_trade(signal, score, data or {}, target_pct)
+    target_pct = float(runner_profile.get("target_pct", target_pct))
+    partial_tp_pct = float(runner_profile.get("partial_tp_pct", PARTIAL_TP_PCT))
+    partial_close_fraction = float(runner_profile.get("partial_close_fraction", PARTIAL_CLOSE_FRACTION))
+    trailing_giveback_pct = float(runner_profile.get("trailing_giveback_pct", TRAILING_STOP_GIVEBACK_PCT))
     underlying_entry_price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
     delta_5m, delta_10m = _score_trend_deltas(data or {}, side)
     entry_timing = _classify_entry_timing(data or {}, side)
@@ -4224,8 +4283,12 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "stop_pct":   stop_pct,
         "score":      score,
         "max_pnl_pct": 0.0,
+        "runner_profile": bool(runner_profile.get("runner_profile", False)),
+        "partial_tp_pct": partial_tp_pct,
+        "partial_close_fraction": partial_close_fraction,
+        "trailing_giveback_pct": trailing_giveback_pct,
         "partial_taken": False,
-        "partial_target": entry_price * (1 + max(0.01, PARTIAL_TP_PCT)),
+        "partial_target": entry_price * (1 + max(0.01, partial_tp_pct)),
         "partial_close_qty": 0,
         "partial_exit_px": 0.0,
         "partial_pnl_pct": 0.0,
@@ -4387,8 +4450,12 @@ def sync_open_trades_from_alpaca():
             "stop_pct": STOP_LOSS_PCT,
             "score": prev.get("score", 0) if prev else 0,
             "max_pnl_pct": prev.get("max_pnl_pct", 0.0) if prev else 0.0,
+            "runner_profile": bool(prev.get("runner_profile", False)) if prev else False,
+            "partial_tp_pct": float(prev.get("partial_tp_pct", PARTIAL_TP_PCT) or PARTIAL_TP_PCT) if prev else PARTIAL_TP_PCT,
+            "partial_close_fraction": float(prev.get("partial_close_fraction", PARTIAL_CLOSE_FRACTION) or PARTIAL_CLOSE_FRACTION) if prev else PARTIAL_CLOSE_FRACTION,
+            "trailing_giveback_pct": float(prev.get("trailing_giveback_pct", TRAILING_STOP_GIVEBACK_PCT) or TRAILING_STOP_GIVEBACK_PCT) if prev else TRAILING_STOP_GIVEBACK_PCT,
             "partial_taken": bool(prev.get("partial_taken", False)) if prev else False,
-            "partial_target": prev.get("partial_target", p["entry"] * (1 + max(0.01, PARTIAL_TP_PCT))) if prev else p["entry"] * (1 + max(0.01, PARTIAL_TP_PCT)),
+            "partial_target": prev.get("partial_target", p["entry"] * (1 + max(0.01, float(prev.get("partial_tp_pct", PARTIAL_TP_PCT) if prev else PARTIAL_TP_PCT)))) if prev else p["entry"] * (1 + max(0.01, PARTIAL_TP_PCT)),
             "partial_close_qty": int(prev.get("partial_close_qty", 0) or 0) if prev else 0,
             "partial_exit_px": float(prev.get("partial_exit_px", 0.0) or 0.0) if prev else 0.0,
             "partial_pnl_pct": float(prev.get("partial_pnl_pct", 0.0) or 0.0) if prev else 0.0,
@@ -4550,9 +4617,10 @@ def track_open_trades():
                     trade["entry"]  = alpaca_entry
                     target_pct = float(trade.get("target_pct", PROFIT_TARGET_PCT) or PROFIT_TARGET_PCT)
                     stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT)
+                    partial_tp_pct = float(trade.get("partial_tp_pct", PARTIAL_TP_PCT) or PARTIAL_TP_PCT)
                     trade["target"] = alpaca_entry * (1 + target_pct)
                     trade["stop"] = alpaca_entry * (1 - stop_pct)
-                    trade["partial_target"] = alpaca_entry * (1 + max(0.01, PARTIAL_TP_PCT))
+                    trade["partial_target"] = alpaca_entry * (1 + max(0.01, partial_tp_pct))
             except Exception:
                 pass  # position not yet visible or already closed on Alpaca side
 
@@ -4577,6 +4645,8 @@ def track_open_trades():
         stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT)
         partial_target = float(trade.get("partial_target", trade.get("entry", 0.0) * (1 + max(0.01, PARTIAL_TP_PCT))) or 0.0)
         partial_taken = bool(trade.get("partial_taken", False))
+        partial_close_fraction = float(trade.get("partial_close_fraction", PARTIAL_CLOSE_FRACTION) or PARTIAL_CLOSE_FRACTION)
+        trailing_giveback_pct = float(trade.get("trailing_giveback_pct", TRAILING_STOP_GIVEBACK_PCT) or TRAILING_STOP_GIVEBACK_PCT)
         held_minutes = max(1, int((datetime.now(central) - trade.get("opened_at", datetime.now(central))).total_seconds() // 60))
 
         # 1) Adaptive hard exits.
@@ -4589,7 +4659,7 @@ def track_open_trades():
 
         # 2) Take partial profit and let remainder run.
         if (not partial_taken) and current_price >= partial_target and int(trade.get("qty", 0) or 0) > 1:
-            partial_qty = max(1, int(round(int(trade.get("qty", 0)) * max(0.1, min(0.9, PARTIAL_CLOSE_FRACTION)))))
+            partial_qty = max(1, int(round(int(trade.get("qty", 0)) * max(0.1, min(0.9, partial_close_fraction)))))
             close_trade(trade, current_price, "PARTIAL TAKE PROFIT", pnl_pct, close_qty=partial_qty, final_close=False)
             # After partial TP, protect remaining risk by moving stop near break-even.
             trade["stop"] = max(float(trade.get("stop", 0.0) or 0.0), float(trade.get("entry", 0.0) or 0.0) * 0.99)
@@ -4607,7 +4677,7 @@ def track_open_trades():
 
         # 5) Trailing stop after partial take.
         max_seen = float(trade.get("max_pnl_pct", 0.0) or 0.0)
-        if partial_taken and max_seen > 0 and pnl_pct <= (max_seen - max(0.02, TRAILING_STOP_GIVEBACK_PCT)):
+        if partial_taken and max_seen > 0 and pnl_pct <= (max_seen - max(0.02, trailing_giveback_pct)):
             close_trade(trade, current_price, "TRAILING STOP", pnl_pct)
 
 
@@ -4902,7 +4972,8 @@ def try_open_paper_trade(symbol, side, option, data):
     grade = "A" if score >= 90 else "B" if score >= 80 else "C" if score >= 70 else "D"
     stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT)) * 100.0
     target_pct = float(trade.get("target_pct", PROFIT_TARGET_PCT)) * 100.0
-    target_1 = float(trade.get("partial_target", trade['entry'] * (1 + max(0.01, PARTIAL_TP_PCT))))
+    partial_tp_pct = float(trade.get("partial_tp_pct", PARTIAL_TP_PCT))
+    target_1 = float(trade.get("partial_target", trade['entry'] * (1 + max(0.01, partial_tp_pct))))
     target_2 = float(trade.get("target", trade['entry'] * (1 + PROFIT_TARGET_PCT)))
 
     score_line = f"{score}/100"
@@ -4945,7 +5016,7 @@ def try_open_paper_trade(symbol, side, option, data):
         f"\U0001f4ca **Setup:** `{setup}` | Score: `{score_line}`\n"
         f"\U0001f3c6 **Entry Grade:** `{grade}` {'🟢' if grade == 'A' else '🔵' if grade == 'B' else '🟡' if grade == 'C' else '🔴'}\n"
         f"⚡ **Why Now:** `{why_now_line}`\n"
-        f"\U0001f3af **Plan:** Entry `${trade['entry']:.2f}` | Partial `${target_1:.2f}` (+{PARTIAL_TP_PCT*100:.0f}%) | "
+        f"\U0001f3af **Plan:** Entry `${trade['entry']:.2f}` | Partial `${target_1:.2f}` (+{partial_tp_pct*100:.0f}%) | "
         f"Final `${target_2:.2f}` (+{target_pct:.0f}%) | Stop `-{stop_pct:.0f}%`\n"
         f"\U0001f6d1 **Invalidation:** VWAP loss / hard stop hit\n"
         f"\U0001f916 **AI:** \U0001f7e1 **{ai_label}** — balanced setup with rules-aligned confirmation\n"
