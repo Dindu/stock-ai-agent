@@ -185,6 +185,22 @@ RSI_OVERSOLD       = int(os.getenv("RSI_OVERSOLD",   "30"))  # block PUT entries
 SPY_MACRO_ALIGN         = os.getenv("SPY_MACRO_ALIGN", "1") == "1"
 SPY_MACRO_SCORE_PENALTY = int(os.getenv("SPY_MACRO_SCORE_PENALTY", "10"))
 SPY_MACRO_HARD_BLOCK    = os.getenv("SPY_MACRO_HARD_BLOCK", "0") == "1"
+# Bearish tape CALL penalty: if SPY+QQQ are both bearish at entry time, add an
+# extra score penalty to CALLs so only truly high-conviction bullish entries pass.
+BEARISH_TAPE_CALL_PENALTY_ENABLED = os.getenv("BEARISH_TAPE_CALL_PENALTY_ENABLED", "1") == "1"
+BEARISH_TAPE_CALL_SCORE_PENALTY   = int(os.getenv("BEARISH_TAPE_CALL_SCORE_PENALTY", "8"))
+# Marginal score tighter stop: for borderline setups (score < MARGINAL_SCORE_CEIL),
+# apply a tighter stop so weak entries don't bleed out to full stop.
+MARGINAL_SCORE_STOP_ENABLED = os.getenv("MARGINAL_SCORE_STOP_ENABLED", "1") == "1"
+MARGINAL_SCORE_FLOOR  = int(os.getenv("MARGINAL_SCORE_FLOOR", "64"))
+MARGINAL_SCORE_CEIL   = int(os.getenv("MARGINAL_SCORE_CEIL",  "77"))
+MARGINAL_STOP_PCT     = float(os.getenv("MARGINAL_STOP_PCT",  "0.08"))
+# Recovered position market alignment: when a recovered position direction is
+# opposite to current market bias, apply a tighter stop and a score penalty so it
+# exits quickly if the market continues against it.
+RECOVERED_MARKET_ALIGN_ENABLED      = os.getenv("RECOVERED_MARKET_ALIGN_ENABLED", "1") == "1"
+RECOVERED_OPPOSING_STOP_PCT         = float(os.getenv("RECOVERED_OPPOSING_STOP_PCT", "0.05"))
+RECOVERED_OPPOSING_SCORE_PENALTY    = int(os.getenv("RECOVERED_OPPOSING_SCORE_PENALTY", "12"))
 
 # Anti-chase entry filters: avoid entering when price is too stretched from VWAP,
 # or when the latest candle already flipped against the intended side.
@@ -1556,19 +1572,39 @@ def entry_momentum_continuation_ok(symbol, side, data):
     )
 
 
-def adaptive_target_stop_pcts(data):
-    """Return target/stop percentages tuned to current volatility regime."""
+def adaptive_target_stop_pcts(data, score=None):
+    """Return target/stop percentages tuned to current volatility regime and conviction."""
     base_target = float(PROFIT_TARGET_PCT)
     base_stop = float(STOP_LOSS_PCT)
     if not ADAPTIVE_EXIT_PROFILE_ENABLED:
+        # Still apply marginal score tighter stop even when adaptive profile is off.
+        if MARGINAL_SCORE_STOP_ENABLED and score is not None:
+            sc = int(score or 0)
+            if MARGINAL_SCORE_FLOOR <= sc < MARGINAL_SCORE_CEIL:
+                base_stop = min(base_stop, max(0.01, MARGINAL_STOP_PCT))
         return base_target, base_stop
 
     vol_ratio = _safe_float_num((data or {}).get("vol_ratio", 1.0), 1.0)
     if vol_ratio >= HIGH_VOL_RATIO:
-        return max(0.01, HIGH_VOL_TARGET_PCT), max(0.01, HIGH_VOL_STOP_PCT)
-    if vol_ratio <= LOW_VOL_RATIO:
-        return max(0.01, LOW_VOL_TARGET_PCT), max(0.01, LOW_VOL_STOP_PCT)
-    return base_target, base_stop
+        stop = max(0.01, HIGH_VOL_STOP_PCT)
+    elif vol_ratio <= LOW_VOL_RATIO:
+        stop = max(0.01, LOW_VOL_STOP_PCT)
+        base_target = max(0.01, LOW_VOL_TARGET_PCT)
+        return base_target, stop
+    else:
+        stop = base_stop
+
+    target = base_target
+    if vol_ratio >= HIGH_VOL_RATIO:
+        target = max(0.01, HIGH_VOL_TARGET_PCT)
+
+    # Marginal score tighter stop overrides vol regime stop downward.
+    if MARGINAL_SCORE_STOP_ENABLED and score is not None:
+        sc = int(score or 0)
+        if MARGINAL_SCORE_FLOOR <= sc < MARGINAL_SCORE_CEIL:
+            stop = min(stop, max(0.01, MARGINAL_STOP_PCT))
+
+    return target, stop
 
 
 def runner_exit_profile_for_trade(signal, score, data, base_target_pct):
@@ -4306,7 +4342,7 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
     """Build a trade record using the actual Alpaca fill price (never a yfinance estimate)."""
     entry_price = fill_price
     side = option.get("side", signal.split()[-1])  # "CALL" or "PUT"
-    target_pct, stop_pct = adaptive_target_stop_pcts(data or {})
+    target_pct, stop_pct = adaptive_target_stop_pcts(data or {}, score=score)
     runner_profile = runner_exit_profile_for_trade(signal, score, data or {}, target_pct)
     target_pct = float(runner_profile.get("target_pct", target_pct))
     partial_tp_pct = float(runner_profile.get("partial_tp_pct", PARTIAL_TP_PCT))
@@ -4483,6 +4519,22 @@ def sync_open_trades_from_alpaca():
         prev = previous.get(contract_sym)
         if prev is None:
             recovered += 1
+        # Decide stop pct for this recovered/re-synced position.
+        # For truly new recoveries (prev=None), apply tighter stop.
+        # If market bias is opposing the position direction, tighten further.
+        _rec_stop_pct = STOP_LOSS_PCT
+        if prev is None and RECOVERED_MARKET_ALIGN_ENABLED:
+            spy_side = _spy_vwap_side()
+            qqq_side = _qqq_vwap_cache.get("side")
+            pos_side = p["side"]
+            spy_opposing  = (pos_side == "CALL" and spy_side == "bear") or (pos_side == "PUT" and spy_side == "bull")
+            qqq_opposing  = (pos_side == "CALL" and qqq_side == "bear") or (pos_side == "PUT" and qqq_side == "bull")
+            if spy_opposing or qqq_opposing:
+                _rec_stop_pct = min(STOP_LOSS_PCT, max(0.01, RECOVERED_OPPOSING_STOP_PCT))
+                log(
+                    f"[{p['underlying']}] Recovered {pos_side} opposing market bias "
+                    f"(spy={spy_side}, qqq={qqq_side}) — tighter stop {_rec_stop_pct*100:.0f}%."
+                )
         _open_trades[contract_sym] = {
             "underlying": p["underlying"],
             "signal": prev.get("signal", f"RECOVERED {p['side']}") if prev else f"RECOVERED {p['side']}",
@@ -4494,9 +4546,9 @@ def sync_open_trades_from_alpaca():
             "qty": p["qty"],
             "current_price": p["current_price"],
             "target": p["entry"] * (1 + PROFIT_TARGET_PCT),
-            "stop": p["entry"] * (1 - STOP_LOSS_PCT),
+            "stop": p["entry"] * (1 - (float(prev.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT) if prev else _rec_stop_pct)),
             "target_pct": PROFIT_TARGET_PCT,
-            "stop_pct": STOP_LOSS_PCT,
+            "stop_pct": float(prev.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT) if prev else _rec_stop_pct,
             "score": prev.get("score", 0) if prev else 0,
             "max_pnl_pct": prev.get("max_pnl_pct", 0.0) if prev else 0.0,
             "runner_profile": bool(prev.get("runner_profile", False)) if prev else False,
@@ -5696,6 +5748,26 @@ def run_symbol(client, symbol, prefetched_bars=None):
             log(
                 f"[{symbol}] Macro context: {side} misaligned with SPY VWAP "
                 f"(spy_side={spy_vwap_side}) — applying -{macro_penalty} confidence penalty (no veto)."
+            )
+
+    # ── Bearish tape CALL penalty: if SPY AND QQQ are both bearish, CALLs need
+    # higher conviction. No hard block — just raises the effective bar.
+    if (
+        BEARISH_TAPE_CALL_PENALTY_ENABLED
+        and side == "CALL"
+        and (not NO_GATING_MODE)
+    ):
+        spy_side = _spy_vwap_side()
+        qqq_side = _qqq_vwap_cache.get("side")
+        spy_bear_score  = int(_spy_vwap_cache.get("bear_score", 0) or 0) if hasattr(_spy_vwap_cache, "get") else 0
+        qqq_bear_score  = int(_qqq_vwap_cache.get("bear_score", 0) or 0) if hasattr(_qqq_vwap_cache, "get") else 0
+        both_bearish = (spy_side == "bear" and qqq_side == "bear")
+        if both_bearish:
+            tape_penalty = max(0, BEARISH_TAPE_CALL_SCORE_PENALTY)
+            macro_penalty = max(macro_penalty, tape_penalty)
+            log(
+                f"[{symbol}] Bearish tape: SPY+QQQ both bearish — CALL gets "
+                f"-{tape_penalty} score penalty (no veto)."
             )
 
     raw_score = data["bull_score"] if side == "CALL" else data["bear_score"]
