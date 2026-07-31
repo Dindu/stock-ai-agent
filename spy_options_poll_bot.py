@@ -288,6 +288,8 @@ TARGET_OPTION_DELTA_MAX = float(os.getenv("TARGET_OPTION_DELTA_MAX", "0.50"))
 OPTION_RANK_SPREAD_WEIGHT = float(os.getenv("OPTION_RANK_SPREAD_WEIGHT", "0.50"))
 OPTION_RANK_LIQUIDITY_WEIGHT = float(os.getenv("OPTION_RANK_LIQUIDITY_WEIGHT", "0.35"))
 OPTION_RANK_DELTA_WEIGHT = float(os.getenv("OPTION_RANK_DELTA_WEIGHT", "0.15"))
+OPTION_RANK_STRIKE_DISTANCE_WEIGHT = float(os.getenv("OPTION_RANK_STRIKE_DISTANCE_WEIGHT", "0.45"))
+OPTION_MAX_STRIKE_DISTANCE_PCT = float(os.getenv("OPTION_MAX_STRIKE_DISTANCE_PCT", "0.012"))
 OPTION_RELAXED_FALLBACK_ALERT_ONLY = os.getenv("OPTION_RELAXED_FALLBACK_ALERT_ONLY", "1") == "1"
 # Legacy profit-protection env vars are retained for backward compatibility,
 # but are intentionally not used in exit logic.
@@ -1658,6 +1660,7 @@ def option_candidate_rank(candidate):
     volume = max(0.0, _safe_float_num(candidate.get("volume", 0), 0.0))
     oi = max(0.0, _safe_float_num(candidate.get("open_interest", 0), 0.0))
     delta_abs = abs(_safe_float_num(candidate.get("delta", 0.0), 0.0))
+    strike_distance_pct = max(0.0, _safe_float_num(candidate.get("strike_distance_pct", 1.0), 1.0))
 
     # Lower spread is better.
     spread_score = max(0.0, 1.0 - min(1.0, spread_pct / 0.35))
@@ -1673,10 +1676,17 @@ def option_candidate_rank(candidate):
     else:
         delta_score = max(0.0, 1.0 - ((delta_abs - TARGET_OPTION_DELTA_MAX) / max(0.05, 1.0 - TARGET_OPTION_DELTA_MAX)))
 
+    # Prefer strikes close to underlying; beyond max distance decays to 0.
+    strike_distance_score = max(
+        0.0,
+        1.0 - min(1.0, strike_distance_pct / max(0.0001, OPTION_MAX_STRIKE_DISTANCE_PCT)),
+    )
+
     score = (
         spread_score * OPTION_RANK_SPREAD_WEIGHT
         + liq_raw * OPTION_RANK_LIQUIDITY_WEIGHT
         + delta_score * OPTION_RANK_DELTA_WEIGHT
+        + strike_distance_score * OPTION_RANK_STRIKE_DISTANCE_WEIGHT
     )
     return score
 
@@ -2708,6 +2718,11 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
                 "side":          signal,  # stored so close_trade can build the alert_key
             }
 
+            strike_distance_pct = (
+                abs(float(option_candidate["strike"]) - float(underlying_price)) / float(underlying_price)
+            ) if float(underlying_price) > 0 else 1.0
+            option_candidate["strike_distance_pct"] = strike_distance_pct
+
             if data is not None and max_ext_from_vwap is not None:
                 precheck_ok, precheck_reason = entry_contract_quality_ok(
                     symbol,
@@ -2728,12 +2743,19 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
             passed_candidates.append(option_candidate)
 
         if passed_candidates:
-            ranked = sorted(passed_candidates, key=option_candidate_rank, reverse=True)
+            # Prefer near-ATM contracts when available; fall back to full pool if not.
+            near_atm_candidates = [
+                c for c in passed_candidates
+                if _safe_float(c.get("strike_distance_pct", 1.0), 1.0) <= OPTION_MAX_STRIKE_DISTANCE_PCT
+            ]
+            pool = near_atm_candidates if near_atm_candidates else passed_candidates
+            ranked = sorted(pool, key=option_candidate_rank, reverse=True)
             best = ranked[0]
             print(
                 f"[{symbol}] Selected contract: {best['contract']} strike={best['strike']} "
                 f"expiry={best['expiry']} bid={best['bid']:.2f} ask={best['ask']:.2f} "
                 f"vol={best['volume']} oi={best['open_interest']} delta={best['delta']:.2f} "
+                f"dist={_safe_float(best.get('strike_distance_pct', 0.0), 0.0)*100:.2f}% "
                 f"rank={option_candidate_rank(best):.3f}",
                 flush=True,
             )
