@@ -2749,6 +2749,20 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
                 if _safe_float(c.get("strike_distance_pct", 1.0), 1.0) <= OPTION_MAX_STRIKE_DISTANCE_PCT
             ]
             pool = near_atm_candidates if near_atm_candidates else passed_candidates
+
+            # Prefer directional near-spot strikes first:
+            # - CALL: ATM or slightly OTM (strike >= underlying)
+            # - PUT:  ATM or slightly OTM (strike <= underlying)
+            directional_near_spot = []
+            for c in pool:
+                strike = _safe_float(c.get("strike", 0.0), 0.0)
+                if signal == "CALL" and strike >= float(underlying_price):
+                    directional_near_spot.append(c)
+                elif signal == "PUT" and strike <= float(underlying_price):
+                    directional_near_spot.append(c)
+            if directional_near_spot:
+                pool = directional_near_spot
+
             ranked = sorted(pool, key=option_candidate_rank, reverse=True)
             best = ranked[0]
             print(
