@@ -119,6 +119,17 @@ SCORE_STRONG = int(os.getenv("SCORE_STRONG", "80"))   # STRONG CALL/PUT alert
 SCORE_SIGNAL = int(os.getenv("SCORE_SIGNAL", "65"))   # CALL/PUT alert
 SCORE_WATCH  = int(os.getenv("SCORE_WATCH",  "50"))   # WATCHLIST heads-up
 SCORE_DOMINANCE = int(os.getenv("SCORE_DOMINANCE", "20"))  # bull must lead bear by this much (and vice versa)
+# Entry decisions use one of two named technical playbooks. Set to 0 only to
+# retain the legacy stacked ignition/watchlist/RSI entry chain.
+TWO_PLAYBOOK_ENTRY_MODE = os.getenv("TWO_PLAYBOOK_ENTRY_MODE", "1") == "1"
+BREAKOUT_MIN_SCORE = int(os.getenv("BREAKOUT_MIN_SCORE", str(SCORE_SIGNAL)))
+PULLBACK_MIN_SCORE = int(os.getenv("PULLBACK_MIN_SCORE", str(SCORE_SIGNAL)))
+PLAYBOOK_MIN_DOMINANCE = int(os.getenv("PLAYBOOK_MIN_DOMINANCE", str(SCORE_DOMINANCE)))
+PLAYBOOK_MAX_VWAP_EXTENSION = float(os.getenv("PLAYBOOK_MAX_VWAP_EXTENSION", "0.012"))
+PULLBACK_RECLAIM_TOLERANCE = float(os.getenv("PULLBACK_RECLAIM_TOLERANCE", "0.003"))
+PULLBACK_MIN_SCORE_DELTA = int(os.getenv("PULLBACK_MIN_SCORE_DELTA", "0"))
+BREAKOUT_PUT_ENTRIES_ENABLED = os.getenv("BREAKOUT_PUT_ENTRIES_ENABLED", "0") == "1"
+MAX_NEW_ENTRIES_PER_CYCLE = max(1, int(os.getenv("MAX_NEW_ENTRIES_PER_CYCLE", "10")))
 # Global bypass for all entry gating layers (tier/stock strict/opening/cooldown/ignition/RSI/macro/anti-chase/candle).
 NO_GATING_MODE = os.getenv("NO_GATING_MODE", "0") == "1"
 ENFORCE_OPENING_WINDOW_IN_NO_GATING = os.getenv("ENFORCE_OPENING_WINDOW_IN_NO_GATING", "1") == "1"
@@ -1702,6 +1713,68 @@ def _score_trend_deltas(data, side):
     return delta_5m, delta_10m
 
 
+def classify_entry_playbook(side, data):
+    """Classify a valid directional setup as a breakout or pullback continuation."""
+    side = str(side or "").upper()
+    call_side = side == "CALL"
+    fresh_break = bool((data or {}).get("fresh_breakout" if call_side else "fresh_breakdown", False))
+    delta_5m, _ = _score_trend_deltas(data or {}, side)
+    price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
+    vwap = _safe_float_num((data or {}).get("vwap", 0.0), 0.0)
+    ema20 = _safe_float_num((data or {}).get("ema20", 0.0), 0.0)
+    ema50 = _safe_float_num((data or {}).get("ema50", 0.0), 0.0)
+    micro_high = _safe_float_num((data or {}).get("micro_high", price), price)
+    micro_low = _safe_float_num((data or {}).get("micro_low", price), price)
+    prior_bar_high = _safe_float_num((data or {}).get("prior_bar_high", price), price)
+    prior_bar_low = _safe_float_num((data or {}).get("prior_bar_low", price), price)
+    candle_ok = bool((data or {}).get("bullish_candle" if call_side else "bearish_candle", False))
+    aligned = (price > vwap and price > ema20 and price > ema50) if call_side else (price < vwap and price < ema20 and price < ema50)
+
+    if fresh_break and candle_ok and aligned and (delta_5m is None or delta_5m >= 0):
+        return "BREAKOUT"
+    pullback_reclaim = (
+        micro_low <= min(vwap, ema20) * (1.0 + PULLBACK_RECLAIM_TOLERANCE)
+        and price > prior_bar_high
+    ) if call_side else (
+        micro_high >= max(vwap, ema20) * (1.0 - PULLBACK_RECLAIM_TOLERANCE)
+        and price < prior_bar_low
+    )
+    if aligned and candle_ok and pullback_reclaim and delta_5m is not None and delta_5m >= PULLBACK_MIN_SCORE_DELTA:
+        return "PULLBACK_CONTINUATION"
+    return None
+
+
+def playbook_entry_ok(side, data):
+    """Apply the minimum technical conditions for a named entry playbook."""
+    side = str(side or "").upper()
+    call_side = side == "CALL"
+    score = _safe_float_num((data or {}).get("bull_score" if call_side else "bear_score", 0.0), 0.0)
+    opposite = _safe_float_num((data or {}).get("bear_score" if call_side else "bull_score", 0.0), 0.0)
+    price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
+    vwap = _safe_float_num((data or {}).get("vwap", 0.0), 0.0)
+    ema20 = _safe_float_num((data or {}).get("ema20", 0.0), 0.0)
+    extension = abs(_safe_float_num((data or {}).get("vwap_extension_pct", 0.0), 0.0))
+    delta_5m, _ = _score_trend_deltas(data or {}, side)
+    playbook = classify_entry_playbook(side, data)
+
+    if playbook is None:
+        return False, None, "no breakout or pullback-continuation structure"
+    min_score = BREAKOUT_MIN_SCORE if playbook == "BREAKOUT" else PULLBACK_MIN_SCORE
+    if score < min_score:
+        return False, playbook, f"score {score:.0f} < {min_score}"
+    if (score - opposite) < PLAYBOOK_MIN_DOMINANCE:
+        return False, playbook, f"dominance {score - opposite:.0f} < {PLAYBOOK_MIN_DOMINANCE}"
+    if call_side and not (price > vwap and price > ema20):
+        return False, playbook, "CALL lacks VWAP/EMA20 alignment"
+    if not call_side and not (price < vwap and price < ema20):
+        return False, playbook, "PUT lacks VWAP/EMA20 alignment"
+    if extension > PLAYBOOK_MAX_VWAP_EXTENSION:
+        return False, playbook, f"VWAP extension {extension * 100:.2f}% > {PLAYBOOK_MAX_VWAP_EXTENSION * 100:.2f}%"
+    if delta_5m is not None and delta_5m < -4:
+        return False, playbook, f"directional score fading ({delta_5m:+d} over 5m)"
+    return True, playbook, f"score={score:.0f}, dominance={score - opposite:.0f}, 5m_delta={delta_5m}"
+
+
 def promoted_entry_quality_ok(symbol, side, data):
     """Unified quality gate for promoted watchlist entries used by all relaxed paths."""
     m = _side_metric_bundle(data or {}, side)
@@ -1867,6 +1940,47 @@ def _opportunity_score_from_data(data):
     tier_boost = {"STRONG": 30, "SIGNAL": 15, "WATCH": 5}.get(tier, 0)
     news_boost = {"HIGH": 8, "MEDIUM": 4, "LOW": 0}.get(str(data.get("news_impact_label", "LOW") or "LOW").upper(), 0)
     return float(dominant + (0.8 * dominance) + (1.2 * delta_boost) + tier_boost + news_boost)
+
+
+def entry_candidate_rank(candidate):
+    """Rank executable candidates from one scan before committing capital."""
+    data = candidate.get("data", {})
+    side = candidate.get("side", "")
+    raw_score = _safe_float_num(data.get("effective_score", 0.0), 0.0)
+    opposite_score = _safe_float_num(data.get("bear_score" if side == "CALL" else "bull_score", 0.0), 0.0)
+    dominance = max(0.0, raw_score - opposite_score)
+    delta_5m, _ = _score_trend_deltas(data, side)
+    extension = abs(_safe_float_num(data.get("vwap_extension_pct", 0.0), 0.0))
+    option_score = option_candidate_rank(candidate.get("option", {}))
+    playbook_bonus = 5.0 if candidate.get("playbook") == "BREAKOUT" else 0.0
+    return raw_score + (0.5 * dominance) + max(0.0, float(delta_5m or 0)) + playbook_bonus + (10.0 * option_score) - (1000.0 * extension)
+
+
+def execute_ranked_candidates(candidates):
+    """Execute only the highest-ranked valid candidates from a shared scan."""
+    if not candidates:
+        return
+
+    ranked = sorted(candidates, key=entry_candidate_rank, reverse=True)
+    for candidate in ranked[:MAX_NEW_ENTRIES_PER_CYCLE]:
+        symbol = candidate["symbol"]
+        side = candidate["side"]
+        rank = entry_candidate_rank(candidate)
+        if not NO_GATING_MODE:
+            _alerted_today["keys"].add(candidate["alert_key"])
+        log(
+            f"[{symbol}] Candidate selected: {candidate['playbook']} {side} "
+            f"rank={rank:.1f} ({len(ranked)} eligible, top {MAX_NEW_ENTRIES_PER_CYCLE} executable)."
+        )
+        try:
+            opened = try_open_paper_trade(symbol, side, candidate["option"], candidate["data"])
+        except Exception:
+            log(f"[{symbol}] Selected candidate execution error:")
+            traceback.print_exc()
+            sys.stdout.flush()
+            opened = False
+        if not opened and (not NO_GATING_MODE) and ALERT_ONLY_COOLDOWN_MINUTES > 0:
+            _alert_cooldowns[candidate["alert_key"]] = datetime.now(central) + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
 
 
 def _update_symbol_opportunity_cache(symbol, data):
@@ -2917,7 +3031,12 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
     if not option:
         return False, "missing option contract"
 
-    if STRICT_IGNITION_NO_BYPASS and IGNITION_REQUIRED and not bool((data or {}).get("ignition_confirmed", False)):
+    if (
+        not TWO_PLAYBOOK_ENTRY_MODE
+        and STRICT_IGNITION_NO_BYPASS
+        and IGNITION_REQUIRED
+        and not bool((data or {}).get("ignition_confirmed", False))
+    ):
         return False, "ignition not freshly confirmed"
 
     entry_timing = _classify_entry_timing(data or {}, side)
@@ -2930,14 +3049,14 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
     )
     fresh_break = bool((data or {}).get("fresh_breakout", False)) if side == "CALL" else bool((data or {}).get("fresh_breakdown", False))
 
-    if ENTRY_ALLOWED_SETUPS and entry_timing not in ENTRY_ALLOWED_SETUPS:
+    if not TWO_PLAYBOOK_ENTRY_MODE and ENTRY_ALLOWED_SETUPS and entry_timing not in ENTRY_ALLOWED_SETUPS:
         if not (RECALL_FIRST_MODE and effective_score >= 82 and delta_5m is not None and delta_5m >= 0):
             return False, f"setup {entry_timing} not in allowed setups"
 
-    if ignition_delta < ENTRY_MIN_IGNITION_DELTA:
+    if not TWO_PLAYBOOK_ENTRY_MODE and ignition_delta < ENTRY_MIN_IGNITION_DELTA:
         return False, f"ignition delta {ignition_delta} < {ENTRY_MIN_IGNITION_DELTA}"
 
-    if EARLY_IGNITION_PHASE_FILTER:
+    if not TWO_PLAYBOOK_ENTRY_MODE and EARLY_IGNITION_PHASE_FILTER:
         if entry_timing == "LATE_CHASE":
             return False, "late-chase timing"
         if delta_5m is not None and delta_5m < EARLY_IGNITION_MIN_DELTA_5M:
@@ -2947,7 +3066,12 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
         if entry_timing == "MOMENTUM_CONTINUATION" and trend_age_bars > ENTRY_MAX_TREND_AGE_BARS:
             return False, f"continuation too mature ({trend_age_bars} trend bars)"
 
-    if RECOVERY_CALL_STRICT_ENABLED and side == "CALL" and entry_timing in {"FIRST_PULLBACK", "VWAP_RECLAIM", "HIGHER_LOW_RECLAIM"}:
+    if (
+        not TWO_PLAYBOOK_ENTRY_MODE
+        and RECOVERY_CALL_STRICT_ENABLED
+        and side == "CALL"
+        and entry_timing in {"FIRST_PULLBACK", "VWAP_RECLAIM", "HIGHER_LOW_RECLAIM"}
+    ):
         m = _side_metric_bundle(data or {}, side)
         rsi_now = _safe_float_num((data or {}).get("rsi", 50.0), 50.0)
         vwap_now = _safe_float_num((data or {}).get("vwap", 0.0), 0.0)
@@ -3019,7 +3143,7 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
     if dte == 1 and opt_delta < ENTRY_1DTE_MIN_DELTA:
         return False, f"1DTE delta {opt_delta:.2f} < {ENTRY_1DTE_MIN_DELTA:.2f}"
 
-    if ENTRY_EXPENSIVE_EXTENSION_FILTER:
+    if not TWO_PLAYBOOK_ENTRY_MODE and ENTRY_EXPENSIVE_EXTENSION_FILTER:
         ext_pct = _safe_float_num((data or {}).get("vwap_extension_pct", 0.0), 0.0)
         ext_limit = max(0.0, float(max_ext_from_vwap) * max(0.0, ENTRY_EXPENSIVE_EXTENSION_VWAP_RATIO))
         if bid >= ENTRY_EXPENSIVE_EXTENSION_BID_FLOOR and ext_pct >= ext_limit:
@@ -5213,11 +5337,14 @@ def run_cycle(client):
     symbols_to_scan = _order_symbols_by_priority(symbols_to_scan)
     prefetched_bars = prefetch_bars_parallel(client, symbols_to_scan)
     symbol_eval_ms = []
+    candidates = []
 
     for symbol in symbols_to_scan:
         symbol_started_at = time.perf_counter()
         try:
-            run_symbol(client, symbol, prefetched_bars=prefetched_bars.get(symbol))
+            candidate = run_symbol(client, symbol, prefetched_bars=prefetched_bars.get(symbol))
+            if candidate:
+                candidates.append(candidate)
         except Exception:
             log(f"[{symbol}] Cycle error:")
             traceback.print_exc()
@@ -5227,6 +5354,9 @@ def run_cycle(client):
             symbol_eval_ms.append(elapsed_ms)
             if ENABLE_SCAN_TIMING_LOGS and elapsed_ms >= SCAN_SYMBOL_LOG_THRESHOLD_MS:
                 log(f"[SCAN] {symbol} evaluation took {elapsed_ms:.1f}ms.")
+
+    if TWO_PLAYBOOK_ENTRY_MODE:
+        execute_ranked_candidates(candidates)
 
     try:
         track_open_trades()
@@ -5359,11 +5489,14 @@ def run_websocket_cycle(client):
         prefetched_bars = prefetch_bars_parallel(client, symbols_to_run)
         batch_started_at = time.perf_counter()
         symbol_eval_ms = []
+        candidates = []
 
         for symbol in symbols_to_run:
             symbol_started_at = time.perf_counter()
             try:
-                run_symbol(client, symbol, prefetched_bars=prefetched_bars.get(symbol))
+                candidate = run_symbol(client, symbol, prefetched_bars=prefetched_bars.get(symbol))
+                if candidate:
+                    candidates.append(candidate)
             except Exception:
                 log(f"[{symbol}] WebSocket cycle error:")
                 traceback.print_exc()
@@ -5376,6 +5509,9 @@ def run_websocket_cycle(client):
                 _ws_last_eval_at[symbol] = datetime.now(central)
                 with _ws_pending_lock:
                     _ws_pending_symbols.discard(symbol)
+
+        if TWO_PLAYBOOK_ENTRY_MODE:
+            execute_ranked_candidates(candidates)
 
         if ENABLE_SCAN_TIMING_LOGS and symbols_to_run:
             total_ms = (time.perf_counter() - batch_started_at) * 1000.0
@@ -5461,7 +5597,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
         return
 
     watchlist_promoted = False
-    if data.get("tier") == "WATCH":
+    if data.get("tier") == "WATCH" and not TWO_PLAYBOOK_ENTRY_MODE:
         if EXECUTE_WATCHLIST_SIGNALS:
             watchlist_promoted = True
             log(f"[{symbol}] WATCHLIST execution enabled globally (EXECUTE_WATCHLIST_SIGNALS=1).")
@@ -5477,7 +5613,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
             log(f"[{symbol}] WATCHLIST promoted for execution — {wl_reason}.")
     data["watchlist_promoted"] = watchlist_promoted
 
-    if watchlist_promoted and RECALL_FIRST_MODE:
+    if watchlist_promoted and RECALL_FIRST_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         promoted_ok, promoted_reason = promoted_entry_quality_ok(symbol, side, data)
         data["promoted_quality_ok"] = bool(promoted_ok)
         if not promoted_ok:
@@ -5493,7 +5629,11 @@ def run_symbol(client, symbol, prefetched_bars=None):
     )
     if enforce_hard_gate:
         side_score = data["bull_score"] if side == "CALL" else data["bear_score"]
-        min_required_score = dynamic_min_required_score(symbol, side, data)
+        min_required_score = (
+            min(BREAKOUT_MIN_SCORE, PULLBACK_MIN_SCORE)
+            if TWO_PLAYBOOK_ENTRY_MODE
+            else dynamic_min_required_score(symbol, side, data)
+        )
         if data.get("watchlist_promoted", False) and RECALL_FIRST_MODE:
             dominance = abs(int(data.get("bull_score", 0)) - int(data.get("bear_score", 0)))
             promoted_floor = max(50, SCORE_WATCH)
@@ -5516,7 +5656,12 @@ def run_symbol(client, symbol, prefetched_bars=None):
             return
 
     # Only send Discord alerts for STRONG tier unless watchlist was selectively promoted.
-    if (not NO_GATING_MODE) and data["tier"] != "STRONG" and not data.get("watchlist_promoted", False):
+    if (
+        (not NO_GATING_MODE)
+        and not TWO_PLAYBOOK_ENTRY_MODE
+        and data["tier"] != "STRONG"
+        and not data.get("watchlist_promoted", False)
+    ):
         log(f"[{symbol}] {data['signal']} (BULL {data['bull_score']} / BEAR {data['bear_score']}) "
             f"\u2014 below STRONG threshold, no Discord alert.")
         return
@@ -5568,7 +5713,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 return
 
     # Trend-ignition filter: only fire when the move is *just starting*, not mid- or late-trend.
-    if IGNITION_REQUIRED and not NO_GATING_MODE:
+    if IGNITION_REQUIRED and not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         entry_timing = _classify_entry_timing(data or {}, side)
         if side == "CALL":
             now_score = data["bull_score"]
@@ -5750,7 +5895,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
 
     # Continuation check: relaxed version (ignition delta already requires momentum confirmation)
     # Note: We're keeping this gate but making it advisory only during fresh ignitions
-    if not NO_GATING_MODE and not data.get("ignition_confirmed", False):
+    if not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE and not data.get("ignition_confirmed", False):
         cont_ok, cont_reason = entry_momentum_continuation_ok(symbol, side, data)
         if not cont_ok:
             log(f"[{symbol}] Momentum continuation filter: {side} blocked — {cont_reason}.")
@@ -5759,7 +5904,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     # ── RSI exhaustion filter ─────────────────────────────────────────────────
     # Don't enter CALLs when RSI is already overbought (move likely exhausted),
     # or PUTs when RSI is already oversold.
-    if RSI_FILTER and not NO_GATING_MODE:
+    if RSI_FILTER and not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         rsi = data.get("rsi", 50.0)
         if side == "CALL" and rsi >= rsi_overbought:
             log(f"[{symbol}] RSI filter: CALL blocked — RSI {rsi:.1f} >= {rsi_overbought} (overbought, late entry).")
@@ -5812,7 +5957,19 @@ def run_symbol(client, symbol, prefetched_bars=None):
     data["macro_penalty"] = macro_penalty
     data["effective_score"] = effective_score
 
-    if ML_GATE_ENABLED and (not NO_GATING_MODE):
+    if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE:
+        playbook_ok, playbook, playbook_reason = playbook_entry_ok(side, data)
+        if not playbook_ok:
+            log(f"[{symbol}] Playbook gate: {side} blocked — {playbook_reason}.")
+            return
+        data["entry_playbook"] = playbook
+        data["setup_type"] = playbook
+        if playbook == "BREAKOUT" and side == "PUT" and not BREAKOUT_PUT_ENTRIES_ENABLED:
+            log(f"[{symbol}] Playbook gate: BREAKOUT PUT blocked by BREAKOUT_PUT_ENTRIES_ENABLED=0.")
+            return
+        log(f"[{symbol}] Playbook gate: {playbook} {side} passed — {playbook_reason}.")
+
+    if ML_GATE_ENABLED and (not NO_GATING_MODE) and not TWO_PLAYBOOK_ENTRY_MODE:
         ml_prob, ml_exp_ret, ml_source = _predict_ml_entry(symbol, side, data)
         data["ml_probability"] = ml_prob
         data["ml_expected_return"] = ml_exp_ret
@@ -5841,7 +5998,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     # ── Anti-chase filters ───────────────────────────────────────────────────
     # Avoid buying when price is already too extended away from VWAP, and avoid
     # entering when the latest candle already flipped against our side.
-    if ANTI_CHASE_FILTER and not NO_GATING_MODE:
+    if ANTI_CHASE_FILTER and not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         ext_pct = float(data.get("vwap_extension_pct", 0.0))
         if ext_pct > max_ext_from_vwap:
             log(
@@ -5850,7 +6007,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
             )
             return
 
-    if CANDLE_CONFIRMATION and not NO_GATING_MODE:
+    if CANDLE_CONFIRMATION and not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         if side == "CALL" and not data.get("bullish_candle", False):
             log(f"[{symbol}] Candle filter: CALL blocked — latest candle is not bullish.")
             return
@@ -5858,9 +6015,9 @@ def run_symbol(client, symbol, prefetched_bars=None):
             log(f"[{symbol}] Candle filter: PUT blocked — latest candle is not bearish.")
             return
 
-    # Lock this (symbol, side) NOW — before the option fetch — so a failed or
-    # rate-limited fetch doesn't cause ignition to re-fire every 30 seconds.
-    if not NO_GATING_MODE:
+    # Legacy mode locks before contract lookup. Two-playbook mode locks only
+    # when a shared-cycle candidate is selected for execution.
+    if not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         _alerted_today["keys"].add(alert_key)
 
     option = get_option_contract(
@@ -5894,6 +6051,16 @@ def run_symbol(client, symbol, prefetched_bars=None):
         _alerted_today["keys"].discard(alert_key)
         log(f"[{symbol}] Entry quality checklist blocked {side} — {entry_reason}.")
         return
+
+    if TWO_PLAYBOOK_ENTRY_MODE:
+        return {
+            "symbol": symbol,
+            "side": side,
+            "data": data,
+            "option": option,
+            "playbook": data.get("entry_playbook", "UNKNOWN"),
+            "alert_key": alert_key,
+        }
 
     emoji = "\U0001f7e2" if side == "CALL" else "\U0001f534"
     header = f"\U0001f6a8 {emoji} **{symbol} {data['signal']}**"

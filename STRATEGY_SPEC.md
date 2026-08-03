@@ -1,6 +1,6 @@
 # Strategy Spec
 
-This bot is a technical trend-entry system with layered gates. It scans symbols, scores bull vs bear structure, filters for timing and quality, picks an option contract, opens a paper trade, then manages exits until the position is closed.
+This bot is a technical options system with two explicit entry playbooks. It scans symbols, scores bull versus bear structure, classifies eligible setups as breakouts or pullback continuations, ranks the valid candidates, picks a liquid option contract, opens the highest-ranked trade, then manages exits until the position is closed.
 
 ## 1. Core Idea
 
@@ -26,31 +26,11 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if side == "NO TRADE":
         return
 
-    if data["tier"] == "WATCH":
-        ok, reason = watchlist_execution_confirmed(symbol, side, data)
-        if not ok:
-            return
-
-    min_required_score = dynamic_min_required_score(symbol, side, data)
-    if side_score(data, side) < min_required_score:
-        return
-
     if not opening_window_exception_ok(symbol, side, data):
         return
 
-    if not ignition_gate_passes(symbol, side, data):
-        return
-
-    if not continuation_gate_passes(symbol, side, data):
-        return
-
-    if not rsi_filter_passes(symbol, side, data):
-        return
-
-    if not anti_chase_passes(symbol, side, data):
-        return
-
-    if not candle_confirmation_passes(symbol, side, data):
+    ok, playbook, reason = playbook_entry_ok(side, data)
+    if not ok:
         return
 
     option = get_option_contract(symbol, side, data["price"], data, max_ext_from_vwap)
@@ -61,7 +41,10 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if not ok:
         return
 
-    try_open_paper_trade(symbol, side, option, data)
+    return candidate(symbol, side, playbook, option, data)
+
+ranked = rank_candidates(all_candidates)
+try_open_paper_trade(*ranked[0])
 ```
 
 ### Signal generation
@@ -83,34 +66,40 @@ The scoring model uses:
 - volume and candle direction
 - relative regime and momentum quality
 
+### Entry playbooks
+
+#### BREAKOUT
+
+A new directional high or low that is aligned with VWAP, EMA20, EMA50, and the current candle. It may enter only when the directional score and dominance meet the configured floors, VWAP extension is within the configured limit, and the score is not fading.
+
+#### PULLBACK_CONTINUATION
+
+An established directional trend above VWAP/EMA20/EMA50 for CALLs or below them for PUTs. It may enter when the directional score is not fading and all score, dominance, extension, option-liquidity, and session safeguards pass. It does not require a new ignition event.
+
 ### Gate order
 
-1. Signal side must be valid.
-2. WATCH tier setups must pass selective promotion.
-3. Dynamic hard score floor must be cleared.
-4. Opening window rules must allow the setup.
-5. Ignition must confirm the move is starting.
-6. Continuation must not look stale or faded.
-7. RSI must not show exhaustion.
-8. Anti-chase rules must not reject stretched entries.
-9. Candle confirmation must agree with the side.
-10. A valid option contract must be selected.
-11. The contract must pass liquidity and quality checks.
-12. Buying power must support the trade.
+1. A valid directional CALL or PUT side must be produced by the score engine.
+2. Opening and closing session rules must allow an entry.
+3. The setup must qualify as `BREAKOUT` or `PULLBACK_CONTINUATION`.
+4. The playbook score, dominance, directional structure, extension, and score-fade rules must pass.
+5. A valid option contract must pass DTE, open-interest, delta, premium, and buying-power checks.
+6. Valid candidates from the scan are ranked; only the top `MAX_NEW_ENTRIES_PER_CYCLE` candidates execute.
+
+In two-playbook mode, legacy watchlist promotion, fresh-ignition, RSI, single-candle, ML, and repeated timing-label vetoes do not independently block an entry. They remain available only when `TWO_PLAYBOOK_ENTRY_MODE=0` restores the legacy chain.
 
 ## 3. Strategy Shape
 
 The strategy is mostly:
-- trend-following
-- pullback/reclaim aware
 - breakout/breakdown aware
-- momentum-confirmation based
+- pullback-continuation aware
+- directionally trend-following
+- candidate-ranked before capital is committed
 
 It tries to avoid:
-- late chasing
-- weak continuation
-- low-liquidity contracts
-- stale signals that already moved too far
+- weak or ambiguous directional structure
+- excessive distance from VWAP
+- sharply fading trend scores
+- low-liquidity or unsuitable option contracts
 
 For ETFs and stocks, the bot has been simplified so strong directional moves are not blocked by too many redundant checks.
 
@@ -132,7 +121,36 @@ def _classify_entry_timing(data, side):
     # MOMENTUM_CONTINUATION, LATE_CHASE, MEAN_REVERSION_RISK
 ```
 
-### Hard score and watchlist logic
+### Playbook and candidate selection
+
+```python
+def classify_entry_playbook(side, data):
+    # Returns BREAKOUT, PULLBACK_CONTINUATION, or None.
+```
+
+```python
+def playbook_entry_ok(side, data):
+    # Validates score, dominance, VWAP/EMA structure, extension, and score fade.
+```
+
+```python
+def execute_ranked_candidates(candidates):
+    # Ranks all valid candidates from the same scan before opening a position.
+```
+
+Runtime controls:
+
+```text
+TWO_PLAYBOOK_ENTRY_MODE=1
+BREAKOUT_MIN_SCORE=65
+PULLBACK_MIN_SCORE=65
+PLAYBOOK_MIN_DOMINANCE=20
+PLAYBOOK_MAX_VWAP_EXTENSION=0.012
+BREAKOUT_PUT_ENTRIES_ENABLED=0
+MAX_NEW_ENTRIES_PER_CYCLE=1
+```
+
+### Legacy hard score and watchlist logic
 
 ```python
 def dynamic_min_required_score(symbol, side, data):
@@ -163,23 +181,18 @@ flowchart TD
     A[Fetch bars] --> B[Analyze symbol]
     B --> C{NO TRADE?}
     C -->|Yes| Z[Skip]
-    C -->|No| D{WATCH tier?}
-    D -->|Yes| E[watchlist_execution_confirmed]
-    D -->|No| F[Dynamic hard score gate]
-    E -->|Blocked| Z
-    E -->|Passed| F
+    C -->|No| D[Session safety check]
+    D -->|Blocked| Z
+    D -->|Passed| E[Classify entry playbook]
+    E -->|No playbook| Z
+    E -->|BREAKOUT or PULLBACK_CONTINUATION| F[Playbook technical gate]
     F -->|Blocked| Z
-    F -->|Passed| G[Opening window check]
-    G -->|Blocked| Z
-    G -->|Passed| H[Ignition check]
+    F -->|Passed| G[Select option contract]
+    G -->|No contract| Z
+    G -->|Has contract| H[Contract and buying-power checks]
     H -->|Blocked| Z
-    H -->|Passed| I[Continuation / RSI / anti-chase / candle filters]
-    I -->|Blocked| Z
-    I -->|Passed| J[Select option contract]
-    J -->|No contract| Z
-    J -->|Has contract| K[entry_contract_quality_ok]
-    K -->|Blocked| Z
-    K -->|Passed| L[try_open_paper_trade]
+    H -->|Passed| I[Rank scan candidates]
+    I --> J[Execute top candidate]
 ```
 
 ## 6. Exit Flow
