@@ -4511,6 +4511,7 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
     underlying_entry_price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
     delta_5m, delta_10m = _score_trend_deltas(data or {}, side)
     entry_timing = _classify_entry_timing(data or {}, side)
+    setup_type = str((data or {}).get("entry_playbook") or (data or {}).get("setup_type") or entry_timing or "UNKNOWN")
     ignition_delta = _safe_int_num((data or {}).get("ignition_delta", 0), 0)
     option_oi = _safe_int_num((option or {}).get("open_interest", 0), 0)
     return {
@@ -4548,7 +4549,7 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "entry_delta_10m": delta_10m,
         "entry_rsi": _safe_float_num((data or {}).get("rsi", 50.0), 50.0),
         "entry_timing": entry_timing,
-        "setup_type": entry_timing,
+        "setup_type": setup_type,
         "entry_ignition_delta": ignition_delta,
         "entry_option_oi": option_oi,
         "opened_at":  datetime.now(central),
