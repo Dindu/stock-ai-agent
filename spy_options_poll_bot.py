@@ -330,10 +330,10 @@ TRADE_LOG_FILE    = os.getenv("TRADE_LOG_FILE", "trade_results.csv")
 
 # Option quality filters (stock-only tightened defaults; ETFs remain baseline).
 ETF_MIN_OPTION_BID = float(os.getenv("ETF_MIN_OPTION_BID", "0.15"))
-ETF_MAX_OPTION_SPREAD_PCT = float(os.getenv("ETF_MAX_OPTION_SPREAD_PCT", "0.30"))
+ETF_MAX_OPTION_SPREAD_PCT = float(os.getenv("ETF_MAX_OPTION_SPREAD_PCT", "0.05"))
 ETF_MAX_OPTION_BID = float(os.getenv("ETF_MAX_OPTION_BID", "8.00"))
 STOCK_MIN_OPTION_BID = float(os.getenv("STOCK_MIN_OPTION_BID", "0.20"))
-STOCK_MAX_OPTION_SPREAD_PCT = float(os.getenv("STOCK_MAX_OPTION_SPREAD_PCT", "0.25"))
+STOCK_MAX_OPTION_SPREAD_PCT = float(os.getenv("STOCK_MAX_OPTION_SPREAD_PCT", "0.05"))
 STOCK_MAX_OPTION_BID = float(os.getenv("STOCK_MAX_OPTION_BID", "8.00"))
 STOCK_MIN_OPTION_VOLUME = int(os.getenv("STOCK_MIN_OPTION_VOLUME", "10"))
 STOCK_MIN_OPTION_OPEN_INTEREST = int(os.getenv("STOCK_MIN_OPTION_OPEN_INTEREST", "50"))
@@ -1754,6 +1754,7 @@ def playbook_entry_ok(side, data):
     vwap = _safe_float_num((data or {}).get("vwap", 0.0), 0.0)
     ema20 = _safe_float_num((data or {}).get("ema20", 0.0), 0.0)
     extension = abs(_safe_float_num((data or {}).get("vwap_extension_pct", 0.0), 0.0))
+    volume_ratio = _safe_float_num((data or {}).get("vol_ratio", 0.0), 0.0)
     delta_5m, _ = _score_trend_deltas(data or {}, side)
     playbook = classify_entry_playbook(side, data)
 
@@ -1762,6 +1763,19 @@ def playbook_entry_ok(side, data):
     min_score = BREAKOUT_MIN_SCORE if playbook == "BREAKOUT" else PULLBACK_MIN_SCORE
     if score < min_score:
         return False, playbook, f"score {score:.0f} < {min_score}"
+    if score < SCORE_STRONG:
+        if volume_ratio < VOLUME_MULTIPLIER:
+            return False, playbook, (
+                f"early-entry volume ratio {volume_ratio:.2f} < {VOLUME_MULTIPLIER:.2f}"
+            )
+        if delta_5m is None or delta_5m <= 0:
+            return False, playbook, (
+                f"early-entry 5m score delta {delta_5m} is not rising"
+            )
+    elif volume_ratio < 1.0:
+        return False, playbook, (
+            f"confirmed-entry volume ratio {volume_ratio:.2f} < 1.00"
+        )
     if (score - opposite) < PLAYBOOK_MIN_DOMINANCE:
         return False, playbook, f"dominance {score - opposite:.0f} < {PLAYBOOK_MIN_DOMINANCE}"
     if call_side and not (price > vwap and price > ema20):
@@ -3129,6 +3143,14 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
         return False, f"open interest {oi} < {min_oi}"
 
     bid = _safe_float_num((option or {}).get("bid", 0.0), 0.0)
+    ask = _safe_float_num((option or {}).get("ask", 0.0), 0.0)
+    mid = (bid + ask) / 2.0
+    spread_pct = ((ask - bid) / mid) if mid > 0 else float("inf")
+    max_spread_pct = ETF_MAX_OPTION_SPREAD_PCT if symbol in ETF_SYMBOLS else STOCK_MAX_OPTION_SPREAD_PCT
+    if spread_pct > max_spread_pct:
+        return False, (
+            f"option spread {spread_pct * 100:.1f}% > {max_spread_pct * 100:.1f}% max"
+        )
     opt_delta = abs(_safe_float_num((option or {}).get("delta", 0.0), 0.0))
     max_bid = ETF_MAX_OPTION_BID if symbol in ETF_SYMBOLS else STOCK_MAX_OPTION_BID
     if bid > max_bid:
