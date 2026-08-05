@@ -5121,12 +5121,14 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
             f"\n\U0001f4ca **Net combined:** `${_combined_dollar:+.2f}` (`{combined_pnl_pct * 100:+.2f}%`) on `{_total_orig_qty}` contracts"
         )
 
-    outcome_label = "PROFIT" if combined_pnl_pct > 0 else "LOSS"
-    exit_type_label = "Profit" if combined_pnl_pct > 0 else "Loss"
+    is_profit = combined_pnl_pct > 0
+    outcome_label = "PROFIT" if is_profit else "LOSS"
+    exit_type_label = "Profit" if is_profit else "Loss"
+    exit_icon = "\U0001f7e2" if is_profit else "\U0001f534"
     grade = "A" if combined_pnl_pct >= 0.20 else "B" if combined_pnl_pct >= 0.10 else "C" if combined_pnl_pct >= -0.10 else "D"
 
     send_discord(
-        f"\U0001f534 **{exit_type_label} — {exit_header} | {trade['side']} - {pnl_pct * 100:+.2f}%**\n"
+        f"{exit_icon} **{exit_type_label} — {exit_header} | {trade['side']} - {pnl_pct * 100:+.2f}%**\n"
         f"\U0001f3f7\ufe0f **{exit_scope}**\n\n"
         f"------------------------------\n"
         f"\U0001f4b2 **Current Price:** `${exit_px:.2f}`\n"
@@ -5139,7 +5141,7 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         f"\U0001f4cc **Outcome:** `{outcome_label} (RULES FOLLOWED)`\n"
         f"Opened: `{trade['opened_at']:%Y-%m-%d %H:%M:%S %Z}`\n"
         f"Closed: `{closed_at:%Y-%m-%d %H:%M:%S %Z}`",
-        color=DISCORD_COLOR_CALL if combined_pnl_pct > 0 else DISCORD_COLOR_PUT,
+        color=DISCORD_COLOR_CALL if is_profit else DISCORD_COLOR_PUT,
     )
 
     # Exit Reason in Google Sheets: PROFIT or LOSS with P&L figures only.
