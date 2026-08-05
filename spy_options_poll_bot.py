@@ -5148,6 +5148,81 @@ def track_open_trades():
             close_trade(trade, current_price, "TRAILING STOP", pnl_pct)
 
 
+def _capture_exit_market_context(trade):
+    """Return the underlying structure at exit so alerts can explain the trade outcome."""
+    symbol = str(trade.get("underlying", "") or "").upper()
+    if not symbol:
+        return {}
+    try:
+        client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        bars = fetch_bars(client, symbol)
+        if bars is None or bars.empty or len(bars) < 6:
+            return {}
+        df = calculate_indicators(bars)
+        latest = df.iloc[-1]
+        price = _safe_float_num(latest.get("close"), 0.0)
+        vwap = _safe_float_num(latest.get("VWAP"), price)
+        ema20 = _safe_float_num(latest.get("EMA20"), price)
+        ema50 = _safe_float_num(latest.get("EMA50"), price)
+        close_2 = _safe_float_num(df["close"].iloc[-3], price)
+        close_5 = _safe_float_num(df["close"].iloc[-6], price)
+        return {
+            "price": price,
+            "vwap": vwap,
+            "ema20": ema20,
+            "ema50": ema50,
+            "move_2bar_pct": ((price - close_2) / close_2 * 100.0) if close_2 else 0.0,
+            "move_5bar_pct": ((price - close_5) / close_5 * 100.0) if close_5 else 0.0,
+        }
+    except Exception as e:
+        log(f"[{symbol}] Exit market-context capture failed: {e}")
+        return {}
+
+
+def _trade_exit_explanation(trade, reason, entry_price, exit_price, pnl_pct, market_context=None):
+    """Explain the observed market reason, option move, and exit rule."""
+    reason_text = str(reason or "").upper()
+    side = str(trade.get("side", trade.get("signal", "")) or "").upper()
+    move = "rose" if pnl_pct > 0 else "fell" if pnl_pct < 0 else "finished flat"
+    price_move = f"option premium {move} from ${entry_price:.2f} to ${exit_price:.2f} ({pnl_pct * 100:+.2f}%)"
+    context = market_context or {}
+    underlying_price = _safe_float_num(context.get("price"), 0.0)
+    vwap = _safe_float_num(context.get("vwap"), 0.0)
+    ema20 = _safe_float_num(context.get("ema20"), 0.0)
+    move_2bar = _safe_float_num(context.get("move_2bar_pct"), 0.0)
+    move_5bar = _safe_float_num(context.get("move_5bar_pct"), 0.0)
+    call_structure_failed = underlying_price > 0 and underlying_price < min(vwap, ema20)
+    put_structure_failed = underlying_price > 0 and underlying_price > max(vwap, ema20)
+    structure_failed = call_structure_failed if "CALL" in side else put_structure_failed
+    if underlying_price > 0:
+        structure_text = (
+            f"underlying ${underlying_price:.2f} vs VWAP ${vwap:.2f}/EMA20 ${ema20:.2f}; "
+            f"2-bar {move_2bar:+.2f}%, 5-bar {move_5bar:+.2f}%"
+        )
+    else:
+        structure_text = "underlying exit structure was unavailable"
+
+    if reason_text == "TARGET HIT":
+        target_pct = float(trade.get("target_pct", PROFIT_TARGET_PCT) or PROFIT_TARGET_PCT) * 100
+        return f"{side} thesis followed through: {structure_text}. {price_move}; the +{target_pct:.0f}% target was reached."
+    if reason_text == "STOP LOSS":
+        stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT) * 100
+        if structure_failed:
+            return f"{side} thesis failed: the underlying lost VWAP/EMA20 alignment; {structure_text}. {price_move}, so the -{stop_pct:.0f}% stop closed it."
+        return f"Option premium weakness caused the stop while the underlying structure remained intact: {structure_text}. {price_move}; the -{stop_pct:.0f}% stop closed it."
+    if reason_text == "MOMENTUM FAILURE":
+        structure = "below VWAP and EMA20" if "CALL" in side else "above VWAP and EMA20"
+        return f"{side} thesis failed: the underlying moved {structure}; {structure_text}. {price_move}."
+    if reason_text == "PARTIAL TAKE PROFIT":
+        return f"{side} thesis followed through: {structure_text}. {price_move}; the first profit objective was realized."
+    if reason_text == "TRAILING STOP":
+        max_seen = float(trade.get("max_pnl_pct", pnl_pct) or pnl_pct) * 100
+        return f"Initial {side} move succeeded, then momentum gave back gains: {structure_text}. Profit retraced from +{max_seen:.2f}% and the trailing stop closed it."
+    if reason_text.startswith("TIME EXIT"):
+        return f"{side} thesis did not follow through within the allowed holding window: {structure_text}. {price_move}."
+    return f"{price_move}; {structure_text}; exit triggered by {reason}."
+
+
 def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=True):
     """Submit a paper exit (if enabled), Discord the result, and append to CSV.
 
@@ -5205,6 +5280,7 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     if not exit_confirmed:
         return
 
+    exit_market_context = _capture_exit_market_context(trade)
     emoji = "\u2705" if pnl_pct > 0 else "\u274c"
     outcome_label = "PROFIT" if pnl_pct > 0 else "LOSS"
     closed_at = datetime.now(central)
@@ -5264,6 +5340,11 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     exit_type_label = "Profit" if is_profit else "Loss"
     exit_icon = "\U0001f7e2" if is_profit else "\U0001f534"
     grade = "A" if combined_pnl_pct >= 0.20 else "B" if combined_pnl_pct >= 0.10 else "C" if combined_pnl_pct >= -0.10 else "D"
+    outcome_pnl_pct = combined_pnl_pct if final_close else pnl_pct
+    exit_explanation = _trade_exit_explanation(
+        trade, reason, entry_px, exit_px, outcome_pnl_pct, exit_market_context
+    )
+    outcome_reason_label = "Profit reason" if is_profit else "Loss reason"
 
     exit_message = (
         f"{exit_icon} **{exit_type_label} — {exit_header} | {trade['side']} - {pnl_pct * 100:+.2f}%**\n"
@@ -5274,9 +5355,9 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         f" | remaining `{remaining_qty}`\n"
         f"\U0001f4ca **Trade:** `${entry_px:.2f} -> ${exit_px:.2f}` | `{duration_min}m`\n"
         f"\U0001f4c9 **Result:** `{reason}`{combined_note}\n"
-        f"\U0001f9e0 **Summary:** `{trade['underlying']} {trade['side']} closed by rules`\n"
+        f"\U0001f9e0 **{outcome_reason_label}:** {exit_explanation}\n"
         f"\U0001f3c6 **Grade:** `{grade}`\n\n"
-        f"\U0001f4cc **Outcome:** `{outcome_label} (RULES FOLLOWED)`\n"
+        f"\U0001f4cc **Outcome:** `{outcome_label} {outcome_pnl_pct * 100:+.2f}%`\n"
         f"Opened: `{trade['opened_at']:%Y-%m-%d %H:%M:%S %Z}`\n"
         f"Closed: `{closed_at:%Y-%m-%d %H:%M:%S %Z}`"
     )
@@ -5456,7 +5537,6 @@ def try_open_paper_trade(symbol, side, option, data):
     log_trade_open_to_sheets(trade)
 
     setup = str(trade.get("setup_type", trade.get("entry_timing", "UNKNOWN")) or "UNKNOWN")
-    ai_label = "HIGH" if score >= 90 else "MEDIUM" if score >= 80 else "LOW"
     grade = "A" if score >= 90 else "B" if score >= 80 else "C" if score >= 70 else "D"
     stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT)) * 100.0
     target_pct = float(trade.get("target_pct", PROFIT_TARGET_PCT)) * 100.0
@@ -5498,16 +5578,12 @@ def try_open_paper_trade(symbol, side, option, data):
     entry_msg = send_discord(
         f"\U0001f680 **ENTRY ALERT — {entry_header} | {trade['side']} | ${trade['entry']:.2f} | {expiry_mmdd}**\n\n"
         f"------------------------------\n"
-        f"\U0001f4b2 **Current Price:** `${float(data.get('price', 0.0) or 0.0):.2f}`\n"
         f"\U0001f3af **Underlying Entry:** `${underlying_entry_price:.2f}` | Timing: `{entry_timing}`\n"
-        f"⚡ **Ignition:** `{entry_ignition_delta:+d}` | **OI:** `{entry_option_oi:,}`\n"
         f"\U0001f4ca **Setup:** `{setup}` | Score: `{score_line}`\n"
         f"\U0001f3c6 **Entry Grade:** `{grade}` {'🟢' if grade == 'A' else '🔵' if grade == 'B' else '🟡' if grade == 'C' else '🔴'}\n"
         f"⚡ **Why Now:** `{why_now_line}`\n"
         f"\U0001f3af **Plan:** Entry `${trade['entry']:.2f}` | Partial `${target_1:.2f}` (+{partial_tp_pct*100:.0f}%) | "
         f"Final `${target_2:.2f}` (+{target_pct:.0f}%) | Stop `-{stop_pct:.0f}%`\n"
-        f"\U0001f6d1 **Invalidation:** VWAP loss / hard stop hit\n"
-        f"\U0001f916 **AI:** \U0001f7e1 **{ai_label}** — balanced setup with rules-aligned confirmation\n"
         f"{news_context_block}\n\n"
         f"\U0001f4cc **Action:** ENTERED (`{trade['qty']}` contract{'s' if trade['qty'] != 1 else ''})",
         color=DISCORD_COLOR_CALL if trade['side'] == 'CALL' else DISCORD_COLOR_PUT,
