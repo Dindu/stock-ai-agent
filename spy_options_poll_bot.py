@@ -382,6 +382,12 @@ RECOVERY_CALL_MIN_DELTA_5M = int(os.getenv("RECOVERY_CALL_MIN_DELTA_5M", "3"))
 RECOVERY_CALL_MIN_RSI = float(os.getenv("RECOVERY_CALL_MIN_RSI", "30"))
 RECOVERY_CALL_MIN_VWAP_DISTANCE = float(os.getenv("RECOVERY_CALL_MIN_VWAP_DISTANCE", "-0.008"))
 
+# Scores near the entry floor need stronger confirmation than high-conviction calls.
+MARGINAL_CALL_GATE_ENABLED = os.getenv("MARGINAL_CALL_GATE_ENABLED", "1") == "1"
+MARGINAL_CALL_SCORE_CEIL = int(os.getenv("MARGINAL_CALL_SCORE_CEIL", "69"))
+MARGINAL_CALL_MIN_RELATIVE_STRENGTH = float(os.getenv("MARGINAL_CALL_MIN_RELATIVE_STRENGTH", "5.0"))
+MARGINAL_CALL_MIN_MOMENTUM = float(os.getenv("MARGINAL_CALL_MIN_MOMENTUM", "10.0"))
+
 # Google Sheets tracking — bot creates/finds a spreadsheet by name automatically.
 GOOGLE_SPREADSHEET_NAME   = os.getenv("GOOGLE_SPREADSHEET_NAME", "SPY Options Bot Log")
 GOOGLE_SPREADSHEET_ID     = os.getenv("GOOGLE_SPREADSHEET_ID", "")  # paste sheet ID from URL to use existing sheet
@@ -1876,6 +1882,38 @@ def _breakout_hold_confirmation(symbol, side, data):
     return None, "no pending breakout"
 
 
+def marginal_call_entry_ok(score, data):
+    """Require stronger local and index alignment for 65-69 score CALLs."""
+    if not MARGINAL_CALL_GATE_ENABLED or score > MARGINAL_CALL_SCORE_CEIL:
+        return True, "not a marginal CALL"
+
+    price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
+    vwap = _safe_float_num((data or {}).get("vwap", 0.0), 0.0)
+    ema20 = _safe_float_num((data or {}).get("ema20", 0.0), 0.0)
+    ema50 = _safe_float_num((data or {}).get("ema50", 0.0), 0.0)
+    if not (price > vwap and price > ema20 and price > ema50):
+        return False, "marginal CALL requires VWAP/EMA20/EMA50 alignment"
+
+    relative_strength = _safe_float_num((data or {}).get("relative_strength_score_bull", 0.0), 0.0)
+    if relative_strength < MARGINAL_CALL_MIN_RELATIVE_STRENGTH:
+        return False, (
+            f"marginal CALL relative strength {relative_strength:.1f} "
+            f"< {MARGINAL_CALL_MIN_RELATIVE_STRENGTH:.1f}"
+        )
+
+    momentum = _safe_float_num((data or {}).get("momentum_score_bull", 0.0), 0.0)
+    if momentum < MARGINAL_CALL_MIN_MOMENTUM:
+        return False, f"marginal CALL momentum {momentum:.1f} < {MARGINAL_CALL_MIN_MOMENTUM:.1f}"
+
+    bearish_indices = [
+        name for name, side in (("SPY", _spy_vwap_side()), ("QQQ", _qqq_vwap_side()))
+        if side == "bear"
+    ]
+    if bearish_indices:
+        return False, f"marginal CALL blocked by bearish {'/'.join(bearish_indices)}"
+    return True, "marginal CALL quality confirmed"
+
+
 def playbook_entry_ok(side, data, symbol=None):
     """Apply the minimum technical conditions for a named entry playbook."""
     side = str(side or "").upper()
@@ -1919,6 +1957,10 @@ def playbook_entry_ok(side, data, symbol=None):
         return False, playbook, "CALL lacks VWAP/EMA20 alignment"
     if not call_side and not (price < vwap and price < ema20):
         return False, playbook, "PUT lacks VWAP/EMA20 alignment"
+    if call_side and score <= MARGINAL_CALL_SCORE_CEIL:
+        marginal_call_ok, marginal_call_reason = marginal_call_entry_ok(score, data)
+        if not marginal_call_ok:
+            return False, playbook, marginal_call_reason
     if extension > PLAYBOOK_MAX_VWAP_EXTENSION:
         return False, playbook, f"VWAP extension {extension * 100:.2f}% > {PLAYBOOK_MAX_VWAP_EXTENSION * 100:.2f}%"
     if delta_5m is not None and delta_5m < -4:
