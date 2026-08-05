@@ -128,6 +128,7 @@ PLAYBOOK_MIN_DOMINANCE = int(os.getenv("PLAYBOOK_MIN_DOMINANCE", str(SCORE_DOMIN
 PLAYBOOK_MAX_VWAP_EXTENSION = float(os.getenv("PLAYBOOK_MAX_VWAP_EXTENSION", "0.012"))
 PULLBACK_RECLAIM_TOLERANCE = float(os.getenv("PULLBACK_RECLAIM_TOLERANCE", "0.003"))
 PULLBACK_MIN_SCORE_DELTA = int(os.getenv("PULLBACK_MIN_SCORE_DELTA", "0"))
+BREAKOUT_HOLD_CONFIRMATION_ENABLED = os.getenv("BREAKOUT_HOLD_CONFIRMATION_ENABLED", "1") == "1"
 BREAKOUT_PUT_ENTRIES_ENABLED = os.getenv("BREAKOUT_PUT_ENTRIES_ENABLED", "0") == "1"
 MAX_NEW_ENTRIES_PER_CYCLE = max(1, int(os.getenv("MAX_NEW_ENTRIES_PER_CYCLE", "10")))
 # Global bypass for all entry gating layers (tier/stock strict/opening/cooldown/ignition/RSI/macro/anti-chase/candle).
@@ -412,6 +413,8 @@ _qqq_vwap_cache: "dict" = {"side": None, "updated_at": None}
 # Ignition confirmation buffer: (symbol, side) -> {"score": int, "delta": int, "at": datetime}
 # An ignition must be seen twice (two consecutive scans) before an entry is allowed.
 _ignition_pending: "dict[tuple, dict]" = {}
+# Initial breakout levels awaiting the next completed five-minute bar to hold.
+_breakout_hold_pending: "dict[tuple, dict]" = {}
 # Cached trending stocks and reasons from Alpaca screener/news.
 _trending_cache: "dict" = {"updated_at": None, "symbols": [], "reasons": {}}
 # Cached tradability/profile checks for trending candidates.
@@ -1744,7 +1747,43 @@ def classify_entry_playbook(side, data):
     return None
 
 
-def playbook_entry_ok(side, data):
+def _breakout_hold_confirmation(symbol, side, data):
+    """Require the bar after a fresh break to close beyond its broken level."""
+    if not BREAKOUT_HOLD_CONFIRMATION_ENABLED or not symbol:
+        return None, "disabled"
+
+    side = str(side or "").upper()
+    key = (str(symbol).upper(), side)
+    bar_time = (data or {}).get("bar_time")
+    price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
+    fresh_break = bool((data or {}).get("fresh_breakout", False)) if side == "CALL" else bool((data or {}).get("fresh_breakdown", False))
+    pending = _breakout_hold_pending.get(key)
+
+    if pending:
+        if bar_time == pending["bar_time"]:
+            return False, "awaiting next completed breakout bar"
+        try:
+            expected_bar_time = pending["bar_time"] + timedelta(minutes=5)
+        except (TypeError, ValueError):
+            expected_bar_time = None
+        if expected_bar_time is not None and bar_time != expected_bar_time:
+            _breakout_hold_pending.pop(key, None)
+            return False, "breakout hold confirmation expired"
+        _breakout_hold_pending.pop(key, None)
+        level = float(pending["level"])
+        held = price > level if side == "CALL" else price < level
+        if held:
+            return True, f"breakout held {level:.2f} on next completed bar"
+        return False, f"breakout failed to hold {level:.2f}"
+
+    if fresh_break:
+        level = _safe_float_num((data or {}).get("recent_high" if side == "CALL" else "recent_low", price), price)
+        _breakout_hold_pending[key] = {"bar_time": bar_time, "level": level}
+        return False, f"fresh breakout at {level:.2f}; awaiting hold confirmation"
+    return None, "no pending breakout"
+
+
+def playbook_entry_ok(side, data, symbol=None):
     """Apply the minimum technical conditions for a named entry playbook."""
     side = str(side or "").upper()
     call_side = side == "CALL"
@@ -1757,9 +1796,14 @@ def playbook_entry_ok(side, data):
     volume_ratio = _safe_float_num((data or {}).get("vol_ratio", 0.0), 0.0)
     delta_5m, _ = _score_trend_deltas(data or {}, side)
     playbook = classify_entry_playbook(side, data)
+    hold_confirmed, hold_reason = _breakout_hold_confirmation(symbol, side, data)
+    if hold_confirmed:
+        playbook = "BREAKOUT"
 
     if playbook is None:
         return False, None, "no breakout or pullback-continuation structure"
+    if playbook == "BREAKOUT" and hold_confirmed is False:
+        return False, playbook, hold_reason
     min_score = BREAKOUT_MIN_SCORE if playbook == "BREAKOUT" else PULLBACK_MIN_SCORE
     if score < min_score:
         return False, playbook, f"score {score:.0f} < {min_score}"
@@ -2623,6 +2667,7 @@ def analyze(df, client, symbol):
         sentiment = "Bear lean"
 
     data = {
+        "bar_time": latest.name,
         "price": price,
         "open": open_,
         "vwap": vwap,
@@ -5981,7 +6026,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     data["effective_score"] = effective_score
 
     if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE:
-        playbook_ok, playbook, playbook_reason = playbook_entry_ok(side, data)
+        playbook_ok, playbook, playbook_reason = playbook_entry_ok(side, data, symbol)
         if not playbook_ok:
             log(f"[{symbol}] Playbook gate: {side} blocked — {playbook_reason}.")
             return
