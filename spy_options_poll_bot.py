@@ -52,6 +52,17 @@ load_dotenv()
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK")
+DISCORD_WEBHOOK_LIVE_TRADES_URL = os.getenv("DISCORD_WEBHOOK_LIVE_TRADES") or DISCORD_WEBHOOK_URL
+DISCORD_WEBHOOK_AI_STATUS_URL = os.getenv("DISCORD_WEBHOOK_AI_STATUS", "").strip()
+DISCORD_WEBHOOK_MORNING_BRIEFING_URL = os.getenv("DISCORD_WEBHOOK_MORNING_BRIEFING", "").strip()
+DISCORD_WEBHOOK_EOD_SUMMARY_URL = os.getenv("DISCORD_WEBHOOK_EOD_SUMMARY", "").strip()
+DISCORD_WEBHOOK_ERRORS_URL = os.getenv("DISCORD_WEBHOOK_ERRORS", "").strip()
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+DISCORD_CHANNEL_ID = (
+    os.getenv("DISCORD_CHANNEL_ID")
+    or os.getenv("DISCORD_LIVE_TRADES_CHANNEL_ID")
+    or ""
+).strip()
 FEED = os.getenv("ALPACA_FEED", "iex").lower()
 _options_feed_env = os.getenv("ALPACA_OPTIONS_FEED", "").strip().lower()
 if _options_feed_env in {"opra", "indicative"}:
@@ -952,8 +963,9 @@ DISCORD_COLOR_WARN = 0xF1C40F
 _TIER_RANK = {"NONE": 0, "WATCH": 1, "SIGNAL": 2, "STRONG": 3}
 
 
-def send_discord(message, color=None, reply_to_message_id=None, wait_for_response=False):
-    if not DISCORD_WEBHOOK_URL:
+def send_discord(message, color=None, reply_to_message_id=None, wait_for_response=False, webhook_url=None):
+    webhook_url = webhook_url or DISCORD_WEBHOOK_URL
+    if not webhook_url:
         print("Missing Discord webhook.")
         return None
     payload = None
@@ -980,7 +992,6 @@ def send_discord(message, color=None, reply_to_message_id=None, wait_for_respons
         }
 
     try:
-        webhook_url = DISCORD_WEBHOOK_URL
         if wait_for_response and "wait=true" not in webhook_url:
             sep = "&" if "?" in webhook_url else "?"
             webhook_url = f"{webhook_url}{sep}wait=true"
@@ -1000,6 +1011,82 @@ def send_discord(message, color=None, reply_to_message_id=None, wait_for_respons
     except Exception as e:
         print(f"Discord post failed: {e}")
         return None
+
+
+def append_discord_entry_update(entry_message_id, update, color=None, webhook_url=None):
+    """Append a trade status update to the original Discord entry embed."""
+    webhook_url = webhook_url or DISCORD_WEBHOOK_URL
+    if not webhook_url or not entry_message_id:
+        return False
+
+    message_url = f"{webhook_url.split('?', 1)[0]}/messages/{entry_message_id}"
+    try:
+        response = requests.get(message_url, timeout=10)
+        if response.status_code != 200:
+            print(f"Discord entry fetch returned {response.status_code}: {response.text[:100]}", flush=True)
+            return False
+
+        original = response.json()
+        embeds = original.get("embeds") or []
+        if embeds:
+            description = str(embeds[0].get("description", "") or "")
+        else:
+            description = str(original.get("content", "") or "")
+        description = f"{description}\n\n------------------------------\n{update}".strip()
+        if len(description) > 4000:
+            description = description[-4000:]
+
+        payload = {"embeds": [{"description": description, "color": int(color or DISCORD_COLOR_WARN)}]}
+        response = requests.patch(message_url, json=payload, timeout=10)
+        if response.status_code not in (200, 204):
+            print(f"Discord entry update returned {response.status_code}: {response.text[:100]}", flush=True)
+            return False
+        return True
+    except Exception as e:
+        print(f"Discord entry update failed: {e}")
+        return False
+
+
+def send_discord_bot_reply(entry_message_id, message, color=None):
+    """Send a native Discord bot reply to an original webhook entry alert."""
+    if not DISCORD_BOT_TOKEN or not entry_message_id:
+        return False
+
+    channel_id = DISCORD_CHANNEL_ID
+    if not channel_id:
+        try:
+            message_url = f"{DISCORD_WEBHOOK_URL.split('?', 1)[0]}/messages/{entry_message_id}"
+            original = requests.get(message_url, timeout=10)
+            if original.status_code == 200:
+                channel_id = str((original.json() or {}).get("channel_id", "") or "")
+        except Exception as e:
+            print(f"Discord reply channel lookup failed: {e}", flush=True)
+    if not channel_id:
+        print("Discord bot reply skipped: original entry channel is unavailable.", flush=True)
+        return False
+
+    payload = {
+        "embeds": [{"description": message[:4000], "color": int(color or DISCORD_COLOR_WARN)}],
+        "message_reference": {
+            "message_id": str(entry_message_id),
+            "channel_id": channel_id,
+            "fail_if_not_exists": False,
+        },
+    }
+    try:
+        response = requests.post(
+            f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            json=payload,
+            headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
+            timeout=10,
+        )
+        if response.status_code not in (200, 201):
+            print(f"Discord bot reply returned {response.status_code}: {response.text[:100]}", flush=True)
+            return False
+        return True
+    except Exception as e:
+        print(f"Discord bot reply failed: {e}")
+        return False
 
 
 def _trade_progress_reason(trade, current_price, pnl_pct):
@@ -1047,17 +1134,23 @@ def maybe_send_trade_progress_alert(trade, current_price, pnl_pct):
     opened = trade.get("opened_at")
     opened_text = opened.strftime("%Y-%m-%d %H:%M:%S %Z") if isinstance(opened, datetime) else str(opened)
 
-    send_discord(
-        f"\U0001f4c8 **TRADE UPDATE — {header} | {side} | +10% Milestone Hit**\n\n"
+    milestone_message = (
+        f"\U0001f4c8 **MILESTONE — {header} | {side} | +10%**\n\n"
         f"\U0001f4b2 **Current Price:** `${float(current_price):.2f}`\n"
         f"\U0001f4ca **PnL:** `{pnl_pct * 100:+.2f}%`\n"
         f"\U0001f9e0 **Reason:** `{reason}`\n"
-        f"\U0001f4cc **Opened:** `{opened_text}`",
-        color=color,
-        reply_to_message_id=trade.get("entry_message_id"),
+        f"\U0001f4cc **Opened:** `{opened_text}`"
     )
+    sent = send_discord_bot_reply(trade.get("entry_message_id"), milestone_message, color=color)
+    if not sent:
+        sent = append_discord_entry_update(
+            trade.get("entry_message_id"),
+            milestone_message,
+            color=color,
+            webhook_url=DISCORD_WEBHOOK_LIVE_TRADES_URL,
+        )
     trade["milestone_10_sent"] = True
-    log(f"[{trade.get('underlying', 'UNKNOWN')}] Milestone alert sent (+10%): {trade.get('contract', '')}")
+    log(f"[{trade.get('underlying', 'UNKNOWN')}] Milestone {'sent' if sent else 'not sent'} (+10%): {trade.get('contract', '')}")
 
 
 def market_open_now():
@@ -2118,6 +2211,7 @@ def _maybe_send_transition_alert(symbol, data):
         f"Why now: `{why_now}`\n"
         f"News impact: `{news_impact}`",
         color=DISCORD_COLOR_WARN,
+        webhook_url=DISCORD_WEBHOOK_AI_STATUS_URL or DISCORD_WEBHOOK_URL,
     )
     _last_transition_alert_at[symbol] = now_ct
 
@@ -4189,6 +4283,7 @@ def maybe_send_hourly_perf_report(now_ct=None):
         f"W/L `{delta_wins:+d}/{delta_losses:+d}` | WinRate `{delta_win_rate:.1f}%` | "
         f"P&L `{delta_realized_pnl:+,.2f}`",
         color=color,
+        webhook_url=DISCORD_WEBHOOK_AI_STATUS_URL or DISCORD_WEBHOOK_LIVE_TRADES_URL,
     )
     _perf_stats["last_report_entries"] = entries
     _perf_stats["last_report_closed"] = closed
@@ -4436,6 +4531,7 @@ def _maybe_send_scheduled_briefing(client, now_ct, title, target_hour, target_mi
             f"{market_block}\n\n"
             f"\U0001f4cc **Note:** headline scan is news-based; always verify exact event times on your economic/earnings calendar.",
             color=DISCORD_COLOR_WARN,
+            webhook_url=DISCORD_WEBHOOK_MORNING_BRIEFING_URL or DISCORD_WEBHOOK_URL,
         )
         _mark_briefing_sent(sent_key, today_str, now_ct)
         log(f"{title} sent to Discord.")
@@ -5127,7 +5223,7 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     exit_icon = "\U0001f7e2" if is_profit else "\U0001f534"
     grade = "A" if combined_pnl_pct >= 0.20 else "B" if combined_pnl_pct >= 0.10 else "C" if combined_pnl_pct >= -0.10 else "D"
 
-    send_discord(
+    exit_message = (
         f"{exit_icon} **{exit_type_label} — {exit_header} | {trade['side']} - {pnl_pct * 100:+.2f}%**\n"
         f"\U0001f3f7\ufe0f **{exit_scope}**\n\n"
         f"------------------------------\n"
@@ -5140,9 +5236,19 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         f"\U0001f3c6 **Grade:** `{grade}`\n\n"
         f"\U0001f4cc **Outcome:** `{outcome_label} (RULES FOLLOWED)`\n"
         f"Opened: `{trade['opened_at']:%Y-%m-%d %H:%M:%S %Z}`\n"
-        f"Closed: `{closed_at:%Y-%m-%d %H:%M:%S %Z}`",
-        color=DISCORD_COLOR_CALL if is_profit else DISCORD_COLOR_PUT,
+        f"Closed: `{closed_at:%Y-%m-%d %H:%M:%S %Z}`"
     )
+    exit_color = DISCORD_COLOR_CALL if is_profit else DISCORD_COLOR_PUT
+    exit_sent = send_discord_bot_reply(trade.get("entry_message_id"), exit_message, color=exit_color)
+    if not exit_sent:
+        exit_sent = append_discord_entry_update(
+            trade.get("entry_message_id"),
+            exit_message,
+            color=exit_color,
+            webhook_url=DISCORD_WEBHOOK_LIVE_TRADES_URL,
+        )
+    if not exit_sent:
+        log(f"[{trade['underlying']}] Exit Discord update skipped: entry message unavailable.")
 
     # Exit Reason in Google Sheets: PROFIT or LOSS with P&L figures only.
     if final_close and _prev_partial_qty > 0 and _combined_cost > 0:
@@ -5364,6 +5470,7 @@ def try_open_paper_trade(symbol, side, option, data):
         f"\U0001f4cc **Action:** ENTERED (`{trade['qty']}` contract{'s' if trade['qty'] != 1 else ''})",
         color=DISCORD_COLOR_CALL if trade['side'] == 'CALL' else DISCORD_COLOR_PUT,
         wait_for_response=True,
+        webhook_url=DISCORD_WEBHOOK_LIVE_TRADES_URL,
     )
     try:
         msg_id = (entry_msg or {}).get("id") if isinstance(entry_msg, dict) else None
