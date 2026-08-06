@@ -140,6 +140,7 @@ PLAYBOOK_MAX_VWAP_EXTENSION = float(os.getenv("PLAYBOOK_MAX_VWAP_EXTENSION", "0.
 PULLBACK_RECLAIM_TOLERANCE = float(os.getenv("PULLBACK_RECLAIM_TOLERANCE", "0.003"))
 PULLBACK_MIN_SCORE_DELTA = int(os.getenv("PULLBACK_MIN_SCORE_DELTA", "0"))
 BREAKOUT_HOLD_CONFIRMATION_ENABLED = os.getenv("BREAKOUT_HOLD_CONFIRMATION_ENABLED", "1") == "1"
+PLAYBOOK_EXTREME_PROXIMITY_PCT = float(os.getenv("PLAYBOOK_EXTREME_PROXIMITY_PCT", "0.0015"))
 BREAKOUT_PUT_ENTRIES_ENABLED = os.getenv("BREAKOUT_PUT_ENTRIES_ENABLED", "0") == "1"
 MAX_NEW_ENTRIES_PER_CYCLE = max(1, int(os.getenv("MAX_NEW_ENTRIES_PER_CYCLE", "10")))
 # Global bypass for all entry gating layers (tier/stock strict/opening/cooldown/ignition/RSI/macro/anti-chase/candle).
@@ -280,7 +281,7 @@ ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
 # Set to 0 to keep the bot in pure alert mode (no orders submitted, no tracking).
 ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "1"
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))  # take-profit at +20%
-STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.10"))  # stop-loss at -20%
+STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.10"))  # base stop-loss at -10%
 # Adaptive exit profile (expectancy-focused, not trade-count suppression).
 PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "0.12"))
 PARTIAL_CLOSE_FRACTION = float(os.getenv("PARTIAL_CLOSE_FRACTION", "0.50"))
@@ -302,7 +303,7 @@ ADAPTIVE_EXIT_PROFILE_ENABLED = os.getenv("ADAPTIVE_EXIT_PROFILE_ENABLED", "1") 
 HIGH_VOL_RATIO = float(os.getenv("HIGH_VOL_RATIO", "1.50"))
 LOW_VOL_RATIO = float(os.getenv("LOW_VOL_RATIO", "0.90"))
 HIGH_VOL_TARGET_PCT = float(os.getenv("HIGH_VOL_TARGET_PCT", "0.24"))
-HIGH_VOL_STOP_PCT = float(os.getenv("HIGH_VOL_STOP_PCT", "0.22"))
+HIGH_VOL_STOP_PCT = float(os.getenv("HIGH_VOL_STOP_PCT", "0.14"))
 LOW_VOL_TARGET_PCT = float(os.getenv("LOW_VOL_TARGET_PCT", "0.16"))
 LOW_VOL_STOP_PCT = float(os.getenv("LOW_VOL_STOP_PCT", "0.14"))
 # Option contract ranking preferences.
@@ -1923,6 +1924,10 @@ def playbook_entry_ok(side, data, symbol=None):
     price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
     vwap = _safe_float_num((data or {}).get("vwap", 0.0), 0.0)
     ema20 = _safe_float_num((data or {}).get("ema20", 0.0), 0.0)
+    recent_high = _safe_float_num((data or {}).get("recent_high", price), price)
+    recent_low = _safe_float_num((data or {}).get("recent_low", price), price)
+    pdh = _safe_float_num((data or {}).get("pdh", price), price)
+    pdl = _safe_float_num((data or {}).get("pdl", price), price)
     extension = abs(_safe_float_num((data or {}).get("vwap_extension_pct", 0.0), 0.0))
     volume_ratio = _safe_float_num((data or {}).get("vol_ratio", 0.0), 0.0)
     delta_5m, _ = _score_trend_deltas(data or {}, side)
@@ -1935,6 +1940,21 @@ def playbook_entry_ok(side, data, symbol=None):
         return False, None, "no breakout or pullback-continuation structure"
     if playbook == "BREAKOUT" and hold_confirmed is False:
         return False, playbook, hold_reason
+    if call_side:
+        resistance_levels = [level for level in (recent_high, pdh) if level >= price]
+        extreme_level = min(resistance_levels) if resistance_levels else max(recent_high, pdh)
+    else:
+        support_levels = [level for level in (recent_low, pdl) if level <= price]
+        extreme_level = max(support_levels) if support_levels else min(recent_low, pdl)
+    distance_to_extreme = (
+        ((extreme_level - price) / price) if call_side else ((price - extreme_level) / price)
+    ) if price > 0 else 0.0
+    if playbook != "BREAKOUT" and distance_to_extreme <= PLAYBOOK_EXTREME_PROXIMITY_PCT:
+        direction = "high/resistance" if call_side else "low/support"
+        return False, playbook, (
+            f"{side} is within {distance_to_extreme * 100:+.2f}% of {direction} "
+            f"${extreme_level:.2f}; requires breakout hold confirmation"
+        )
     min_score = BREAKOUT_MIN_SCORE if playbook == "BREAKOUT" else PULLBACK_MIN_SCORE
     if score < min_score:
         return False, playbook, f"score {score:.0f} < {min_score}"
@@ -5223,6 +5243,24 @@ def _trade_exit_explanation(trade, reason, entry_price, exit_price, pnl_pct, mar
     return f"{price_move}; {structure_text}; exit triggered by {reason}."
 
 
+def _sheets_exit_reason(reason, pnl_pct, pnl_dollar, market_context):
+    """Keep the concrete exit trigger and observed underlying structure in Sheets."""
+    context = market_context or {}
+    price = _safe_float_num(context.get("price"), 0.0)
+    vwap = _safe_float_num(context.get("vwap"), 0.0)
+    ema20 = _safe_float_num(context.get("ema20"), 0.0)
+    move_2bar = _safe_float_num(context.get("move_2bar_pct"), 0.0)
+    move_5bar = _safe_float_num(context.get("move_5bar_pct"), 0.0)
+    outcome = "PROFIT" if pnl_pct > 0 else "LOSS"
+    summary = f"{reason} | {outcome} ({pnl_pct * 100:+.2f}% / ${pnl_dollar:+.2f})"
+    if price > 0:
+        summary += (
+            f" | exit underlying ${price:.2f} vs VWAP ${vwap:.2f}/EMA20 ${ema20:.2f}"
+            f"; 2-bar {move_2bar:+.2f}%, 5-bar {move_5bar:+.2f}%"
+        )
+    return summary
+
+
 def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=True):
     """Submit a paper exit (if enabled), Discord the result, and append to CSV.
 
@@ -5373,14 +5411,15 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     if not exit_sent:
         log(f"[{trade['underlying']}] Exit Discord update skipped: entry message unavailable.")
 
-    # Exit Reason in Google Sheets: PROFIT or LOSS with P&L figures only.
     if final_close and _prev_partial_qty > 0 and _combined_cost > 0:
-        _sheets_label = "PROFIT" if combined_pnl_pct > 0 else "LOSS"
-        sheets_reason = f"{_sheets_label} ({combined_pnl_pct * 100:+.2f}% / ${_combined_dollar:+.2f})"
+        sheets_reason = _sheets_exit_reason(
+            reason, combined_pnl_pct, _combined_dollar, exit_market_context
+        )
     else:
         _leg_dollar = (exit_px - entry_px) * close_qty_int * 100.0
-        _sheets_label = "PROFIT" if pnl_pct > 0 else "LOSS"
-        sheets_reason = f"{_sheets_label} ({pnl_pct * 100:+.2f}% / ${_leg_dollar:+.2f})"
+        sheets_reason = _sheets_exit_reason(
+            reason, pnl_pct, _leg_dollar, exit_market_context
+        )
     row = {
         "opened_at": trade["opened_at"],
         "closed_at": closed_at,
