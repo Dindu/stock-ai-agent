@@ -106,6 +106,9 @@ BAR_MINUTES = 5
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index options
 WS_SYMBOL_MIN_EVAL_SECONDS = int(os.getenv("WS_SYMBOL_MIN_EVAL_SECONDS", "5"))
 WS_EXIT_CHECK_SECONDS = int(os.getenv("WS_EXIT_CHECK_SECONDS", "5"))
+EXIT_REVIEW_ENABLED = os.getenv("EXIT_REVIEW_ENABLED", "1") == "1"
+EXIT_REVIEW_DELAY_MINUTES = int(os.getenv("EXIT_REVIEW_DELAY_MINUTES", "30"))
+EXIT_REVIEW_CHECK_SECONDS = int(os.getenv("EXIT_REVIEW_CHECK_SECONDS", "60"))
 WS_LOOP_SLEEP_SECONDS = float(os.getenv("WS_LOOP_SLEEP_SECONDS", "0.5"))
 WS_FULL_SCAN_INTERVAL_SECONDS = int(os.getenv("WS_FULL_SCAN_INTERVAL_SECONDS", "30"))
 SCAN_PREFETCH_PARALLEL_ENABLED = os.getenv("SCAN_PREFETCH_PARALLEL_ENABLED", "1") == "1"
@@ -508,6 +511,12 @@ _TRADES_HEADERS = [
     "Entry Time", "Exit Time", "Exit Reason", "Status", "Options Expiration",
     "Alpaca Order ID", "P&L", "P&L %", "Duration", "Created At", "Updated At", "Setup Type",
 ]
+_EXIT_REVIEWS_HEADERS = [
+    "Review ID", "Status", "Review Due CT", "Reviewed At CT", "Trade ID", "Symbol", "Contract", "Side",
+    "Entry Time CT", "Exit Time CT", "Exit Trigger", "Entry Option", "Exit Option", "Option at Review",
+    "P&L at Exit %", "Option Move After Exit %", "Underlying at Exit", "Underlying at Review",
+    "VWAP at Review", "EMA20 at Review", "2-Bar Move %", "5-Bar Move %", "Assessment", "Notes", "Discord Message ID",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +620,24 @@ def init_google_sheets():
                 log("Ensured 'Trades' header row in Google Sheets.")
         except Exception as header_err:
             log(f"Warning: Could not verify/set Trades headers: {header_err}")
+
+        # Exit Reviews stores one observation-only follow-up for each final exit.
+        try:
+            exit_reviews_ws = _gsheet.worksheet("Exit Reviews")
+        except gspread.exceptions.WorksheetNotFound:
+            exit_reviews_ws = _gsheet.add_worksheet(title="Exit Reviews", rows=2000, cols=len(_EXIT_REVIEWS_HEADERS))
+            log("Created 'Exit Reviews' tab in Google Sheets.")
+        try:
+            existing_review_headers = exit_reviews_ws.row_values(1)
+            if existing_review_headers != _EXIT_REVIEWS_HEADERS:
+                exit_reviews_ws.update(
+                    range_name="A1",
+                    values=[_EXIT_REVIEWS_HEADERS],
+                    value_input_option="USER_ENTERED",
+                )
+                log("Ensured 'Exit Reviews' header row in Google Sheets.")
+        except Exception as header_err:
+            log(f"Warning: Could not verify/set Exit Reviews headers: {header_err}")
         
         # Protect header row (row 1) so it cannot be edited.
         try:
@@ -2035,16 +2062,21 @@ def promoted_entry_quality_ok(symbol, side, data):
 
 
 def _why_now_line(data, side):
-    """Compact explanation of why this side is actionable now."""
+    """Plain-language explanation of why this side is actionable now."""
     side = str(side or "").upper()
     dominant = int(data.get("bull_score", 0)) if side == "CALL" else int(data.get("bear_score", 0))
     opposite = int(data.get("bear_score", 0)) if side == "CALL" else int(data.get("bull_score", 0))
     delta_5m, delta_10m = _score_trend_deltas(data, side)
-    pieces = [f"score {dominant}", f"dominance +{max(0, dominant - opposite)}"]
+    direction = "buyers" if side == "CALL" else "sellers"
+    pieces = [
+        f"{direction} are in control ({dominant} vs {opposite})",
+        f"{side} edge +{max(0, dominant - opposite)}",
+    ]
     if delta_5m is not None:
-        pieces.append(f"5mΔ {delta_5m:+d}")
+        momentum = "building" if delta_5m > 0 else "steady" if delta_5m == 0 else "cooling"
+        pieces.append(f"momentum {momentum} over 5m ({delta_5m:+d})")
     if delta_10m is not None:
-        pieces.append(f"10mΔ {delta_10m:+d}")
+        pieces.append(f"10m trend {delta_10m:+d}")
     return " | ".join(pieces)
 
 
@@ -5215,31 +5247,35 @@ def _trade_exit_explanation(trade, reason, entry_price, exit_price, pnl_pct, mar
     put_structure_failed = underlying_price > 0 and underlying_price > max(vwap, ema20)
     structure_failed = call_structure_failed if "CALL" in side else put_structure_failed
     if underlying_price > 0:
+        if "CALL" in side:
+            structure_state = "buyers lost short-term control" if structure_failed else "buyers still held short-term support"
+        else:
+            structure_state = "sellers lost short-term control" if structure_failed else "sellers still held short-term pressure"
         structure_text = (
-            f"underlying ${underlying_price:.2f} vs VWAP ${vwap:.2f}/EMA20 ${ema20:.2f}; "
-            f"2-bar {move_2bar:+.2f}%, 5-bar {move_5bar:+.2f}%"
+            f"{structure_state}: ${underlying_price:.2f} vs VWAP ${vwap:.2f}/EMA20 ${ema20:.2f}; "
+            f"last 2 bars {move_2bar:+.2f}%, last 5 bars {move_5bar:+.2f}%"
         )
     else:
         structure_text = "underlying exit structure was unavailable"
 
     if reason_text == "TARGET HIT":
         target_pct = float(trade.get("target_pct", PROFIT_TARGET_PCT) or PROFIT_TARGET_PCT) * 100
-        return f"{side} thesis followed through: {structure_text}. {price_move}; the +{target_pct:.0f}% target was reached."
+        return f"The {side} idea followed through. {structure_text}. {price_move}; the +{target_pct:.0f}% target was reached."
     if reason_text == "STOP LOSS":
         stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT) * 100
         if structure_failed:
-            return f"{side} thesis failed: the underlying lost VWAP/EMA20 alignment; {structure_text}. {price_move}, so the -{stop_pct:.0f}% stop closed it."
-        return f"Option premium weakness caused the stop while the underlying structure remained intact: {structure_text}. {price_move}; the -{stop_pct:.0f}% stop closed it."
+            return f"The {side} idea lost support. {structure_text}. {price_move}, so the -{stop_pct:.0f}% risk stop closed it."
+        return f"The option weakened before the underlying trend clearly broke. {structure_text}. {price_move}; the -{stop_pct:.0f}% risk stop closed it."
     if reason_text == "MOMENTUM FAILURE":
         structure = "below VWAP and EMA20" if "CALL" in side else "above VWAP and EMA20"
-        return f"{side} thesis failed: the underlying moved {structure}; {structure_text}. {price_move}."
+        return f"The {side} idea lost momentum: price moved {structure}. {structure_text}. {price_move}."
     if reason_text == "PARTIAL TAKE PROFIT":
-        return f"{side} thesis followed through: {structure_text}. {price_move}; the first profit objective was realized."
+        return f"The {side} idea followed through. {structure_text}. {price_move}; the first profit objective was realized."
     if reason_text == "TRAILING STOP":
         max_seen = float(trade.get("max_pnl_pct", pnl_pct) or pnl_pct) * 100
-        return f"Initial {side} move succeeded, then momentum gave back gains: {structure_text}. Profit retraced from +{max_seen:.2f}% and the trailing stop closed it."
+        return f"The initial {side} move worked, then gave back gains. {structure_text}. Profit retraced from +{max_seen:.2f}% and the trailing stop closed it."
     if reason_text.startswith("TIME EXIT"):
-        return f"{side} thesis did not follow through within the allowed holding window: {structure_text}. {price_move}."
+        return f"The {side} idea did not move soon enough. {structure_text}. {price_move}."
     return f"{price_move}; {structure_text}; exit triggered by {reason}."
 
 
@@ -5259,6 +5295,150 @@ def _sheets_exit_reason(reason, pnl_pct, pnl_dollar, market_context):
             f"; 2-bar {move_2bar:+.2f}%, 5-bar {move_5bar:+.2f}%"
         )
     return summary
+
+
+def schedule_exit_review(trade, reason, entry_price, exit_price, pnl_pct, closed_at, market_context):
+    """Create one durable, observation-only review due after a final exit."""
+    if not EXIT_REVIEW_ENABLED:
+        return
+    if _gsheet is None and not ensure_google_sheets_ready():
+        log(f"[{trade.get('underlying', 'UNKNOWN')}] Exit review scheduling skipped: Google Sheets unavailable.")
+        return
+    try:
+        review_id = str(uuid.uuid4())[:8].upper()
+        due_at = closed_at + timedelta(minutes=max(1, EXIT_REVIEW_DELAY_MINUTES))
+        context = market_context or {}
+        row = [
+            review_id,
+            "PENDING",
+            due_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "",
+            trade.get("trade_id", ""),
+            trade.get("underlying", ""),
+            trade.get("contract", ""),
+            trade.get("side", trade.get("signal", "")),
+            trade.get("opened_at").strftime("%Y-%m-%d %H:%M:%S") if isinstance(trade.get("opened_at"), datetime) else str(trade.get("opened_at", "")),
+            closed_at.strftime("%Y-%m-%d %H:%M:%S"),
+            reason,
+            round(float(entry_price), 4),
+            round(float(exit_price), 4),
+            "",
+            round(float(pnl_pct) * 100.0, 2),
+            "",
+            round(_safe_float_num(context.get("price"), 0.0), 4),
+            "",
+            "",
+            "",
+            "",
+            "",
+            "PENDING",
+            "One 30-minute observation-only review; no automatic re-entry.",
+            str(trade.get("entry_message_id", "") or ""),
+        ]
+        _gsheet.worksheet("Exit Reviews").append_row(row, value_input_option="USER_ENTERED")
+        log(f"[{trade.get('underlying', 'UNKNOWN')}] Exit review {review_id} scheduled for {due_at:%H:%M CT}.")
+    except Exception as e:
+        log(f"[{trade.get('underlying', 'UNKNOWN')}] Exit review scheduling failed: {e}")
+
+
+def _exit_review_assessment(exit_trigger, exit_option, review_option):
+    """Classify a review using only the post-exit option move."""
+    if exit_option <= 0 or review_option <= 0:
+        return "INCONCLUSIVE", "No reliable option quote was available for the review."
+    post_exit_move_pct = (review_option - exit_option) / exit_option * 100.0
+    target_exit = str(exit_trigger or "").upper() in {"TARGET HIT", "PARTIAL TAKE PROFIT"}
+    if target_exit:
+        if post_exit_move_pct >= 5.0:
+            return "LEFT MORE UPSIDE", "The option continued higher after the planned profit exit."
+        if post_exit_move_pct <= -3.0:
+            return "EXIT VALIDATED", "The option gave back value after the planned profit exit."
+    else:
+        if post_exit_move_pct <= -3.0:
+            return "EXIT VALIDATED", "The option continued lower after the exit."
+        if post_exit_move_pct >= 5.0:
+            return "EXIT EARLY", "The option recovered meaningfully after the exit."
+    return "INCONCLUSIVE", "The option move after exit was not large enough to judge the exit."
+
+
+def process_due_exit_reviews(now_ct=None):
+    """Perform due post-exit reviews; this observer never opens or closes positions."""
+    if not EXIT_REVIEW_ENABLED:
+        return
+    if _gsheet is None and not ensure_google_sheets_ready():
+        return
+    now_ct = now_ct or datetime.now(central)
+    try:
+        ws = _gsheet.worksheet("Exit Reviews")
+        rows = ws.get_all_values()
+        if len(rows) <= 1:
+            return
+        headers = rows[0]
+        index = {name: idx for idx, name in enumerate(headers)}
+        for row_number, raw_row in enumerate(rows[1:], start=2):
+            row = list(raw_row) + [""] * max(0, len(headers) - len(raw_row))
+            if str(row[index["Status"]]).upper() != "PENDING":
+                continue
+            try:
+                due_at = central.localize(datetime.strptime(row[index["Review Due CT"]], "%Y-%m-%d %H:%M:%S"))
+            except (TypeError, ValueError):
+                row[index["Status"]] = "ERROR"
+                row[index["Notes"]] = "Could not parse review due time."
+                ws.update(range_name=f"A{row_number}", values=[row], value_input_option="USER_ENTERED")
+                continue
+            if due_at > now_ct:
+                continue
+
+            contract = str(row[index["Contract"]] or "")
+            symbol = str(row[index["Symbol"]] or "")
+            side = str(row[index["Side"]] or "").upper()
+            exit_option = _safe_float_num(row[index["Exit Option"]], 0.0)
+            review_option = get_current_option_price({"contract": contract, "underlying": symbol})
+            market_context = _capture_exit_market_context({"underlying": symbol})
+            assessment, notes = _exit_review_assessment(
+                row[index["Exit Trigger"]], exit_option, _safe_float_num(review_option, 0.0)
+            )
+            if review_option and exit_option > 0:
+                post_exit_move_pct = (float(review_option) - exit_option) / exit_option * 100.0
+            else:
+                post_exit_move_pct = None
+
+            row[index["Status"]] = "COMPLETED"
+            row[index["Reviewed At CT"]] = now_ct.strftime("%Y-%m-%d %H:%M:%S")
+            row[index["Option at Review"]] = round(float(review_option), 4) if review_option else ""
+            row[index["Option Move After Exit %"]] = round(post_exit_move_pct, 2) if post_exit_move_pct is not None else ""
+            row[index["Underlying at Review"]] = round(_safe_float_num(market_context.get("price"), 0.0), 4) or ""
+            row[index["VWAP at Review"]] = round(_safe_float_num(market_context.get("vwap"), 0.0), 4) or ""
+            row[index["EMA20 at Review"]] = round(_safe_float_num(market_context.get("ema20"), 0.0), 4) or ""
+            row[index["2-Bar Move %"]] = round(_safe_float_num(market_context.get("move_2bar_pct"), 0.0), 2)
+            row[index["5-Bar Move %"]] = round(_safe_float_num(market_context.get("move_5bar_pct"), 0.0), 2)
+            row[index["Assessment"]] = assessment
+            row[index["Notes"]] = notes
+            ws.update(range_name=f"A{row_number}", values=[row], value_input_option="USER_ENTERED")
+
+            review_option_text = f"${float(review_option):.2f}" if review_option else "unavailable"
+            move_text = f"{post_exit_move_pct:+.2f}%" if post_exit_move_pct is not None else "unavailable"
+            underlying_text = "underlying review data unavailable"
+            if _safe_float_num(market_context.get("price"), 0.0) > 0:
+                underlying_text = (
+                    f"underlying ${market_context['price']:.2f} vs VWAP ${market_context['vwap']:.2f}/"
+                    f"EMA20 ${market_context['ema20']:.2f}; last 2 bars {market_context['move_2bar_pct']:+.2f}%, "
+                    f"last 5 bars {market_context['move_5bar_pct']:+.2f}%"
+                )
+            message = (
+                f"\U0001f50e **POST-EXIT CHECK — {symbol} | {side} | +{max(1, EXIT_REVIEW_DELAY_MINUTES)}m**\n\n"
+                f"**We exited:** `${exit_option:.2f}`\n"
+                f"**Option now:** `{review_option_text}` (`{move_text}` after exit)\n"
+                f"**Assessment:** `{assessment}`\n"
+                f"**What happened:** {notes}\n"
+                f"**Market now:** {underlying_text}"
+            )
+            message_id = str(row[index["Discord Message ID"]] or "")
+            sent = send_discord_bot_reply(message_id, message, color=DISCORD_COLOR_WARN)
+            if not sent:
+                send_discord(message, color=DISCORD_COLOR_WARN, webhook_url=DISCORD_WEBHOOK_LIVE_TRADES_URL)
+            log(f"[{symbol}] Exit review {row[index['Review ID']]} completed: {assessment}.")
+    except Exception as e:
+        log(f"Exit review processing failed: {e}")
 
 
 def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=True):
@@ -5452,6 +5632,9 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
             combined_row["_combined_pnl_dollar"] = round(_combined_dollar, 2)
         update_alert_close_to_sheets(combined_row, trade)
         log_trade_to_sheets(combined_row, trade, final_close=True)
+        schedule_exit_review(
+            trade, reason, entry_px, exit_px, combined_pnl_pct, closed_at, exit_market_context
+        )
     else:
         log_trade_to_sheets(row, trade, final_close=False)
     perf_trade = dict(trade)
@@ -5700,6 +5883,11 @@ def run_cycle(client):
         sys.stdout.flush()
 
     try:
+        process_due_exit_reviews()
+    except Exception as e:
+        log(f"Exit review check error: {e}")
+
+    try:
         maybe_send_hourly_perf_report(datetime.now(central))
     except Exception as e:
         log(f"Hourly perf report error: {e}")
@@ -5759,6 +5947,7 @@ def run_websocket_cycle(client):
     log(f"WebSocket mode enabled. Subscribed to trade ticks for {len(SYMBOLS)} symbols (feed={FEED}).")
 
     next_exit_check_at = datetime.now(central)
+    next_exit_review_check_at = datetime.now(central)
     next_full_scan_at = datetime.now(central)
     min_eval_gap = max(1, WS_SYMBOL_MIN_EVAL_SECONDS)
     exit_check_gap = max(1, WS_EXIT_CHECK_SECONDS)
@@ -5863,6 +6052,15 @@ def run_websocket_cycle(client):
                 traceback.print_exc()
                 sys.stdout.flush()
             next_exit_check_at = datetime.now(central) + timedelta(seconds=exit_check_gap)
+
+        if now_ct >= next_exit_review_check_at:
+            try:
+                process_due_exit_reviews(now_ct)
+            except Exception as e:
+                log(f"Exit review check error: {e}")
+            next_exit_review_check_at = datetime.now(central) + timedelta(
+                seconds=max(10, EXIT_REVIEW_CHECK_SECONDS)
+            )
 
         try:
             maybe_send_hourly_perf_report(datetime.now(central))
