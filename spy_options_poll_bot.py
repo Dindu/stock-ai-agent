@@ -144,6 +144,8 @@ PLAYBOOK_MAX_VWAP_EXTENSION = float(os.getenv("PLAYBOOK_MAX_VWAP_EXTENSION", "0.
 PULLBACK_RECLAIM_TOLERANCE = float(os.getenv("PULLBACK_RECLAIM_TOLERANCE", "0.003"))
 PULLBACK_MIN_SCORE_DELTA = int(os.getenv("PULLBACK_MIN_SCORE_DELTA", "0"))
 BREAKOUT_HOLD_CONFIRMATION_ENABLED = os.getenv("BREAKOUT_HOLD_CONFIRMATION_ENABLED", "1") == "1"
+BREAKOUT_CONFIRMATION_MIN_BUFFER_PCT = float(os.getenv("BREAKOUT_CONFIRMATION_MIN_BUFFER_PCT", "0.001"))
+BREAKOUT_CONFIRMATION_MIN_SCORE_DELTA = int(os.getenv("BREAKOUT_CONFIRMATION_MIN_SCORE_DELTA", "1"))
 BREAKOUT_CONTINUATION_ENABLED = os.getenv("BREAKOUT_CONTINUATION_ENABLED", "1") == "1"
 BREAKOUT_CONTINUATION_WINDOW_MINUTES = int(os.getenv("BREAKOUT_CONTINUATION_WINDOW_MINUTES", "15"))
 BREAKOUT_CONTINUATION_MIN_SCORE = int(os.getenv("BREAKOUT_CONTINUATION_MIN_SCORE", "75"))
@@ -1912,7 +1914,7 @@ def classify_entry_playbook(side, data):
 
 
 def _breakout_hold_confirmation(symbol, side, data):
-    """Require the bar after a fresh break to close beyond its broken level."""
+    """Require the bar after a fresh break to hold beyond the level with momentum."""
     if not BREAKOUT_HOLD_CONFIRMATION_ENABLED or not symbol:
         return None, "disabled"
 
@@ -1935,7 +1937,27 @@ def _breakout_hold_confirmation(symbol, side, data):
             return False, "breakout hold confirmation expired"
         _breakout_hold_pending.pop(key, None)
         level = float(pending["level"])
-        held = price > level if side == "CALL" else price < level
+        buffer = level * BREAKOUT_CONFIRMATION_MIN_BUFFER_PCT
+        held = price >= level + buffer if side == "CALL" else price <= level - buffer
+        if not held:
+            return False, (
+                f"breakout hold {price:.2f} did not clear {level:.2f} by "
+                f"{BREAKOUT_CONFIRMATION_MIN_BUFFER_PCT * 100:.2f}%"
+            )
+
+        delta_5m, _ = _score_trend_deltas(data or {}, side)
+        if delta_5m is None or delta_5m < BREAKOUT_CONFIRMATION_MIN_SCORE_DELTA:
+            return False, (
+                f"breakout confirmation 5m score delta {delta_5m} < "
+                f"{BREAKOUT_CONFIRMATION_MIN_SCORE_DELTA:+d}"
+            )
+
+        opposing_indices = [
+            name for name, index_side in (("SPY", _spy_vwap_side()), ("QQQ", _qqq_vwap_side()))
+            if index_side == ("bear" if side == "CALL" else "bull")
+        ]
+        if opposing_indices:
+            return False, f"breakout confirmation blocked by {'/'.join(opposing_indices)} macro alignment"
         if held:
             return True, f"breakout held {level:.2f} on next completed bar"
         return False, f"breakout failed to hold {level:.2f}"
