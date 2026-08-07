@@ -5377,6 +5377,23 @@ def _render_trade_candlestick_chart(trade, exit_price, closed_at):
         if isinstance(bars.index, pd.MultiIndex):
             bars = bars.xs(symbol, level=0)
         bars = calculate_indicators(bars[["open", "high", "low", "close", "volume"]])
+
+        def _containing_bar(event_time):
+            """Return the 5-minute bar containing an event timestamp."""
+            event_timestamp = pd.Timestamp(event_time)
+            bar_timezone = bars.index.tz
+            if event_timestamp.tzinfo is None:
+                event_timestamp = event_timestamp.tz_localize(central)
+            if bar_timezone is not None:
+                event_timestamp = event_timestamp.tz_convert(bar_timezone)
+            else:
+                event_timestamp = event_timestamp.tz_localize(None)
+            position = bars.index.searchsorted(event_timestamp, side="right") - 1
+            position = max(0, min(int(position), len(bars) - 1))
+            return bars.index[position], bars.iloc[position]
+
+        entry_bar_time, entry_bar = _containing_bar(opened_at)
+        exit_bar_time, exit_bar = _containing_bar(closed_at)
         fig, axis = plt.subplots(figsize=(9, 5), dpi=150)
         fig.patch.set_facecolor("#111827")
         axis.set_facecolor("#111827")
@@ -5391,12 +5408,32 @@ def _render_trade_candlestick_chart(trade, exit_price, closed_at):
         axis.plot(bars.index, bars["VWAP"], color="#60a5fa", linewidth=1.25, label="VWAP")
         axis.plot(bars.index, bars["EMA20"], color="#f59e0b", linewidth=1.25, label="EMA20")
         entry_underlying = _safe_float_num(trade.get("underlying_entry_price"), 0.0)
-        if entry_underlying > 0:
-            axis.scatter([opened_at], [entry_underlying], color="#22c55e", s=45, zorder=5, label="Entry")
-        axis.scatter([closed_at], [bars["close"].iloc[-1]], color="#ef4444", s=45, zorder=5, label="Exit")
-        axis.axvline(opened_at, color="#22c55e", linestyle="--", linewidth=0.8, alpha=0.7)
-        axis.axvline(closed_at, color="#ef4444", linestyle="--", linewidth=0.8, alpha=0.7)
-        axis.set_title(f"{symbol} 5-Minute Candles | {trade.get('side', '')} option ${trade.get('entry', 0):.2f} -> ${exit_price:.2f}", color="#f9fafb", pad=12)
+        entry_marker_price = entry_underlying if entry_underlying > 0 else float(entry_bar["close"])
+        exit_marker_price = float(exit_bar["close"])
+        opened_label = opened_at.astimezone(central).strftime("%H:%M CT")
+        closed_label = closed_at.astimezone(central).strftime("%H:%M CT")
+        entry_candle_label = entry_bar_time.tz_convert(central).strftime("%H:%M") if entry_bar_time.tzinfo else entry_bar_time.strftime("%H:%M")
+        exit_candle_label = exit_bar_time.tz_convert(central).strftime("%H:%M") if exit_bar_time.tzinfo else exit_bar_time.strftime("%H:%M")
+        axis.scatter([entry_bar_time], [entry_marker_price], color="#22c55e", s=55, zorder=5, label="Entry")
+        axis.scatter([exit_bar_time], [exit_marker_price], color="#ef4444", s=55, zorder=5, label="Exit")
+        axis.annotate(
+            f"ENTRY {opened_label}\nbar {entry_candle_label} | ${entry_marker_price:.2f}",
+            (entry_bar_time, entry_marker_price), xytext=(8, 12), textcoords="offset points",
+            color="#bbf7d0", fontsize=7, weight="bold",
+        )
+        axis.annotate(
+            f"EXIT {closed_label}\nbar {exit_candle_label} | ${exit_marker_price:.2f}",
+            (exit_bar_time, exit_marker_price), xytext=(8, -22), textcoords="offset points",
+            color="#fecaca", fontsize=7, weight="bold",
+        )
+        axis.axvline(entry_bar_time, color="#22c55e", linestyle="--", linewidth=0.8, alpha=0.7)
+        axis.axvline(exit_bar_time, color="#ef4444", linestyle="--", linewidth=0.8, alpha=0.7)
+        axis.set_title(
+            f"{symbol} 5-Minute Candles | {trade.get('contract', '')}\n"
+            f"{trade.get('side', '')} option ${trade.get('entry', 0):.2f} -> ${exit_price:.2f} | "
+            f"{opened_label} -> {closed_label}",
+            color="#f9fafb", pad=12, fontsize=10,
+        )
         axis.grid(color="#374151", alpha=0.45, linewidth=0.6)
         axis.tick_params(colors="#d1d5db")
         for spine in axis.spines.values():
@@ -5782,7 +5819,9 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
                 trade.get("entry_message_id"),
                 chart_bytes,
                 f"{trade['underlying']}_{closed_at:%Y%m%d_%H%M}_exit.png",
-                f"\U0001f4c8 **5-minute candle chart** | entry and exit marked | VWAP (blue) | EMA20 (orange)",
+                f"\U0001f4c8 **{trade['contract']}** | 5-minute candles | "
+                f"entry `{trade['opened_at']:%H:%M CT}` | exit `{closed_at:%H:%M CT}` | "
+                f"VWAP (blue) | EMA20 (orange)",
             )
             if not chart_sent:
                 log(f"[{trade['underlying']}] Exit candle chart was not sent to Discord.")
@@ -6002,6 +6041,7 @@ def try_open_paper_trade(symbol, side, option, data):
         f"⚡ **Why Now:** `{why_now_line}`\n"
         f"\U0001f3af **Plan:** Entry `${trade['entry']:.2f}` | Partial `${target_1:.2f}` (+{partial_tp_pct*100:.0f}%) | "
         f"Final `${target_2:.2f}` (+{target_pct:.0f}%) | Stop `-{stop_pct:.0f}%`\n"
+        f"🕐 **Opened:** `{trade['opened_at']:%Y-%m-%d %H:%M:%S %Z}`\n"
         f"{news_context_block}\n\n"
         f"\U0001f4cc **Action:** ENTERED (`{trade['qty']}` contract{'s' if trade['qty'] != 1 else ''})",
         color=DISCORD_COLOR_CALL if trade['side'] == 'CALL' else DISCORD_COLOR_PUT,
