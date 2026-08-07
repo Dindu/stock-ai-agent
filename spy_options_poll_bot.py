@@ -144,6 +144,9 @@ PLAYBOOK_MAX_VWAP_EXTENSION = float(os.getenv("PLAYBOOK_MAX_VWAP_EXTENSION", "0.
 PULLBACK_RECLAIM_TOLERANCE = float(os.getenv("PULLBACK_RECLAIM_TOLERANCE", "0.003"))
 PULLBACK_MIN_SCORE_DELTA = int(os.getenv("PULLBACK_MIN_SCORE_DELTA", "0"))
 BREAKOUT_HOLD_CONFIRMATION_ENABLED = os.getenv("BREAKOUT_HOLD_CONFIRMATION_ENABLED", "1") == "1"
+BREAKOUT_CONTINUATION_ENABLED = os.getenv("BREAKOUT_CONTINUATION_ENABLED", "1") == "1"
+BREAKOUT_CONTINUATION_WINDOW_MINUTES = int(os.getenv("BREAKOUT_CONTINUATION_WINDOW_MINUTES", "15"))
+BREAKOUT_CONTINUATION_MIN_SCORE = int(os.getenv("BREAKOUT_CONTINUATION_MIN_SCORE", "75"))
 PLAYBOOK_EXTREME_PROXIMITY_PCT = float(os.getenv("PLAYBOOK_EXTREME_PROXIMITY_PCT", "0.0015"))
 BREAKOUT_PUT_ENTRIES_ENABLED = os.getenv("BREAKOUT_PUT_ENTRIES_ENABLED", "0") == "1"
 MAX_NEW_ENTRIES_PER_CYCLE = max(1, int(os.getenv("MAX_NEW_ENTRIES_PER_CYCLE", "10")))
@@ -437,6 +440,7 @@ _qqq_vwap_cache: "dict" = {"side": None, "updated_at": None}
 _ignition_pending: "dict[tuple, dict]" = {}
 # Initial breakout levels awaiting the next completed five-minute bar to hold.
 _breakout_hold_pending: "dict[tuple, dict]" = {}
+_breakout_continuations: "dict[tuple, dict]" = {}
 # Cached trending stocks and reasons from Alpaca screener/news.
 _trending_cache: "dict" = {"updated_at": None, "symbols": [], "reasons": {}}
 # Cached tradability/profile checks for trending candidates.
@@ -1943,6 +1947,48 @@ def _breakout_hold_confirmation(symbol, side, data):
     return None, "no pending breakout"
 
 
+def _breakout_continuation_confirmation(symbol, side, data):
+    """Keep a confirmed breakout eligible for one healthy continuation window."""
+    if not BREAKOUT_CONTINUATION_ENABLED or not symbol:
+        return None, "disabled"
+
+    side = str(side or "").upper()
+    key = (str(symbol).upper(), side)
+    continuation = _breakout_continuations.get(key)
+    if not continuation:
+        return None, "no confirmed breakout continuation"
+
+    bar_time = (data or {}).get("bar_time")
+    price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
+    level = float(continuation["level"])
+    expires_at = continuation.get("expires_at")
+    if expires_at is not None and bar_time is not None and bar_time > expires_at:
+        _breakout_continuations.pop(key, None)
+        return False, "confirmed breakout continuation expired"
+
+    held = price > level if side == "CALL" else price < level
+    if not held:
+        _breakout_continuations.pop(key, None)
+        return False, f"confirmed breakout lost {level:.2f}"
+    return True, f"confirmed breakout continuation above {level:.2f}"
+
+
+def _remember_breakout_continuation(symbol, side, data):
+    if not BREAKOUT_CONTINUATION_ENABLED or not symbol:
+        return
+
+    side = str(side or "").upper()
+    key = (str(symbol).upper(), side)
+    bar_time = (data or {}).get("bar_time")
+    price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
+    level = _safe_float_num((data or {}).get("recent_high" if side == "CALL" else "recent_low", price), price)
+    try:
+        expires_at = bar_time + timedelta(minutes=BREAKOUT_CONTINUATION_WINDOW_MINUTES)
+    except (TypeError, ValueError):
+        expires_at = None
+    _breakout_continuations[key] = {"level": level, "expires_at": expires_at}
+
+
 def marginal_call_entry_ok(score, data):
     """Require stronger local and index alignment for 65-69 score CALLs."""
     if not MARGINAL_CALL_GATE_ENABLED or score > MARGINAL_CALL_SCORE_CEIL:
@@ -1993,8 +2039,14 @@ def playbook_entry_ok(side, data, symbol=None):
     delta_5m, _ = _score_trend_deltas(data or {}, side)
     playbook = classify_entry_playbook(side, data)
     hold_confirmed, hold_reason = _breakout_hold_confirmation(symbol, side, data)
+    continuation_confirmed, continuation_reason = _breakout_continuation_confirmation(symbol, side, data)
     if hold_confirmed:
+        _remember_breakout_continuation(symbol, side, data)
         playbook = "BREAKOUT"
+        continuation_confirmed = True
+        continuation_reason = hold_reason
+    elif continuation_confirmed:
+        playbook = "BREAKOUT_CONTINUATION"
 
     if playbook is None:
         return False, None, "no breakout or pullback-continuation structure"
@@ -2009,16 +2061,23 @@ def playbook_entry_ok(side, data, symbol=None):
     distance_to_extreme = (
         ((extreme_level - price) / price) if call_side else ((price - extreme_level) / price)
     ) if price > 0 else 0.0
-    if playbook != "BREAKOUT" and distance_to_extreme <= PLAYBOOK_EXTREME_PROXIMITY_PCT:
+    if playbook not in ("BREAKOUT", "BREAKOUT_CONTINUATION") and distance_to_extreme <= PLAYBOOK_EXTREME_PROXIMITY_PCT:
         direction = "high/resistance" if call_side else "low/support"
         return False, playbook, (
             f"{side} is within {distance_to_extreme * 100:+.2f}% of {direction} "
             f"${extreme_level:.2f}; requires breakout hold confirmation"
         )
-    min_score = BREAKOUT_MIN_SCORE if playbook == "BREAKOUT" else PULLBACK_MIN_SCORE
+    is_breakout_continuation = continuation_confirmed is True
+    min_score = (
+        BREAKOUT_CONTINUATION_MIN_SCORE if is_breakout_continuation
+        else BREAKOUT_MIN_SCORE if playbook == "BREAKOUT"
+        else PULLBACK_MIN_SCORE
+    )
     if score < min_score:
         return False, playbook, f"score {score:.0f} < {min_score}"
-    if score < SCORE_STRONG:
+    if is_breakout_continuation:
+        pass
+    elif score < SCORE_STRONG:
         if volume_ratio < VOLUME_MULTIPLIER:
             return False, playbook, (
                 f"early-entry volume ratio {volume_ratio:.2f} < {VOLUME_MULTIPLIER:.2f}"
@@ -2045,6 +2104,11 @@ def playbook_entry_ok(side, data, symbol=None):
         return False, playbook, f"VWAP extension {extension * 100:.2f}% > {PLAYBOOK_MAX_VWAP_EXTENSION * 100:.2f}%"
     if delta_5m is not None and delta_5m < -4:
         return False, playbook, f"directional score fading ({delta_5m:+d} over 5m)"
+    if is_breakout_continuation:
+        return True, playbook, (
+            f"{continuation_reason}; score={score:.0f}, "
+            f"dominance={score - opposite:.0f}, 5m_delta={delta_5m}"
+        )
     return True, playbook, f"score={score:.0f}, dominance={score - opposite:.0f}, 5m_delta={delta_5m}"
 
 
