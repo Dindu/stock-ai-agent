@@ -3,6 +3,7 @@ python-dotenv
 yfinance
 alpaca-py
 pandas
+matplotlib
 pytz
 gspread
 google-auth

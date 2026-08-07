@@ -19,6 +19,7 @@ import subprocess
 import threading
 import traceback
 import uuid
+from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from datetime import datetime, date, timedelta, timezone
@@ -1120,6 +1121,38 @@ def send_discord_bot_reply(entry_message_id, message, color=None):
         return True
     except Exception as e:
         print(f"Discord bot reply failed: {e}")
+        return False
+
+
+def send_discord_chart_reply(entry_message_id, chart_bytes, filename, caption):
+    """Attach a chart image as a native reply to the original entry alert."""
+    if not DISCORD_BOT_TOKEN or not entry_message_id or not chart_bytes:
+        return False
+    channel_id = DISCORD_CHANNEL_ID
+    if not channel_id:
+        return False
+    payload = {
+        "content": caption[:2000],
+        "message_reference": {
+            "message_id": str(entry_message_id),
+            "channel_id": channel_id,
+            "fail_if_not_exists": False,
+        },
+    }
+    try:
+        response = requests.post(
+            f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            data={"payload_json": json.dumps(payload)},
+            files={"files[0]": (filename, chart_bytes, "image/png")},
+            headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
+            timeout=15,
+        )
+        if response.status_code not in (200, 201):
+            print(f"Discord chart reply returned {response.status_code}: {response.text[:100]}", flush=True)
+            return False
+        return True
+    except Exception as e:
+        print(f"Discord chart reply failed: {e}")
         return False
 
 
@@ -5231,6 +5264,72 @@ def _capture_exit_market_context(trade):
         return {}
 
 
+def _render_trade_candlestick_chart(trade, exit_price, closed_at):
+    """Render a compact 5-minute underlying chart with entry and exit markers."""
+    symbol = str(trade.get("underlying", "") or "").upper()
+    opened_at = trade.get("opened_at")
+    if not symbol or not isinstance(opened_at, datetime) or not isinstance(closed_at, datetime):
+        return None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.dates as mdates
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+
+        client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        request = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame(BAR_MINUTES, TimeFrameUnit.Minute),
+            start=opened_at.astimezone(timezone.utc) - timedelta(minutes=45),
+            end=closed_at.astimezone(timezone.utc) + timedelta(minutes=5),
+            feed=DataFeed(FEED),
+        )
+        bars = client.get_stock_bars(request).df
+        if bars is None or bars.empty:
+            return None
+        if isinstance(bars.index, pd.MultiIndex):
+            bars = bars.xs(symbol, level=0)
+        bars = calculate_indicators(bars[["open", "high", "low", "close", "volume"]])
+        fig, axis = plt.subplots(figsize=(9, 5), dpi=150)
+        fig.patch.set_facecolor("#111827")
+        axis.set_facecolor("#111827")
+        dates = mdates.date2num(bars.index.to_pydatetime())
+        width = (BAR_MINUTES / (24 * 60)) * 0.72
+        for date_num, (_, candle) in zip(dates, bars.iterrows()):
+            color = "#22c55e" if candle["close"] >= candle["open"] else "#ef4444"
+            axis.vlines(date_num, candle["low"], candle["high"], color=color, linewidth=1.1)
+            body_low = min(candle["open"], candle["close"])
+            body_height = max(abs(candle["close"] - candle["open"]), 0.001)
+            axis.add_patch(Rectangle((date_num - width / 2, body_low), width, body_height, color=color, alpha=0.9))
+        axis.plot(bars.index, bars["VWAP"], color="#60a5fa", linewidth=1.25, label="VWAP")
+        axis.plot(bars.index, bars["EMA20"], color="#f59e0b", linewidth=1.25, label="EMA20")
+        entry_underlying = _safe_float_num(trade.get("underlying_entry_price"), 0.0)
+        if entry_underlying > 0:
+            axis.scatter([opened_at], [entry_underlying], color="#22c55e", s=45, zorder=5, label="Entry")
+        axis.scatter([closed_at], [bars["close"].iloc[-1]], color="#ef4444", s=45, zorder=5, label="Exit")
+        axis.axvline(opened_at, color="#22c55e", linestyle="--", linewidth=0.8, alpha=0.7)
+        axis.axvline(closed_at, color="#ef4444", linestyle="--", linewidth=0.8, alpha=0.7)
+        axis.set_title(f"{symbol} 5-Minute Candles | {trade.get('side', '')} option ${trade.get('entry', 0):.2f} -> ${exit_price:.2f}", color="#f9fafb", pad=12)
+        axis.grid(color="#374151", alpha=0.45, linewidth=0.6)
+        axis.tick_params(colors="#d1d5db")
+        for spine in axis.spines.values():
+            spine.set_color("#4b5563")
+        axis.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=central))
+        axis.set_ylabel("Underlying price", color="#d1d5db")
+        legend = axis.legend(loc="upper left", frameon=False, ncol=4, fontsize=8)
+        for text in legend.get_texts():
+            text.set_color("#e5e7eb")
+        fig.tight_layout()
+        buffer = BytesIO()
+        fig.savefig(buffer, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
+        plt.close(fig)
+        return buffer.getvalue()
+    except Exception as e:
+        log(f"[{symbol}] Candlestick chart render failed: {e}")
+        return None
+
+
 def _trade_exit_explanation(trade, reason, entry_price, exit_price, pnl_pct, market_context=None):
     """Explain the observed market reason, option move, and exit rule."""
     reason_text = str(reason or "").upper()
@@ -5590,6 +5689,17 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         )
     if not exit_sent:
         log(f"[{trade['underlying']}] Exit Discord update skipped: entry message unavailable.")
+    if final_close:
+        chart_bytes = _render_trade_candlestick_chart(trade, exit_px, closed_at)
+        if chart_bytes:
+            chart_sent = send_discord_chart_reply(
+                trade.get("entry_message_id"),
+                chart_bytes,
+                f"{trade['underlying']}_{closed_at:%Y%m%d_%H%M}_exit.png",
+                f"\U0001f4c8 **5-minute candle chart** | entry and exit marked | VWAP (blue) | EMA20 (orange)",
+            )
+            if not chart_sent:
+                log(f"[{trade['underlying']}] Exit candle chart was not sent to Discord.")
 
     if final_close and _prev_partial_qty > 0 and _combined_cost > 0:
         sheets_reason = _sheets_exit_reason(
