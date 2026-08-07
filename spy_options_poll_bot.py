@@ -146,6 +146,7 @@ PULLBACK_MIN_SCORE_DELTA = int(os.getenv("PULLBACK_MIN_SCORE_DELTA", "0"))
 BREAKOUT_HOLD_CONFIRMATION_ENABLED = os.getenv("BREAKOUT_HOLD_CONFIRMATION_ENABLED", "1") == "1"
 BREAKOUT_CONFIRMATION_MIN_BUFFER_PCT = float(os.getenv("BREAKOUT_CONFIRMATION_MIN_BUFFER_PCT", "0.001"))
 BREAKOUT_CONFIRMATION_MIN_SCORE_DELTA = int(os.getenv("BREAKOUT_CONFIRMATION_MIN_SCORE_DELTA", "1"))
+BREAKOUT_CONFIRMATION_MIN_VOLUME_RATIO = float(os.getenv("BREAKOUT_CONFIRMATION_MIN_VOLUME_RATIO", "1.0"))
 BREAKOUT_CONTINUATION_ENABLED = os.getenv("BREAKOUT_CONTINUATION_ENABLED", "1") == "1"
 BREAKOUT_CONTINUATION_WINDOW_MINUTES = int(os.getenv("BREAKOUT_CONTINUATION_WINDOW_MINUTES", "15"))
 BREAKOUT_CONTINUATION_MIN_SCORE = int(os.getenv("BREAKOUT_CONTINUATION_MIN_SCORE", "75"))
@@ -330,6 +331,9 @@ PROFIT_PROTECT_ARM_PCT = float(os.getenv("PROFIT_PROTECT_ARM_PCT", "0.04"))
 PROFIT_PROTECT_FLOOR_PCT = float(os.getenv("PROFIT_PROTECT_FLOOR_PCT", "0.00"))
 PROFIT_PROTECT_DRAWDOWN_PCT = float(os.getenv("PROFIT_PROTECT_DRAWDOWN_PCT", "0.08"))
 MAX_OPEN_TRADES   = int(os.getenv("MAX_OPEN_TRADES",   "250"))
+MAX_SAME_DIRECTION_POSITIONS = int(os.getenv("MAX_SAME_DIRECTION_POSITIONS", "2"))
+MAX_SAME_DIRECTION_ETF_POSITIONS = int(os.getenv("MAX_SAME_DIRECTION_ETF_POSITIONS", "1"))
+MAX_SAME_DIRECTION_STOCK_POSITIONS = int(os.getenv("MAX_SAME_DIRECTION_STOCK_POSITIONS", "1"))
 # Block stacking multiple strikes on the same symbol+side while one is open.
 SINGLE_POSITION_PER_SYMBOL = os.getenv("SINGLE_POSITION_PER_SYMBOL", "1") == "1"
 # Rehydrate in-memory trade tracking from Alpaca open positions after restarts.
@@ -904,7 +908,10 @@ def log_trade_to_sheets(row, trade, final_close=True):
         else:
             pnl_dollar = round((row["exit"] - row["entry"]) * 100 * float(max(1, qty)), 2)
         pnl_pct = round(row["pnl_pct"], 2)
-        trade_id = trade.get("trade_id", "")
+        trade_id = str(trade.get("trade_id", "") or "").strip()
+        if not trade_id:
+            trade_id = str(uuid.uuid4())[:8].upper()
+            trade["trade_id"] = trade_id
         now = datetime.now(central).strftime("%Y-%m-%d %H:%M:%S")
 
         full_row = [
@@ -1950,6 +1957,13 @@ def _breakout_hold_confirmation(symbol, side, data):
             return False, (
                 f"breakout confirmation 5m score delta {delta_5m} < "
                 f"{BREAKOUT_CONFIRMATION_MIN_SCORE_DELTA:+d}"
+            )
+
+        volume_ratio = _safe_float_num((data or {}).get("vol_ratio", 0.0), 0.0)
+        if volume_ratio < BREAKOUT_CONFIRMATION_MIN_VOLUME_RATIO:
+            return False, (
+                f"breakout confirmation volume ratio {volume_ratio:.2f} < "
+                f"{BREAKOUT_CONFIRMATION_MIN_VOLUME_RATIO:.2f}"
             )
 
         opposing_indices = [
@@ -5101,6 +5115,16 @@ def sync_open_trades_from_alpaca():
             "partial_realized_cost": float(prev.get("partial_realized_cost", 0.0) or 0.0) if prev else 0.0,
             "entry_momentum_quality": prev.get("entry_momentum_quality", 0.0) if prev else 0.0,
             "entry_vol_ratio": prev.get("entry_vol_ratio", 1.0) if prev else 1.0,
+            "underlying_entry_price": prev.get("underlying_entry_price", 0.0) if prev else 0.0,
+            "entry_bull_score": prev.get("entry_bull_score", 0) if prev else 0,
+            "entry_bear_score": prev.get("entry_bear_score", 0) if prev else 0,
+            "entry_delta_5m": prev.get("entry_delta_5m") if prev else None,
+            "entry_delta_10m": prev.get("entry_delta_10m") if prev else None,
+            "entry_rsi": prev.get("entry_rsi", 50.0) if prev else 50.0,
+            "entry_timing": prev.get("entry_timing", "UNKNOWN") if prev else "UNKNOWN",
+            "setup_type": prev.get("setup_type", "UNKNOWN") if prev else "UNKNOWN",
+            "entry_ignition_delta": prev.get("entry_ignition_delta", 0) if prev else 0,
+            "entry_option_oi": prev.get("entry_option_oi", 0) if prev else 0,
             "opened_at": prev.get("opened_at", datetime.now(central)) if prev else datetime.now(central),
             "status": "OPEN",
             "trade_id": prev.get("trade_id") if prev else None,
@@ -5166,6 +5190,31 @@ def has_open_underlying_position(symbol, side):
         log(f"[{symbol}] Order guard warning: {e}")
 
     return False, ""
+
+
+def same_direction_position_capacity_ok(symbol, side):
+    """Limit correlated ETF/stock exposure in the same option direction."""
+    side = str(side or "").upper()
+    symbol = str(symbol or "").upper()
+    matching = [
+        trade for trade in _open_trades.values()
+        if str(trade.get("side", "")).upper() == side
+    ]
+    if MAX_SAME_DIRECTION_POSITIONS > 0 and len(matching) >= MAX_SAME_DIRECTION_POSITIONS:
+        return False, f"{side} exposure cap {len(matching)}/{MAX_SAME_DIRECTION_POSITIONS}"
+
+    category_cap = (
+        MAX_SAME_DIRECTION_ETF_POSITIONS if symbol in ETF_SYMBOLS
+        else MAX_SAME_DIRECTION_STOCK_POSITIONS
+    )
+    category_name = "ETF" if symbol in ETF_SYMBOLS else "stock"
+    category_count = sum(
+        1 for trade in matching
+        if (str(trade.get("underlying", "")).upper() in ETF_SYMBOLS) == (symbol in ETF_SYMBOLS)
+    )
+    if category_cap > 0 and category_count >= category_cap:
+        return False, f"{side} {category_name} exposure cap {category_count}/{category_cap}"
+    return True, ""
 
 
 def get_current_option_price(trade):
@@ -5928,6 +5977,10 @@ def try_open_paper_trade(symbol, side, option, data):
             return False
     if option["contract"] in _open_trades:
         log(f"[{symbol}] Already long {option['contract']} — not stacking.")
+        return False
+    direction_capacity_ok, direction_capacity_reason = same_direction_position_capacity_ok(symbol, side)
+    if not direction_capacity_ok:
+        log(f"[{symbol}] Correlated-entry guard: {direction_capacity_reason} — skipping.")
         return False
     if _trading_client is None:
         return False
