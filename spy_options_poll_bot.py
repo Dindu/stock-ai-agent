@@ -2730,11 +2730,15 @@ def analyze(df, client, symbol):
         option_liq_score = 0.0
     else:
 
-        # Underlying liquidity proxy used before contract lookup.
+        # Median baseline: a rolling mean is dominated by the opening volume spike,
+        # which scores every normal mid-session bar as zero liquidity.
         dollar_vol_now = price * volume
-        dv_series = (df["close"] * df["volume"]).rolling(20).mean()
-        dollar_vol_avg = float(dv_series.iloc[-1]) if not pd.isna(dv_series.iloc[-1]) else 0.0
-        liq_ratio = (dollar_vol_now / dollar_vol_avg) if dollar_vol_avg > 0 else 1.0
+        dv_series = (df["close"] * df["volume"]).tail(20)
+        dollar_vol_base = float(dv_series.median()) if len(dv_series) else 0.0
+        liq_ratio = (dollar_vol_now / dollar_vol_base) if dollar_vol_base > 0 else 1.0
+        vol_series = df["volume"].tail(20)
+        vol_base = float(vol_series.median()) if len(vol_series) else 0.0
+        rel_volume = (volume / vol_base) if vol_base > 0 else 1.0
 
         # ---------------- Category scores (0-100 each side) ----------------
         trend_bull = _to_100((
@@ -2751,12 +2755,12 @@ def analyze(df, client, symbol):
         ) / 4.0)
 
         volume_bull = _to_100((
-            (_clamp01((vol_ratio - 1.0) / 1.0)) * 0.50
+            (_clamp01(rel_volume / 1.5)) * 0.50
             + ((1.0 if bullish_candle else 0.0) * 0.25)
             + ((1.0 if strong_volume else 0.0) * 0.25)
         ))
         volume_bear = _to_100((
-            (_clamp01((vol_ratio - 1.0) / 1.0)) * 0.50
+            (_clamp01(rel_volume / 1.5)) * 0.50
             + ((1.0 if bearish_candle else 0.0) * 0.25)
             + ((1.0 if strong_volume else 0.0) * 0.25)
         ))
@@ -2785,7 +2789,7 @@ def analyze(df, client, symbol):
             + ((1.0 if moving_away_bearish else 0.0) * 0.30)
         ))
 
-        option_liq_score = _to_100(_clamp01((liq_ratio - 0.5) / 1.0))
+        option_liq_score = _to_100(_clamp01(liq_ratio / 1.5))
 
         # ---------------- Weighted final score (0-100) ----------------
         bull_score_f = (
