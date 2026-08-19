@@ -2563,19 +2563,19 @@ def calculate_indicators(df):
     df["EMA50"] = df["close"].ewm(span=50, adjust=False).mean()
     df["VOL_AVG"] = df["volume"].rolling(20).mean()
     df["RSI14"] = calculate_rsi(df["close"], period=14)
-    # Wilder ATR(14): volatility diagnostic only. It does NOT change trade decisions.
-prev_close = df["close"].shift(1)
-true_range = pd.concat([
-    df["high"] - df["low"],
-    (df["high"] - prev_close).abs(),
-    (df["low"] - prev_close).abs(),
-], axis=1).max(axis=1)
+        # Wilder ATR(14): volatility diagnostic only. It does NOT change trade decisions.
+    prev_close = df["close"].shift(1)
+    true_range = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
 
-df["ATR14"] = true_range.ewm(
-    alpha=1 / 14,
-    min_periods=14,
-    adjust=False
-).mean()
+    df["ATR14"] = true_range.ewm(
+        alpha=1 / 14,
+        min_periods=14,
+        adjust=False
+    ).mean()
 
     typical = (df["high"] + df["low"] + df["close"]) / 3
 
@@ -3021,39 +3021,39 @@ def analyze(df, client, symbol):
         print(f"[{symbol}]  10m ago : BULL {bull_10m:3d} | BEAR {bear_10m:3d}  (Δ BULL {bull_score - bull_10m:+d})", flush=True)
     print(f"[{symbol}]   Bull components: {bull_breakdown}", flush=True)
     print(f"[{symbol}]   Bear components: {bear_breakdown}", flush=True)
-    # ATR diagnostics only - does NOT block or approve trades.
-atr14 = float(latest.get("ATR14", float("nan")))
+        # ATR diagnostics only - does NOT block or approve trades.
+    atr14 = float(latest.get("ATR14", float("nan")))
 
-if pd.notna(atr14) and atr14 > 0:
-    vwap_dist_atr = abs(price - vwap) / atr14 if vwap else float("nan")
-    ema20_dist_atr = abs(price - ema20) / atr14 if ema20 else float("nan")
+    if pd.notna(atr14) and atr14 > 0:
+        vwap_dist_atr = abs(price - vwap) / atr14 if vwap else float("nan")
+        ema20_dist_atr = abs(price - ema20) / atr14 if ema20 else float("nan")
 
-    if side == "CALL":
-        structure_level = recent_high
-        structure_label = "resistance"
-    elif side == "PUT":
-        structure_level = recent_low
-        structure_label = "support"
-    else:
-        structure_level = (
-            recent_low
-            if abs(price - recent_low) <= abs(recent_high - price)
-            else recent_high
+        if side == "CALL":
+            structure_level = recent_high
+            structure_label = "resistance"
+        elif side == "PUT":
+            structure_level = recent_low
+            structure_label = "support"
+        else:
+            structure_level = (
+                recent_low
+                if abs(price - recent_low) <= abs(recent_high - price)
+                else recent_high
+            )
+            structure_label = "nearest-structure"
+
+        structure_dist_atr = (
+            abs(price - structure_level) / atr14
+            if structure_level else float("nan")
         )
-        structure_label = "nearest-structure"
 
-    structure_dist_atr = (
-        abs(price - structure_level) / atr14
-        if structure_level else float("nan")
-    )
-
-    print(
-        f"[{symbol}]   ATR14(5m)={atr14:.4f} | "
-        f"VWAP dist={vwap_dist_atr:.2f} ATR | "
-        f"EMA20 dist={ema20_dist_atr:.2f} ATR | "
-        f"{structure_label} dist={structure_dist_atr:.2f} ATR",
-        flush=True,
-    )
+        print(
+            f"[{symbol}]   ATR14(5m)={atr14:.4f} | "
+            f"VWAP dist={vwap_dist_atr:.2f} ATR | "
+            f"EMA20 dist={ema20_dist_atr:.2f} ATR | "
+            f"{structure_label} dist={structure_dist_atr:.2f} ATR",
+            flush=True,
+        )
 
     # Sentiment summary line for the human glance.
     if diff >= 30:
