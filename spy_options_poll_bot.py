@@ -2563,7 +2563,7 @@ def calculate_indicators(df):
     df["EMA50"] = df["close"].ewm(span=50, adjust=False).mean()
     df["VOL_AVG"] = df["volume"].rolling(20).mean()
     df["RSI14"] = calculate_rsi(df["close"], period=14)
-        # Wilder ATR(14): volatility diagnostic only. It does NOT change trade decisions.
+    # Wilder ATR(14): volatility diagnostic only. It does NOT change trade decisions.
     prev_close = df["close"].shift(1)
     true_range = pd.concat([
         df["high"] - df["low"],
@@ -3160,7 +3160,7 @@ def analyze(df, client, symbol):
         print(f"[{symbol}]  10m ago : BULL {bull_10m:3d} | BEAR {bear_10m:3d}  (Δ BULL {bull_score - bull_10m:+d})", flush=True)
     print(f"[{symbol}]   Bull components: {bull_breakdown}", flush=True)
     print(f"[{symbol}]   Bear components: {bear_breakdown}", flush=True)
-        # ATR diagnostics only - does NOT block or approve trades.
+    # ATR diagnostics only - does NOT block or approve trades.
     atr14 = float(latest.get("ATR14", float("nan")))
 
     if pd.notna(atr14) and atr14 > 0:
@@ -3181,12 +3181,12 @@ def analyze(df, client, symbol):
             )
             structure_label = "nearest-structure"
 
-        structure_dist_atr = (
+            structure_dist_atr = (
             abs(price - structure_level) / atr14
             if structure_level else float("nan")
         )
 
-               print(
+        print(
             f"[{symbol}]   ATR14(5m)={atr14:.4f} | "
             f"VWAP dist={vwap_dist_atr:.2f} ATR | "
             f"EMA20 dist={ema20_dist_atr:.2f} ATR | "
