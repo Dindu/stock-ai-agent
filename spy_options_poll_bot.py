@@ -391,6 +391,17 @@ ENTRY_ALLOWED_SETUPS = {
     if s.strip()
 }
 
+# Real 1-minute sniper timing engine: 5m finds the setup, 1m times the entry.
+ONE_MINUTE_ENTRY_ENABLED = os.getenv("ONE_MINUTE_ENTRY_ENABLED", "1") == "1"
+ONE_MINUTE_LOOKBACK_BARS = int(os.getenv("ONE_MINUTE_LOOKBACK_BARS", "60"))
+ONE_MINUTE_EMA9_TOUCH_TOLERANCE = float(os.getenv("ONE_MINUTE_EMA9_TOUCH_TOLERANCE", "0.0015"))
+ONE_MINUTE_LEVEL_RETEST_TOLERANCE = float(os.getenv("ONE_MINUTE_LEVEL_RETEST_TOLERANCE", "0.0015"))
+ONE_MINUTE_MIN_VOLUME_RATIO = float(os.getenv("ONE_MINUTE_MIN_VOLUME_RATIO", "1.10"))
+ONE_MINUTE_COMPRESSION_PCT = float(os.getenv("ONE_MINUTE_COMPRESSION_PCT", "0.0035"))
+ONE_MINUTE_MAX_TRIGGER_AGE_BARS = int(os.getenv("ONE_MINUTE_MAX_TRIGGER_AGE_BARS", "6"))
+ONE_MINUTE_REQUIRE_CLOSED_BAR = os.getenv("ONE_MINUTE_REQUIRE_CLOSED_BAR", "1") == "1"
+ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD = os.getenv("ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD", "1") == "1"
+
 # Stricter confirmation for recovery-style CALL entries to reduce weak bounce losses.
 RECOVERY_CALL_STRICT_ENABLED = os.getenv("RECOVERY_CALL_STRICT_ENABLED", "1") == "1"
 RECOVERY_CALL_MIN_MOMENTUM_SCORE = float(os.getenv("RECOVERY_CALL_MIN_MOMENTUM_SCORE", "50"))
@@ -518,7 +529,7 @@ _ALERTS_HEADERS = [
     "Score Components",
     "VWAP", "EMA20", "EMA50", "PDH", "PDL", "Recent High", "Recent Low",
     "Bar Volume", "Bar Vol Avg",
-    "Trade Status", "P&L ($)", "P&L %", "Exit Reason", "Closed At (CT)", "Updated At (CT)", "Setup Type",
+    "1m Trigger", "Trade Status", "P&L ($)", "P&L %", "Exit Reason", "Closed At (CT)", "Updated At (CT)", "Setup Type",
 ]
 _TRADES_HEADERS = [
     "Trade ID", "Symbol", "Entry Price", "Exit Price", "Strike", "Direction",
@@ -739,6 +750,7 @@ def log_alert_to_sheets(symbol, data, option):
             round(data["recent_low"],  2),
             int(data["volume"]),
             int(data["vol_avg"]),
+            str(data.get("one_minute_trigger", "") or ""),
             "OPEN",
             "",
             "",
@@ -2076,10 +2088,25 @@ def playbook_entry_ok(side, data, symbol=None):
     extension = abs(_safe_float_num((data or {}).get("vwap_extension_pct", 0.0), 0.0))
     volume_ratio = _safe_float_num((data or {}).get("vol_ratio", 0.0), 0.0)
     delta_5m, _ = _score_trend_deltas(data or {}, side)
+    one_minute_engine_active = bool(ONE_MINUTE_ENTRY_ENABLED)
+    one_minute_enabled = bool(one_minute_engine_active and data.get("one_minute_entry_confirmed", False))
+    one_minute_trigger = str(data.get("one_minute_trigger", "") or "").upper()
+    if one_minute_engine_active and not one_minute_enabled:
+        return False, None, "1m sniper trigger not confirmed"
     playbook = classify_entry_playbook(side, data)
-    hold_confirmed, hold_reason = _breakout_hold_confirmation(symbol, side, data)
-    continuation_confirmed, continuation_reason = _breakout_continuation_confirmation(symbol, side, data)
-    if hold_confirmed:
+    if one_minute_enabled and one_minute_trigger in {"FIRST_PULLBACK", "BREAKOUT_RETEST", "MOMENTUM_COMPRESSION"}:
+        if one_minute_trigger == "FIRST_PULLBACK":
+            playbook = "PULLBACK_CONTINUATION"
+        elif one_minute_trigger == "BREAKOUT_RETEST":
+            playbook = "BREAKOUT"
+        else:
+            playbook = "BREAKOUT"
+        hold_confirmed, hold_reason = True, f"1m sniper trigger: {one_minute_trigger}"
+        continuation_confirmed, continuation_reason = False, hold_reason
+    else:
+        hold_confirmed, hold_reason = _breakout_hold_confirmation(symbol, side, data)
+        continuation_confirmed, continuation_reason = _breakout_continuation_confirmation(symbol, side, data)
+    if hold_confirmed and not one_minute_enabled:
         _remember_breakout_continuation(symbol, side, data)
         playbook = "BREAKOUT"
         continuation_confirmed = True
@@ -3338,6 +3365,142 @@ def fetch_bars(client, symbol):
 
     bars = bars[["open", "high", "low", "close", "volume"]].tail(LOOKBACK_BARS)
     return bars
+
+
+def fetch_1m_bars(client, symbol):
+    """Fetch recent 1-minute bars for entry timing only.
+
+    The 5-minute engine remains the setup detector. This function supplies the
+    lower-timeframe confirmation used to time the actual option entry.
+    """
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=4)
+    req = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+        start=start,
+        end=end,
+        feed=DataFeed(FEED),
+    )
+    bars = client.get_stock_bars(req).df
+    if bars is None or bars.empty:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    if isinstance(bars.index, pd.MultiIndex):
+        bars = bars.xs(symbol, level=0)
+    bars = bars[["open", "high", "low", "close", "volume"]].tail(ONE_MINUTE_LOOKBACK_BARS + 5)
+
+    # Never use a still-forming 1-minute candle for the trigger when requested.
+    if ONE_MINUTE_REQUIRE_CLOSED_BAR and len(bars):
+        now_utc = pd.Timestamp.now(tz="UTC")
+        last_ts = pd.Timestamp(bars.index[-1])
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.tz_localize("UTC")
+        if last_ts >= now_utc.floor("min"):
+            bars = bars.iloc[:-1]
+    return bars.tail(ONE_MINUTE_LOOKBACK_BARS)
+
+
+def one_minute_entry_timing(symbol, side, bars_1m, five_min_data):
+    """Return a concrete 1m trigger for a qualified 5m directional setup.
+
+    Trigger types: FIRST_PULLBACK, BREAKOUT_RETEST, MOMENTUM_COMPRESSION.
+    No 1m trigger means the 5m setup remains a candidate but is not entered.
+    """
+    if not ONE_MINUTE_ENTRY_ENABLED:
+        return "DISABLED", "1m sniper engine disabled"
+    if bars_1m is None or len(bars_1m) < 25:
+        return None, f"insufficient 1m history ({0 if bars_1m is None else len(bars_1m)}/25)"
+
+    df = bars_1m.copy()
+    df["EMA9"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["EMA20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["VOL_AVG20"] = df["volume"].rolling(20).mean()
+
+    typical = (df["high"] + df["low"] + df["close"]) / 3.0
+    idx = df.index
+    eastern = pytz.timezone("America/New_York")
+    if getattr(idx, "tz", None) is not None:
+        idx_et = idx.tz_convert(eastern)
+    else:
+        idx_et = idx.tz_localize("UTC").tz_convert(eastern)
+    today_et = datetime.now(eastern).date()
+    session_mask = pd.Series([ts.date() == today_et for ts in idx_et], index=df.index, dtype=bool)
+    vwap = pd.Series(float("nan"), index=df.index, dtype=float)
+    if session_mask.any():
+        tv = typical[session_mask] * df.loc[session_mask, "volume"]
+        vwap[session_mask] = tv.cumsum() / df.loc[session_mask, "volume"].cumsum()
+    df["VWAP"] = vwap
+
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    recent = df.iloc[-(ONE_MINUTE_MAX_TRIGGER_AGE_BARS + 1):]
+    avg_vol = float(latest["VOL_AVG20"]) if pd.notna(latest["VOL_AVG20"]) else 0.0
+    vol_ratio = float(latest["volume"] / avg_vol) if avg_vol > 0 else 1.0
+
+    price = float(latest["close"])
+    ema9 = float(latest["EMA9"])
+    ema20 = float(latest["EMA20"])
+    one_vwap = float(latest["VWAP"]) if pd.notna(latest["VWAP"]) else price
+    ema9_slope = float(latest["EMA9"] - df["EMA9"].iloc[-4]) if len(df) >= 4 else 0.0
+
+    five_price = float(five_min_data.get("price", price))
+    five_vwap = float(five_min_data.get("vwap", price))
+    five_ema20 = float(five_min_data.get("ema20", price))
+    five_ema50 = float(five_min_data.get("ema50", price))
+
+    bullish = price > float(latest["open"])
+    bearish = price < float(latest["open"])
+
+    if side == "CALL":
+        five_aligned = five_price > five_vwap and five_price > five_ema20 and five_price > five_ema50
+        micro_high = float(recent["high"].iloc[:-1].max()) if len(recent) > 1 else float(prev["high"])
+        pullback_touch = float(recent["low"].min()) <= ema9 * (1.0 + ONE_MINUTE_EMA9_TOUCH_TOLERANCE)
+        reclaim = price > float(prev["high"]) and price > ema9 and bullish
+        near_vwap = abs(price - one_vwap) / max(price, 0.01) <= ONE_MINUTE_LEVEL_RETEST_TOLERANCE
+        level_retest = float(latest["low"]) <= micro_high * (1.0 + ONE_MINUTE_LEVEL_RETEST_TOLERANCE) and price > micro_high and bullish
+        compression_window = df.iloc[-4:-1]
+        compression = False
+        if len(compression_window) == 3:
+            rng = (float(compression_window["high"].max()) - float(compression_window["low"].min())) / max(float(latest["close"]), 0.01)
+            compression = rng <= ONE_MINUTE_COMPRESSION_PCT
+        momentum_break = compression and price > float(compression_window["high"].max()) and bullish and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO
+
+        if five_aligned and ema9_slope > 0 and pullback_touch and reclaim and (near_vwap or price > five_vwap):
+            return "FIRST_PULLBACK", f"1m EMA9 pullback/reclaim confirmed; volx={vol_ratio:.2f}"
+        if five_aligned and level_retest and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO:
+            return "BREAKOUT_RETEST", f"1m breakout retest confirmed; volx={vol_ratio:.2f}"
+        if five_aligned and momentum_break:
+            return "MOMENTUM_COMPRESSION", f"1m compression expansion confirmed; volx={vol_ratio:.2f}"
+
+        return None, (
+            f"waiting 1m CALL trigger; price={price:.2f}, EMA9={ema9:.2f}, VWAP1m={one_vwap:.2f}, "
+            f"volx={vol_ratio:.2f}, ema9_slope={ema9_slope:+.4f}"
+        )
+
+    five_aligned = five_price < five_vwap and five_price < five_ema20 and five_price < five_ema50
+    micro_low = float(recent["low"].iloc[:-1].min()) if len(recent) > 1 else float(prev["low"])
+    pullback_touch = float(recent["high"].max()) >= ema9 * (1.0 - ONE_MINUTE_EMA9_TOUCH_TOLERANCE)
+    reclaim = price < float(prev["low"]) and price < ema9 and bearish
+    near_vwap = abs(price - one_vwap) / max(price, 0.01) <= ONE_MINUTE_LEVEL_RETEST_TOLERANCE
+    level_retest = float(latest["high"]) >= micro_low * (1.0 - ONE_MINUTE_LEVEL_RETEST_TOLERANCE) and price < micro_low and bearish
+    compression_window = df.iloc[-4:-1]
+    compression = False
+    if len(compression_window) == 3:
+        rng = (float(compression_window["high"].max()) - float(compression_window["low"].min())) / max(float(latest["close"]), 0.01)
+        compression = rng <= ONE_MINUTE_COMPRESSION_PCT
+    momentum_break = compression and price < float(compression_window["low"].min()) and bearish and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO
+
+    if five_aligned and ema9_slope < 0 and pullback_touch and reclaim and (near_vwap or price < five_vwap):
+        return "FIRST_PULLBACK", f"1m EMA9 pullback/reclaim confirmed; volx={vol_ratio:.2f}"
+    if five_aligned and level_retest and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO:
+        return "BREAKOUT_RETEST", f"1m breakdown retest confirmed; volx={vol_ratio:.2f}"
+    if five_aligned and momentum_break:
+        return "MOMENTUM_COMPRESSION", f"1m compression expansion confirmed; volx={vol_ratio:.2f}"
+
+    return None, (
+        f"waiting 1m PUT trigger; price={price:.2f}, EMA9={ema9:.2f}, VWAP1m={one_vwap:.2f}, "
+        f"volx={vol_ratio:.2f}, ema9_slope={ema9_slope:+.4f}"
+    )
 
 
 def prefetch_bars_parallel(client, symbols):
@@ -4960,6 +5123,7 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "entry_delta_10m": delta_10m,
         "entry_rsi": _safe_float_num((data or {}).get("rsi", 50.0), 50.0),
         "entry_timing": entry_timing,
+        "one_minute_trigger": str((data or {}).get("one_minute_trigger", "") or ""),
         "setup_type": setup_type,
         "entry_ignition_delta": ignition_delta,
         "entry_option_oi": option_oi,
@@ -6799,6 +6963,25 @@ def run_symbol(client, symbol, prefetched_bars=None):
     data["macro_penalty"] = macro_penalty
     data["effective_score"] = effective_score
 
+    # Real lower-timeframe timing: only after the 5m setup passes the hard score gate.
+    if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and ONE_MINUTE_ENTRY_ENABLED:
+        try:
+            bars_1m = fetch_1m_bars(client, symbol)
+            trigger, trigger_reason = one_minute_entry_timing(symbol, side, bars_1m, data)
+            data["one_minute_trigger"] = trigger or ""
+            data["one_minute_entry_confirmed"] = bool(trigger)
+            if trigger:
+                log(f"[{symbol}] 1m SNIPER PASS: {trigger} — {trigger_reason}")
+            else:
+                log(f"[{symbol}] 1m SNIPER WAIT: {trigger_reason}")
+        except Exception as e:
+            data["one_minute_trigger"] = ""
+            data["one_minute_entry_confirmed"] = False
+            log(f"[{symbol}] 1m sniper evaluation failed: {type(e).__name__}: {e}")
+    else:
+        data["one_minute_trigger"] = "DISABLED" if not ONE_MINUTE_ENTRY_ENABLED else ""
+        data["one_minute_entry_confirmed"] = not ONE_MINUTE_ENTRY_ENABLED
+
     if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE:
         playbook_ok, playbook, playbook_reason = playbook_entry_ok(side, data, symbol)
         if not playbook_ok:
@@ -6902,6 +7085,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
             "option": option,
             "playbook": data.get("entry_playbook", "UNKNOWN"),
             "alert_key": alert_key,
+            "one_minute_trigger": data.get("one_minute_trigger", ""),
         }
 
     emoji = "\U0001f7e2" if side == "CALL" else "\U0001f534"
