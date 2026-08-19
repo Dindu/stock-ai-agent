@@ -2595,7 +2595,131 @@ def calculate_indicators(df):
         vwap[session_mask] = t_vol.cumsum() / df.loc[session_mask, "volume"].cumsum()
     df["VWAP"] = vwap
     return df
+def detect_horizontal_levels(df, price, atr14, lookback=60):
+    """
+    Diagnostic-only horizontal support/resistance detector.
 
+    Finds local swing highs/lows, clusters nearby levels, and reports
+    the strongest levels near the current price.
+
+    DOES NOT approve or reject trades.
+    """
+    if df is None or len(df) < 15 or not atr14 or atr14 <= 0:
+        return {
+            "support": None,
+            "resistance": None,
+        }
+
+    window = df.iloc[-min(lookback, len(df)) - 1:-1].copy()
+
+    if len(window) < 10:
+        return {
+            "support": None,
+            "resistance": None,
+        }
+
+    highs = []
+    lows = []
+
+    # 2-bar pivot detection.
+    for i in range(2, len(window) - 2):
+        row = window.iloc[i]
+
+        high_val = float(row["high"])
+        low_val = float(row["low"])
+
+        left_highs = window["high"].iloc[i - 2:i]
+        right_highs = window["high"].iloc[i + 1:i + 3]
+
+        left_lows = window["low"].iloc[i - 2:i]
+        right_lows = window["low"].iloc[i + 1:i + 3]
+
+        if high_val >= float(left_highs.max()) and high_val >= float(right_highs.max()):
+            highs.append(high_val)
+
+        if low_val <= float(left_lows.min()) and low_val <= float(right_lows.min()):
+            lows.append(low_val)
+
+    # Cluster tolerance scales with volatility.
+    cluster_tolerance = max(
+        atr14 * 0.30,
+        price * 0.0010,
+    )
+
+    def cluster_levels(levels):
+        if not levels:
+            return []
+
+        levels = sorted(levels)
+        clusters = []
+
+        for level in levels:
+            if not clusters:
+                clusters.append([level])
+                continue
+
+            cluster_mean = sum(clusters[-1]) / len(clusters[-1])
+
+            if abs(level - cluster_mean) <= cluster_tolerance:
+                clusters[-1].append(level)
+            else:
+                clusters.append([level])
+
+        results = []
+
+        for cluster in clusters:
+            center = sum(cluster) / len(cluster)
+            touches = len(cluster)
+
+            distance_atr = abs(price - center) / atr14
+
+            # Simple diagnostic strength score.
+            strength = min(
+                100.0,
+                45.0
+                + (touches - 1) * 18.0
+                + max(0.0, 20.0 - distance_atr * 8.0),
+            )
+
+            results.append({
+                "level": center,
+                "touches": touches,
+                "strength": strength,
+                "distance_atr": distance_atr,
+            })
+
+        return results
+
+    support_clusters = cluster_levels(
+        [level for level in lows if level <= price]
+    )
+
+    resistance_clusters = cluster_levels(
+        [level for level in highs if level >= price]
+    )
+
+    support = (
+        max(
+            support_clusters,
+            key=lambda x: (x["touches"], x["strength"]),
+        )
+        if support_clusters
+        else None
+    )
+
+    resistance = (
+        max(
+            resistance_clusters,
+            key=lambda x: (x["touches"], x["strength"]),
+        )
+        if resistance_clusters
+        else None
+    )recent_high = float(recent_window["high"].max()) if len(recent_window) else price
+
+    return {
+        "support": support,
+        "resistance": resistance,
+    }
 
 def analyze(df, client, symbol):
     """Compute weighted Bull/Bear scores (0-100) from independent factor groups.
@@ -2657,6 +2781,24 @@ def analyze(df, client, symbol):
     recent_window = df.iloc[-(RECENT_HIGH_LOOKBACK + 1):-1]
     recent_high = float(recent_window["high"].max()) if len(recent_window) else price
     recent_low = float(recent_window["low"].min()) if len(recent_window) else price
+        recent_high = float(recent_window["high"].max()) if len(recent_window) else price
+    recent_low = float(recent_window["low"].min()) if len(recent_window) else price
+
+    # Horizontal support/resistance diagnostics only.
+    atr14 = float(latest["ATR14"]) if not pd.isna(latest.get("ATR14")) else 0.0
+
+    horizontal_levels = detect_horizontal_levels(
+        df=df,
+        price=price,
+        atr14=atr14,
+        lookback=60,
+    )
+
+    support_level = horizontal_levels.get("support")
+    resistance_level = horizontal_levels.get("resistance")
+
+    fresh_breakout = prev_close <= recent_high and price > recent_high
+    fresh_breakdown = prev_close >= recent_low and price < recent_low
     fresh_breakout = prev_close <= recent_high and price > recent_high
     fresh_breakdown = prev_close >= recent_low and price < recent_low
     micro_window = df.iloc[-4:-1]
@@ -3048,6 +3190,38 @@ def analyze(df, client, symbol):
         )
 
         print(
+                    print(
+            f"[{symbol}]   ATR14(5m)={atr14:.4f} | "
+            f"VWAP dist={vwap_dist_atr:.2f} ATR | "
+            f"EMA20 dist={ema20_dist_atr:.2f} ATR | "
+            f"{structure_label} dist={structure_dist_atr:.2f} ATR",
+            flush=True,
+        )
+
+        # Horizontal S/R diagnostics only.
+        if support_level:
+            print(
+                f"[{symbol}]   H-SUPPORT ${support_level['level']:.2f} | "
+                f"touches={support_level['touches']} | "
+                f"strength={support_level['strength']:.0f}/100 | "
+                f"distance={support_level['distance_atr']:.2f} ATR",
+                flush=True,
+            )
+        else:
+            print(f"[{symbol}]   H-SUPPORT none", flush=True)
+
+        if resistance_level:
+            print(
+                f"[{symbol}]   H-RESISTANCE ${resistance_level['level']:.2f} | "
+                f"touches={resistance_level['touches']} | "
+                f"strength={resistance_level['strength']:.0f}/100 | "
+                f"distance={resistance_level['distance_atr']:.2f} ATR",
+                flush=True,
+            )
+        else:
+            print(f"[{symbol}]   H-RESISTANCE none", flush=True)
+
+    # Sentiment summary line for the human glance.
             f"[{symbol}]   ATR14(5m)={atr14:.4f} | "
             f"VWAP dist={vwap_dist_atr:.2f} ATR | "
             f"EMA20 dist={ema20_dist_atr:.2f} ATR | "
