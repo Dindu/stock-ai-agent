@@ -2085,6 +2085,8 @@ def playbook_entry_ok(side, data, symbol=None):
     recent_low = _safe_float_num((data or {}).get("recent_low", price), price)
     pdh = _safe_float_num((data or {}).get("pdh", price), price)
     pdl = _safe_float_num((data or {}).get("pdl", price), price)
+    support_level = (data or {}).get("support_level")
+    resistance_level = (data or {}).get("resistance_level")
     extension = abs(_safe_float_num((data or {}).get("vwap_extension_pct", 0.0), 0.0))
     volume_ratio = _safe_float_num((data or {}).get("vol_ratio", 0.0), 0.0)
     delta_5m, _ = _score_trend_deltas(data or {}, side)
@@ -2133,6 +2135,42 @@ def playbook_entry_ok(side, data, symbol=None):
             f"{side} is within {distance_to_extreme * 100:+.2f}% of {direction} "
             f"${extreme_level:.2f}; requires breakout hold confirmation"
         )
+
+    # Strong horizontal S/R guard for non-breakout entries. Breakout entries are
+    # allowed to challenge and clear the level because they have explicit hold
+    # confirmation logic elsewhere in this function.
+    if playbook not in ("BREAKOUT", "BREAKOUT_CONTINUATION"):
+        if call_side and isinstance(resistance_level, dict):
+            resistance_touches = _safe_int_num(resistance_level.get("touches", 0), 0)
+            resistance_strength = _safe_float_num(resistance_level.get("strength", 0.0), 0.0)
+            resistance_distance_atr = _safe_float_num(resistance_level.get("distance_atr", 999.0), 999.0)
+            if (
+                resistance_touches >= 2
+                and resistance_strength >= 75.0
+                and resistance_distance_atr <= 0.35
+            ):
+                return False, playbook, (
+                    f"CALL blocked -- strong horizontal resistance "
+                    f"${_safe_float_num(resistance_level.get('level', 0.0), 0.0):.2f} is "
+                    f"{resistance_distance_atr:.2f} ATR away "
+                    f"(touches={resistance_touches}, strength={resistance_strength:.0f}/100)"
+                )
+
+        if (not call_side) and isinstance(support_level, dict):
+            support_touches = _safe_int_num(support_level.get("touches", 0), 0)
+            support_strength = _safe_float_num(support_level.get("strength", 0.0), 0.0)
+            support_distance_atr = _safe_float_num(support_level.get("distance_atr", 999.0), 999.0)
+            if (
+                support_touches >= 2
+                and support_strength >= 75.0
+                and support_distance_atr <= 0.35
+            ):
+                return False, playbook, (
+                    f"PUT blocked -- strong horizontal support "
+                    f"${_safe_float_num(support_level.get('level', 0.0), 0.0):.2f} is "
+                    f"{support_distance_atr:.2f} ATR away "
+                    f"(touches={support_touches}, strength={support_strength:.0f}/100)"
+                )
     is_breakout_continuation = continuation_confirmed is True
     min_score = (
         BREAKOUT_CONTINUATION_MIN_SCORE if is_breakout_continuation
@@ -3267,6 +3305,8 @@ def analyze(df, client, symbol):
         "pdl": pdl,
         "recent_high": recent_high,
         "recent_low": recent_low,
+        "support_level": support_level,
+        "resistance_level": resistance_level,
         "micro_high": micro_high,
         "micro_low": micro_low,
         "prior_bar_high": prior_bar_high,
