@@ -375,6 +375,9 @@ ETF_ENTRY_MIN_OPTION_OI = int(os.getenv("ETF_ENTRY_MIN_OPTION_OI", "5000"))  # R
 STOCK_ENTRY_MIN_OPTION_OI = int(os.getenv("STOCK_ENTRY_MIN_OPTION_OI", "4000"))
 PROMOTED_ETF_ENTRY_MIN_OPTION_OI = int(os.getenv("PROMOTED_ETF_ENTRY_MIN_OPTION_OI", "1500"))
 PROMOTED_STOCK_ENTRY_MIN_OPTION_OI = int(os.getenv("PROMOTED_STOCK_ENTRY_MIN_OPTION_OI", "100"))
+# OCC open interest is prior-session settlement, so short-dated strikes look illiquid even when actively traded.
+ENTRY_VOLUME_SUBSTITUTES_OI = os.getenv("ENTRY_VOLUME_SUBSTITUTES_OI", "1") == "1"
+ENTRY_MIN_OPTION_DAY_VOLUME = int(os.getenv("ENTRY_MIN_OPTION_DAY_VOLUME", "1000"))
 PROMOTED_CONT_MIN_MOMENTUM_SCORE = float(os.getenv("PROMOTED_CONT_MIN_MOMENTUM_SCORE", "36"))
 PROMOTED_MIN_DOMINANCE = int(os.getenv("PROMOTED_MIN_DOMINANCE", "20"))
 PROMOTED_MIN_DELTA_5M = int(os.getenv("PROMOTED_MIN_DELTA_5M", "2"))
@@ -3148,19 +3151,24 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
 
             bid = ask = last = 0.0
             vol = 0
+            last_trade_size = 0
             oi = _safe_int(getattr(candidate, "open_interest", 0), 0)
+            oi_date = str(getattr(candidate, "open_interest_date", "") or "")
             if snap:
                 q = getattr(snap, "latest_quote", None) or getattr(snap, "quote", None)
                 t = getattr(snap, "latest_trade", None) or getattr(snap, "trade", None)
                 greeks = getattr(snap, "greeks", None)
+                daily = getattr(snap, "daily_bar", None)
 
                 if q is not None:
                     bid = _safe_float(getattr(q, "bid_price", 0.0), 0.0)
                     ask = _safe_float(getattr(q, "ask_price", 0.0), 0.0)
                 if t is not None:
                     last = _safe_float(getattr(t, "price", 0.0), 0.0)
-                    # Snapshot trade size is not true daily volume, but we keep it for telemetry.
-                    vol = _safe_int(getattr(t, "size", 0), 0)
+                    last_trade_size = _safe_int(getattr(t, "size", 0), 0)
+                # Daily bar volume is today's cumulative flow; last-trade size is a single print.
+                if daily is not None:
+                    vol = _safe_int(getattr(daily, "volume", 0), 0)
                 delta_val = _safe_float(getattr(greeks, "delta", 0.0), 0.0) if greeks is not None else 0.0
             else:
                 delta_val = 0.0
@@ -3205,7 +3213,9 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
                 "ask":           ask,
                 "last":          last,
                 "volume":        vol,
+                "last_trade_size": last_trade_size,
                 "open_interest": oi,
+                "open_interest_date": oi_date,
                 "delta":         delta_val,
                 "spread_pct":    spread_pct,
                 "slippage_est":  slippage_est,
@@ -3262,7 +3272,8 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
             print(
                 f"[{symbol}] Selected contract: {best['contract']} strike={best['strike']} "
                 f"expiry={best['expiry']} bid={best['bid']:.2f} ask={best['ask']:.2f} "
-                f"vol={best['volume']} oi={best['open_interest']} delta={best['delta']:.2f} "
+                f"day_vol={best['volume']} oi={best['open_interest']} "
+                f"oi_asof={best.get('open_interest_date') or 'unknown'} delta={best['delta']:.2f} "
                 f"dist={_safe_float(best.get('strike_distance_pct', 0.0), 0.0)*100:.2f}% "
                 f"rank={option_candidate_rank(best):.3f}",
                 flush=True,
@@ -3506,7 +3517,13 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
     ):
         min_oi = min(min_oi, int(PROMOTED_STOCK_ENTRY_MIN_OPTION_OI))
     if oi < min_oi:
-        return False, f"open interest {oi} < {min_oi}"
+        day_volume = _safe_int_num((option or {}).get("volume", 0), 0)
+        if not (ENTRY_VOLUME_SUBSTITUTES_OI and day_volume >= ENTRY_MIN_OPTION_DAY_VOLUME):
+            oi_date = str((option or {}).get("open_interest_date", "") or "unknown")
+            return False, (
+                f"open interest {oi} (as of {oi_date}) < {min_oi} "
+                f"and day volume {day_volume} < {ENTRY_MIN_OPTION_DAY_VOLUME}"
+            )
 
     bid = _safe_float_num((option or {}).get("bid", 0.0), 0.0)
     ask = _safe_float_num((option or {}).get("ask", 0.0), 0.0)
