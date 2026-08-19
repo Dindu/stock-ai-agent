@@ -3160,12 +3160,15 @@ def analyze(df, client, symbol):
         print(f"[{symbol}]  10m ago : BULL {bull_10m:3d} | BEAR {bear_10m:3d}  (Δ BULL {bull_score - bull_10m:+d})", flush=True)
     print(f"[{symbol}]   Bull components: {bull_breakdown}", flush=True)
     print(f"[{symbol}]   Bear components: {bear_breakdown}", flush=True)
-    # ATR diagnostics only - does NOT block or approve trades.
+        # ATR diagnostics only - does NOT block or approve trades.
     atr14 = float(latest.get("ATR14", float("nan")))
 
     if pd.notna(atr14) and atr14 > 0:
         vwap_dist_atr = abs(price - vwap) / atr14 if vwap else float("nan")
         ema20_dist_atr = abs(price - ema20) / atr14 if ema20 else float("nan")
+
+        structure_level = None
+        structure_label = "nearest-structure"
 
         if side == "CALL":
             structure_level = recent_high
@@ -3174,17 +3177,15 @@ def analyze(df, client, symbol):
             structure_level = recent_low
             structure_label = "support"
         else:
-            structure_level = (
-                recent_low
-                if abs(price - recent_low) <= abs(recent_high - price)
-                else recent_high
-            )
-            structure_label = "nearest-structure"
+            if abs(price - recent_low) <= abs(recent_high - price):
+                structure_level = recent_low
+            else:
+                structure_level = recent_high
 
-            structure_dist_atr = (
-            abs(price - structure_level) / atr14
-            if structure_level else float("nan")
-        )
+        if structure_level is not None:
+            structure_dist_atr = abs(price - structure_level) / atr14
+        else:
+            structure_dist_atr = float("nan")
 
         print(
             f"[{symbol}]   ATR14(5m)={atr14:.4f} | "
@@ -3193,6 +3194,29 @@ def analyze(df, client, symbol):
             f"{structure_label} dist={structure_dist_atr:.2f} ATR",
             flush=True,
         )
+
+        # Horizontal S/R diagnostics only.
+        if support_level:
+            print(
+                f"[{symbol}]   H-SUPPORT ${support_level['level']:.2f} | "
+                f"touches={support_level['touches']} | "
+                f"strength={support_level['strength']:.0f}/100 | "
+                f"distance={support_level['distance_atr']:.2f} ATR",
+                flush=True,
+            )
+        else:
+            print(f"[{symbol}]   H-SUPPORT none", flush=True)
+
+        if resistance_level:
+            print(
+                f"[{symbol}]   H-RESISTANCE ${resistance_level['level']:.2f} | "
+                f"touches={resistance_level['touches']} | "
+                f"strength={resistance_level['strength']:.0f}/100 | "
+                f"distance={resistance_level['distance_atr']:.2f} ATR",
+                flush=True,
+            )
+        else:
+            print(f"[{symbol}]   H-RESISTANCE none", flush=True)
 
         # Horizontal S/R diagnostics only.
         if support_level:
