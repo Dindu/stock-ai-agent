@@ -2714,7 +2714,7 @@ def detect_horizontal_levels(df, price, atr14, lookback=60):
         )
         if resistance_clusters
         else None
-    )recent_high = float(recent_window["high"].max()) if len(recent_window) else price
+    )
 
     return {
         "support": support,
@@ -2777,11 +2777,9 @@ def analyze(df, client, symbol):
     moving_away_bullish = vwap_distance_now > vwap_distance_prev
     moving_away_bearish = vwap_distance_now < vwap_distance_prev
 
-    # Intraday recent high/low (exclude current bar so a break is meaningful).
+       # Intraday recent high/low (exclude current bar so a break is meaningful).
     recent_window = df.iloc[-(RECENT_HIGH_LOOKBACK + 1):-1]
     recent_high = float(recent_window["high"].max()) if len(recent_window) else price
-    recent_low = float(recent_window["low"].min()) if len(recent_window) else price
-        recent_high = float(recent_window["high"].max()) if len(recent_window) else price
     recent_low = float(recent_window["low"].min()) if len(recent_window) else price
 
     # Horizontal support/resistance diagnostics only.
@@ -2799,8 +2797,7 @@ def analyze(df, client, symbol):
 
     fresh_breakout = prev_close <= recent_high and price > recent_high
     fresh_breakdown = prev_close >= recent_low and price < recent_low
-    fresh_breakout = prev_close <= recent_high and price > recent_high
-    fresh_breakdown = prev_close >= recent_low and price < recent_low
+
     micro_window = df.iloc[-4:-1]
     micro_high = float(micro_window["high"].max()) if len(micro_window) else recent_high
     micro_low = float(micro_window["low"].min()) if len(micro_window) else recent_low
@@ -3189,8 +3186,7 @@ def analyze(df, client, symbol):
             if structure_level else float("nan")
         )
 
-        print(
-                    print(
+               print(
             f"[{symbol}]   ATR14(5m)={atr14:.4f} | "
             f"VWAP dist={vwap_dist_atr:.2f} ATR | "
             f"EMA20 dist={ema20_dist_atr:.2f} ATR | "
@@ -3220,14 +3216,6 @@ def analyze(df, client, symbol):
             )
         else:
             print(f"[{symbol}]   H-RESISTANCE none", flush=True)
-
-    # Sentiment summary line for the human glance.
-            f"[{symbol}]   ATR14(5m)={atr14:.4f} | "
-            f"VWAP dist={vwap_dist_atr:.2f} ATR | "
-            f"EMA20 dist={ema20_dist_atr:.2f} ATR | "
-            f"{structure_label} dist={structure_dist_atr:.2f} ATR",
-            flush=True,
-        )
 
     # Sentiment summary line for the human glance.
     if diff >= 30:
