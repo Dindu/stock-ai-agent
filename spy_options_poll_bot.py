@@ -291,7 +291,7 @@ ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
 # Set to 0 to keep the bot in pure alert mode (no orders submitted, no tracking).
 ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "1"
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))  # take-profit at +20%
-STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.10"))  # base stop-loss at -10%
+STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.25"))  # emergency option-premium stop; thesis invalidation exits earlier
 # Adaptive exit profile (expectancy-focused, not trade-count suppression).
 PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "0.12"))
 PARTIAL_CLOSE_FRACTION = float(os.getenv("PARTIAL_CLOSE_FRACTION", "0.50"))
@@ -305,8 +305,8 @@ RUNNER_TARGET_PCT = float(os.getenv("RUNNER_TARGET_PCT", "0.24"))
 RUNNER_PARTIAL_TP_PCT = float(os.getenv("RUNNER_PARTIAL_TP_PCT", "0.14"))
 RUNNER_PARTIAL_CLOSE_FRACTION = float(os.getenv("RUNNER_PARTIAL_CLOSE_FRACTION", "0.35"))
 RUNNER_TRAILING_GIVEBACK_PCT = float(os.getenv("RUNNER_TRAILING_GIVEBACK_PCT", "0.08"))
-MOMENTUM_FAIL_EXIT_ENABLED = False
-MOMENTUM_FAIL_MIN_PNL_PCT = float(os.getenv("MOMENTUM_FAIL_MIN_PNL_PCT", "0.06"))
+MOMENTUM_FAIL_EXIT_ENABLED = os.getenv("MOMENTUM_FAIL_EXIT_ENABLED", "1") == "1"
+MOMENTUM_FAIL_MIN_PNL_PCT = float(os.getenv("MOMENTUM_FAIL_MIN_PNL_PCT", "0.08"))
 MAX_TRADE_HOLD_MINUTES = int(os.getenv("MAX_TRADE_HOLD_MINUTES", "90"))
 # Regime-aware target/stop profile.
 ADAPTIVE_EXIT_PROFILE_ENABLED = os.getenv("ADAPTIVE_EXIT_PROFILE_ENABLED", "1") == "1"
@@ -396,7 +396,11 @@ ONE_MINUTE_ENTRY_ENABLED = os.getenv("ONE_MINUTE_ENTRY_ENABLED", "1") == "1"
 ONE_MINUTE_LOOKBACK_BARS = int(os.getenv("ONE_MINUTE_LOOKBACK_BARS", "60"))
 ONE_MINUTE_EMA9_TOUCH_TOLERANCE = float(os.getenv("ONE_MINUTE_EMA9_TOUCH_TOLERANCE", "0.0015"))
 ONE_MINUTE_LEVEL_RETEST_TOLERANCE = float(os.getenv("ONE_MINUTE_LEVEL_RETEST_TOLERANCE", "0.0015"))
-ONE_MINUTE_MIN_VOLUME_RATIO = float(os.getenv("ONE_MINUTE_MIN_VOLUME_RATIO", "1.10"))
+ONE_MINUTE_MIN_VOLUME_RATIO = float(os.getenv("ONE_MINUTE_MIN_VOLUME_RATIO", "1.20"))
+# Stronger FIRST_PULLBACK confirmation: require the 5m directional score to still be building.
+FIRST_PULLBACK_MIN_SCORE_DELTA = int(os.getenv("FIRST_PULLBACK_MIN_SCORE_DELTA", "2"))
+# Minimum 1m trigger-candle follow-through as a fraction of price.
+ONE_MINUTE_MIN_TRIGGER_MOVE_PCT = float(os.getenv("ONE_MINUTE_MIN_TRIGGER_MOVE_PCT", "0.0005"))
 ONE_MINUTE_COMPRESSION_PCT = float(os.getenv("ONE_MINUTE_COMPRESSION_PCT", "0.0035"))
 ONE_MINUTE_MAX_TRIGGER_AGE_BARS = int(os.getenv("ONE_MINUTE_MAX_TRIGGER_AGE_BARS", "6"))
 ONE_MINUTE_REQUIRE_CLOSED_BAR = os.getenv("ONE_MINUTE_REQUIRE_CLOSED_BAR", "1") == "1"
@@ -2171,6 +2175,16 @@ def playbook_entry_ok(side, data, symbol=None):
                     f"{support_distance_atr:.2f} ATR away "
                     f"(touches={support_touches}, strength={support_strength:.0f}/100)"
                 )
+
+    # FIRST_PULLBACK is a trigger, not sufficient proof by itself. Require the 5m
+    # directional score to still be building so stale pullbacks do not re-enter a fading move.
+    if playbook not in ("BREAKOUT", "BREAKOUT_CONTINUATION") and one_minute_enabled and one_minute_trigger == "FIRST_PULLBACK":
+        if delta_5m is None or delta_5m < FIRST_PULLBACK_MIN_SCORE_DELTA:
+            return False, playbook, (
+                f"FIRST_PULLBACK blocked -- 5m directional score delta {delta_5m} "
+                f"< +{FIRST_PULLBACK_MIN_SCORE_DELTA}; waiting for fresh continuation"
+            )
+
     is_breakout_continuation = continuation_confirmed is True
     min_score = (
         BREAKOUT_CONTINUATION_MIN_SCORE if is_breakout_continuation
@@ -3322,6 +3336,7 @@ def analyze(df, client, symbol):
         "ema20_slope_pct": ema20_slope_pct,
         "volume_accel": volume_accel,
         "momentum_quality": momentum_quality,
+        "atr14": atr14,
         "bullish_candle": bullish_candle,
         "bearish_candle": bearish_candle,
         "bull_score": bull_score,
@@ -3737,7 +3752,8 @@ def one_minute_entry_timing(symbol, side, bars_1m, five_min_data):
             compression = rng <= ONE_MINUTE_COMPRESSION_PCT
         momentum_break = compression and price > float(compression_window["high"].max()) and bullish and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO
 
-        if five_aligned and ema9_slope > 0 and pullback_touch and reclaim and (near_vwap or price > five_vwap):
+        trigger_move_pct = abs(price - float(prev["close"])) / max(abs(float(prev["close"])), 0.01) if float(prev["close"]) else 0.0
+        if five_aligned and ema9_slope > 0 and pullback_touch and reclaim and (near_vwap or price > five_vwap) and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO and trigger_move_pct >= ONE_MINUTE_MIN_TRIGGER_MOVE_PCT:
             return "FIRST_PULLBACK", f"1m EMA9 pullback/reclaim confirmed; volx={vol_ratio:.2f}"
         if five_aligned and level_retest and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO:
             return "BREAKOUT_RETEST", f"1m breakout retest confirmed; volx={vol_ratio:.2f}"
@@ -3762,7 +3778,8 @@ def one_minute_entry_timing(symbol, side, bars_1m, five_min_data):
         compression = rng <= ONE_MINUTE_COMPRESSION_PCT
     momentum_break = compression and price < float(compression_window["low"].min()) and bearish and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO
 
-    if five_aligned and ema9_slope < 0 and pullback_touch and reclaim and (near_vwap or price < five_vwap):
+    trigger_move_pct = abs(price - float(prev["close"])) / max(abs(float(prev["close"])), 0.01) if float(prev["close"]) else 0.0
+    if five_aligned and ema9_slope < 0 and pullback_touch and reclaim and (near_vwap or price < five_vwap) and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO and trigger_move_pct >= ONE_MINUTE_MIN_TRIGGER_MOVE_PCT:
         return "FIRST_PULLBACK", f"1m EMA9 pullback/reclaim confirmed; volx={vol_ratio:.2f}"
     if five_aligned and level_retest and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO:
         return "BREAKOUT_RETEST", f"1m breakdown retest confirmed; volx={vol_ratio:.2f}"
@@ -5399,6 +5416,15 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "setup_type": setup_type,
         "entry_ignition_delta": ignition_delta,
         "entry_option_oi": option_oi,
+        "entry_atr14": _safe_float_num((data or {}).get("atr14", 0.0), 0.0),
+        "entry_support_level": ((data or {}).get("support_level") or {}).get("level") if isinstance((data or {}).get("support_level"), dict) else None,
+        "entry_support_touches": ((data or {}).get("support_level") or {}).get("touches") if isinstance((data or {}).get("support_level"), dict) else None,
+        "entry_support_strength": ((data or {}).get("support_level") or {}).get("strength") if isinstance((data or {}).get("support_level"), dict) else None,
+        "entry_support_distance_atr": ((data or {}).get("support_level") or {}).get("distance_atr") if isinstance((data or {}).get("support_level"), dict) else None,
+        "entry_resistance_level": ((data or {}).get("resistance_level") or {}).get("level") if isinstance((data or {}).get("resistance_level"), dict) else None,
+        "entry_resistance_touches": ((data or {}).get("resistance_level") or {}).get("touches") if isinstance((data or {}).get("resistance_level"), dict) else None,
+        "entry_resistance_strength": ((data or {}).get("resistance_level") or {}).get("strength") if isinstance((data or {}).get("resistance_level"), dict) else None,
+        "entry_resistance_distance_atr": ((data or {}).get("resistance_level") or {}).get("distance_atr") if isinstance((data or {}).get("resistance_level"), dict) else None,
         "opened_at":  datetime.now(central),
         "status":     "OPEN",
         "entry_message_id": None,
@@ -5793,10 +5819,20 @@ def track_open_trades():
         trailing_giveback_pct = float(trade.get("trailing_giveback_pct", TRAILING_STOP_GIVEBACK_PCT) or TRAILING_STOP_GIVEBACK_PCT)
         held_minutes = max(1, int((datetime.now(central) - trade.get("opened_at", datetime.now(central))).total_seconds() // 60))
 
-        # 1) Adaptive hard exits.
+        # 1) Primary thesis exit: close when the underlying loses the VWAP/EMA20
+        # structure that justified the trade. The option-premium stop is only the
+        # emergency backstop and should not routinely force exits while the thesis
+        # is still intact.
+        if pnl_pct <= MOMENTUM_FAIL_MIN_PNL_PCT and _momentum_failed(trade):
+            close_trade(trade, current_price, "MOMENTUM FAILURE", pnl_pct)
+            continue
+
+        # 2) Profit target.
         if pnl_pct >= target_pct:
             close_trade(trade, current_price, "TARGET HIT", pnl_pct)
             continue
+
+        # 3) Emergency option-premium stop only.
         if pnl_pct <= -stop_pct:
             close_trade(trade, current_price, "STOP LOSS", pnl_pct)
             continue
