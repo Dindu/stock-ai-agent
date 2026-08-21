@@ -3266,6 +3266,21 @@ def analyze(df, client, symbol):
         # ALLOW: Trend/breakout trade - near/above VWAP and momentum aligned
         if price_to_vwap_pct >= -0.8 and momentum_2bar >= 0.05 and momentum_pct >= 0.0:
             return True, "CALL context valid: trend aligned"
+        # ALLOW: Controlled pullback inside an intact uptrend — a negative 2-bar print alone
+        # doesn't mean low conviction here; hand off to the playbook/1m sniper (reclaim +
+        # volume confirmation) instead of killing the candidate before it gets evaluated.
+        if (
+            TWO_PLAYBOOK_ENTRY_MODE
+            and ema20_rising
+            and rsi >= 45
+            and price_to_vwap_pct >= -1.0
+            and momentum_pct >= -0.3
+            and -1.5 <= momentum_2bar < 0.05
+        ):
+            return True, (
+                f"CALL allowed: controlled pullback in intact uptrend (VWAP {price_to_vwap_pct:.1f}%, "
+                f"2bar {momentum_2bar:.2f}%, 5bar {momentum_pct:.2f}%) — handing to playbook/1m sniper"
+            )
         # REJECT: no clear bullish structure yet
         return False, (
             f"CALL rejected: low conviction (VWAP {price_to_vwap_pct:.1f}%, "
@@ -3295,6 +3310,20 @@ def analyze(df, client, symbol):
         # ALLOW: Trend/breakdown trade - near/below VWAP and momentum aligned
         if price_to_vwap_pct <= 0.8 and momentum_2bar <= -0.05 and momentum_pct <= 0.0:
             return True, "PUT context valid: trend aligned"
+        # ALLOW: Controlled bounce inside an intact downtrend — mirror of the CALL case;
+        # hand off to the playbook/1m sniper instead of killing the candidate outright.
+        if (
+            TWO_PLAYBOOK_ENTRY_MODE
+            and ema20_falling
+            and rsi <= 55
+            and price_to_vwap_pct <= 1.0
+            and momentum_pct <= 0.3
+            and -0.05 < momentum_2bar <= 1.5
+        ):
+            return True, (
+                f"PUT allowed: controlled bounce in intact downtrend (VWAP {price_to_vwap_pct:.1f}%, "
+                f"2bar {momentum_2bar:.2f}%, 5bar {momentum_pct:.2f}%) — handing to playbook/1m sniper"
+            )
         # REJECT: no clear bearish structure yet
         return False, (
             f"PUT rejected: low conviction (VWAP {price_to_vwap_pct:.1f}%, "
