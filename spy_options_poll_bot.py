@@ -421,6 +421,10 @@ FIRST_PULLBACK_MIN_SCORE_DELTA = int(os.getenv("FIRST_PULLBACK_MIN_SCORE_DELTA",
 ONE_MINUTE_MIN_TRIGGER_MOVE_PCT = float(os.getenv("ONE_MINUTE_MIN_TRIGGER_MOVE_PCT", "0.0005"))
 ONE_MINUTE_COMPRESSION_PCT = float(os.getenv("ONE_MINUTE_COMPRESSION_PCT", "0.0035"))
 ONE_MINUTE_MAX_TRIGGER_AGE_BARS = int(os.getenv("ONE_MINUTE_MAX_TRIGGER_AGE_BARS", "6"))
+# Reclaim confirmation window: look for a bullish/bearish reclaim across the last N closed
+# 1m bars instead of requiring the single latest bar to beat the immediately prior bar's
+# high/low (audit showed that single-bar rule was the dominant 1m-sniper blocker).
+ONE_MINUTE_RECLAIM_WINDOW_BARS = int(os.getenv("ONE_MINUTE_RECLAIM_WINDOW_BARS", "3"))
 ONE_MINUTE_REQUIRE_CLOSED_BAR = os.getenv("ONE_MINUTE_REQUIRE_CLOSED_BAR", "1") == "1"
 ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD = os.getenv("ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD", "1") == "1"
 
@@ -3970,7 +3974,13 @@ def one_minute_entry_timing(symbol, side, bars_1m, five_min_data):
         five_aligned = five_price > five_vwap and five_price > five_ema20 and five_price > five_ema50
         micro_high = float(recent["high"].iloc[:-1].max()) if len(recent) > 1 else float(prev["high"])
         pullback_touch = float(recent["low"].min()) <= ema9 * (1.0 + ONE_MINUTE_EMA9_TOUCH_TOLERANCE)
-        reclaim = price > float(prev["high"]) and price > ema9 and bullish
+        # Reclaim within the last N closed bars (not just the single latest bar vs. the
+        # immediately prior bar) — a bullish candle closing back above the pre-pullback
+        # high, with price still holding above EMA9 now.
+        reclaim_window = df.iloc[-ONE_MINUTE_RECLAIM_WINDOW_BARS:]
+        reclaim = bool(
+            ((reclaim_window["close"] > reclaim_window["open"]) & (reclaim_window["close"] > micro_high)).any()
+        ) and price > ema9
         near_vwap = abs(price - one_vwap) / max(price, 0.01) <= ONE_MINUTE_LEVEL_RETEST_TOLERANCE
         level_retest = float(latest["low"]) <= micro_high * (1.0 + ONE_MINUTE_LEVEL_RETEST_TOLERANCE) and price > micro_high and bullish
         compression_window = df.iloc[-4:-1]
@@ -3996,7 +4006,12 @@ def one_minute_entry_timing(symbol, side, bars_1m, five_min_data):
     five_aligned = five_price < five_vwap and five_price < five_ema20 and five_price < five_ema50
     micro_low = float(recent["low"].iloc[:-1].min()) if len(recent) > 1 else float(prev["low"])
     pullback_touch = float(recent["high"].max()) >= ema9 * (1.0 - ONE_MINUTE_EMA9_TOUCH_TOLERANCE)
-    reclaim = price < float(prev["low"]) and price < ema9 and bearish
+    # Mirror of the CALL-side reclaim window: bearish candle closing back below the
+    # pre-bounce low within the last N bars, with price still holding below EMA9 now.
+    reclaim_window = df.iloc[-ONE_MINUTE_RECLAIM_WINDOW_BARS:]
+    reclaim = bool(
+        ((reclaim_window["close"] < reclaim_window["open"]) & (reclaim_window["close"] < micro_low)).any()
+    ) and price < ema9
     near_vwap = abs(price - one_vwap) / max(price, 0.01) <= ONE_MINUTE_LEVEL_RETEST_TOLERANCE
     level_retest = float(latest["high"]) >= micro_low * (1.0 - ONE_MINUTE_LEVEL_RETEST_TOLERANCE) and price < micro_low and bearish
     compression_window = df.iloc[-4:-1]
