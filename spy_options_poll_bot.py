@@ -317,14 +317,22 @@ HIGH_VOL_STOP_PCT = float(os.getenv("HIGH_VOL_STOP_PCT", "0.14"))
 LOW_VOL_TARGET_PCT = float(os.getenv("LOW_VOL_TARGET_PCT", "0.16"))
 LOW_VOL_STOP_PCT = float(os.getenv("LOW_VOL_STOP_PCT", "0.14"))
 # Option contract ranking preferences.
-TARGET_OPTION_DELTA_MIN = float(os.getenv("TARGET_OPTION_DELTA_MIN", "0.35"))
-TARGET_OPTION_DELTA_MAX = float(os.getenv("TARGET_OPTION_DELTA_MAX", "0.50"))
+TARGET_OPTION_DELTA_MIN = float(os.getenv("TARGET_OPTION_DELTA_MIN", "0.50"))
+TARGET_OPTION_DELTA_MAX = float(os.getenv("TARGET_OPTION_DELTA_MAX", "0.60"))
+# Hard floor/ceiling — contracts outside this band are never selected, regardless of OI/spread.
+OPTION_ACCEPTABLE_DELTA_MIN = float(os.getenv("OPTION_ACCEPTABLE_DELTA_MIN", "0.40"))
+OPTION_ACCEPTABLE_DELTA_MAX = float(os.getenv("OPTION_ACCEPTABLE_DELTA_MAX", "0.70"))
 OPTION_RANK_SPREAD_WEIGHT = float(os.getenv("OPTION_RANK_SPREAD_WEIGHT", "0.50"))
 OPTION_RANK_LIQUIDITY_WEIGHT = float(os.getenv("OPTION_RANK_LIQUIDITY_WEIGHT", "0.35"))
 OPTION_RANK_DELTA_WEIGHT = float(os.getenv("OPTION_RANK_DELTA_WEIGHT", "0.15"))
 OPTION_RANK_STRIKE_DISTANCE_WEIGHT = float(os.getenv("OPTION_RANK_STRIKE_DISTANCE_WEIGHT", "0.45"))
 OPTION_MAX_STRIKE_DISTANCE_PCT = float(os.getenv("OPTION_MAX_STRIKE_DISTANCE_PCT", "0.012"))
 OPTION_RELAXED_FALLBACK_ALERT_ONLY = os.getenv("OPTION_RELAXED_FALLBACK_ALERT_ONLY", "1") == "1"
+# Extended-move filter: demand stronger breakout evidence (or skip) when price is
+# already far above/below VWAP/EMA20 in ATR terms — avoids buying momentum exhaustion.
+EXTENSION_ATR_FILTER_ENABLED = os.getenv("EXTENSION_ATR_FILTER_ENABLED", "1") == "1"
+EXTENSION_ATR_MAX = float(os.getenv("EXTENSION_ATR_MAX", "2.0"))
+EXTENSION_MIN_IGNITION_DELTA = int(os.getenv("EXTENSION_MIN_IGNITION_DELTA", "20"))
 # Legacy profit-protection env vars are retained for backward compatibility,
 # but are intentionally not used in exit logic.
 PROFIT_PROTECT_ARM_PCT = float(os.getenv("PROFIT_PROTECT_ARM_PCT", "0.04"))
@@ -3214,6 +3222,8 @@ def analyze(df, client, symbol):
     print(f"[{symbol}]   Bear components: {bear_breakdown}", flush=True)
         # ATR diagnostics only - does NOT block or approve trades.
     atr14 = float(latest.get("ATR14", float("nan")))
+    vwap_dist_atr = float("nan")
+    ema20_dist_atr = float("nan")
 
     if pd.notna(atr14) and atr14 > 0:
         vwap_dist_atr = abs(price - vwap) / atr14 if vwap else float("nan")
@@ -3337,6 +3347,8 @@ def analyze(df, client, symbol):
         "volume_accel": volume_accel,
         "momentum_quality": momentum_quality,
         "atr14": atr14,
+        "vwap_dist_atr": vwap_dist_atr,
+        "ema20_dist_atr": ema20_dist_atr,
         "bullish_candle": bullish_candle,
         "bearish_candle": bearish_candle,
         "bull_score": bull_score,
@@ -3563,6 +3575,24 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
                     continue
 
             passed_candidates.append(option_candidate)
+
+        # Hard delta filter — never select a contract outside the acceptable delta band
+        # (e.g. a 0.13-delta lottery ticket) just because it has better OI/spread.
+        if passed_candidates:
+            in_delta_band = [
+                c for c in passed_candidates
+                if OPTION_ACCEPTABLE_DELTA_MIN <= abs(_safe_float(c.get("delta", 0.0), 0.0)) <= OPTION_ACCEPTABLE_DELTA_MAX
+            ]
+            if not in_delta_band:
+                print(
+                    f"[{symbol}] No contracts within acceptable delta band "
+                    f"[{OPTION_ACCEPTABLE_DELTA_MIN:.2f}, {OPTION_ACCEPTABLE_DELTA_MAX:.2f}] — skipping trade "
+                    f"({len(passed_candidates)} candidate(s) rejected on delta alone).",
+                    flush=True,
+                )
+                passed_candidates = []
+            else:
+                passed_candidates = in_delta_band
 
         if passed_candidates:
             # Prefer near-ATM contracts when available; fall back to full pool if not.
@@ -7339,6 +7369,27 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 f"(max {max_ext_from_vwap*100:.2f}%)."
             )
             return
+
+    # ── ATR extension filter: after a large already-extended move, demand a stronger
+    # breakout trigger (retest-confirmed) and stronger ignition instead of a plain pass.
+    if EXTENSION_ATR_FILTER_ENABLED and not NO_GATING_MODE:
+        vwap_dist_atr = _safe_float_num(data.get("vwap_dist_atr", 0.0), 0.0)
+        ema20_dist_atr = _safe_float_num(data.get("ema20_dist_atr", 0.0), 0.0)
+        max_dist_atr = max(vwap_dist_atr, ema20_dist_atr)
+        if max_dist_atr > EXTENSION_ATR_MAX:
+            ignition_delta = _safe_int_num(data.get("ignition_delta", 0), 0)
+            one_minute_trigger = str(data.get("one_minute_trigger", "") or "")
+            strong_evidence = (
+                ignition_delta >= EXTENSION_MIN_IGNITION_DELTA
+                and (not TWO_PLAYBOOK_ENTRY_MODE or one_minute_trigger == "BREAKOUT_RETEST")
+            )
+            if not strong_evidence:
+                log(
+                    f"[{symbol}] Extension filter: {side} blocked — {max_dist_atr:.2f} ATR from VWAP/EMA20 "
+                    f"(max {EXTENSION_ATR_MAX:.2f}) without retest-confirmed, high-ignition evidence "
+                    f"(ignition={ignition_delta}, trigger={one_minute_trigger or 'none'})."
+                )
+                return
 
     if CANDLE_CONFIRMATION and not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         if side == "CALL" and not data.get("bullish_candle", False):
