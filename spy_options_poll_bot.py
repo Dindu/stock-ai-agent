@@ -333,6 +333,16 @@ OPTION_RANK_DELTA_WEIGHT = float(os.getenv("OPTION_RANK_DELTA_WEIGHT", "0.15"))
 OPTION_RANK_STRIKE_DISTANCE_WEIGHT = float(os.getenv("OPTION_RANK_STRIKE_DISTANCE_WEIGHT", "0.45"))
 OPTION_MAX_STRIKE_DISTANCE_PCT = float(os.getenv("OPTION_MAX_STRIKE_DISTANCE_PCT", "0.012"))
 OPTION_RELAXED_FALLBACK_ALERT_ONLY = os.getenv("OPTION_RELAXED_FALLBACK_ALERT_ONLY", "1") == "1"
+# Entry-quality confluence: compensating multi-factor check (not a single pass/fail score).
+ENTRY_CONFLUENCE_ENABLED = os.getenv("ENTRY_CONFLUENCE_ENABLED", "1") == "1"
+ENTRY_CONFLUENCE_MIN_POINTS = float(os.getenv("ENTRY_CONFLUENCE_MIN_POINTS", "7.0"))  # out of 12
+# Fresh-setup-after-loss: require new evidence before re-entering the same (symbol, side)
+# after a stop-out, instead of a blanket block or an unconditional re-entry.
+FRESH_SETUP_AFTER_LOSS_ENABLED = os.getenv("FRESH_SETUP_AFTER_LOSS_ENABLED", "1") == "1"
+FRESH_SETUP_LOOKBACK_MINUTES = int(os.getenv("FRESH_SETUP_LOOKBACK_MINUTES", "240"))
+FRESH_SETUP_MIN_IGNITION_DELTA = int(os.getenv("FRESH_SETUP_MIN_IGNITION_DELTA", "20"))
+FRESH_SETUP_MIN_REQUIRED_SIGNALS = int(os.getenv("FRESH_SETUP_MIN_REQUIRED_SIGNALS", "2"))
+FRESH_SETUP_PRICE_RESET_PCT = float(os.getenv("FRESH_SETUP_PRICE_RESET_PCT", "0.0015"))  # 0.15%
 # Legacy profit-protection env vars are retained for backward compatibility,
 # but are intentionally not used in exit logic.
 PROFIT_PROTECT_ARM_PCT = float(os.getenv("PROFIT_PROTECT_ARM_PCT", "0.04"))
@@ -460,6 +470,9 @@ _trading_client: "TradingClient | None" = None
 _option_client: "OptionHistoricalDataClient | None" = None
 # (symbol, side) -> datetime after which re-alerting is allowed (post-trade cooldown).
 _alert_cooldowns: "dict[tuple, datetime]" = {}
+# (symbol, side) -> reference state from the most recent losing trade, used to require
+# a genuinely fresh setup (not the same chop) before re-entering the same side same day.
+_post_loss_setup: "dict[tuple, dict]" = {}
 # Authorized gspread Spreadsheet object (None if not configured / failed).
 _gsheet: "gspread.Spreadsheet | None" = None
 _last_gsheet_init_attempt: "datetime | None" = None
@@ -1945,6 +1958,142 @@ def classify_entry_playbook(side, data):
     if aligned and candle_ok and pullback_reclaim and delta_5m is not None and delta_5m >= PULLBACK_MIN_SCORE_DELTA:
         return "PULLBACK_CONTINUATION"
     return None
+
+
+def classify_entry_confluence(symbol, side, data, option):
+    """Score DIRECTION/LOCATION/STRUCTURE/TIMING/CONTEXT/CONTRACT (0-2 each, 12 max).
+
+    This is a compensating check, not six independent gates: a very strong
+    category (e.g. a clean breakout-retest) can offset one mediocre category.
+    Only STRUCTURE (a valid playbook) and CONTRACT (a tradeable option) are
+    mandatory — everything else can trade off against everything else.
+    """
+    side = str(side or "").upper()
+    call_side = side == "CALL"
+    data = data or {}
+    option = option or {}
+    points = {}
+
+    # DIRECTION — score dominance and 5m trend both point the same way.
+    score = _safe_float_num(data.get("bull_score" if call_side else "bear_score", 0.0), 0.0)
+    opposite = _safe_float_num(data.get("bear_score" if call_side else "bull_score", 0.0), 0.0)
+    delta_5m, _ = _score_trend_deltas(data, side)
+    dominance = score - opposite
+    if dominance >= 30 and delta_5m is not None and delta_5m >= 0:
+        points["direction"] = 2.0
+    elif dominance >= 10 or (delta_5m is not None and delta_5m >= 0):
+        points["direction"] = 1.0
+    else:
+        points["direction"] = 0.0
+
+    # LOCATION — reasonable distance from VWAP/EMA20, room before opposing S/R.
+    ext_pct = abs(_safe_float_num(data.get("vwap_extension_pct", 0.0), 0.0))
+    opposing_level = data.get("resistance_level") if call_side else data.get("support_level")
+    opposing_room_atr = _safe_float_num((opposing_level or {}).get("distance_atr", 999.0), 999.0)
+    if ext_pct <= 0.006 and opposing_room_atr >= 0.5:
+        points["location"] = 2.0
+    elif ext_pct <= 0.012 and opposing_room_atr >= 0.25:
+        points["location"] = 1.0
+    else:
+        points["location"] = 0.0
+
+    # STRUCTURE — mandatory: must be a named, valid playbook.
+    playbook = str(data.get("entry_playbook", "") or "")
+    points["structure"] = 2.0 if playbook in {"BREAKOUT", "PULLBACK_CONTINUATION", "BREAKOUT_CONTINUATION"} else 0.0
+
+    # TIMING — 1m sniper trigger quality.
+    trigger = str(data.get("one_minute_trigger", "") or "").upper()
+    if trigger == "BREAKOUT_RETEST":
+        points["timing"] = 2.0
+    elif trigger in {"FIRST_PULLBACK", "MOMENTUM_COMPRESSION"}:
+        points["timing"] = 1.0
+    else:
+        points["timing"] = 0.0
+
+    # CONTEXT — SPY/QQQ tape not strongly contradictory.
+    macro_penalty = _safe_float_num(data.get("macro_penalty", 0.0), 0.0)
+    if macro_penalty <= 0:
+        points["context"] = 2.0
+    elif macro_penalty <= 12:
+        points["context"] = 1.0
+    else:
+        points["context"] = 0.0
+
+    # CONTRACT — mandatory: delta must fall in the preferred/acceptable band.
+    opt_delta = abs(_safe_float_num(option.get("delta", 0.0), 0.0))
+    if TARGET_OPTION_DELTA_MIN <= opt_delta <= TARGET_OPTION_DELTA_MAX:
+        points["contract"] = 2.0
+    elif OPTION_ACCEPTABLE_DELTA_MIN <= opt_delta <= OPTION_ACCEPTABLE_DELTA_MAX:
+        points["contract"] = 1.0
+    else:
+        points["contract"] = 0.0
+
+    total = sum(points.values())
+    detail = ", ".join(f"{k}={v:.0f}" for k, v in points.items())
+
+    if points["structure"] <= 0.0:
+        return False, total, f"no valid structure ({detail})"
+    if points["contract"] <= 0.0:
+        return False, total, f"contract outside tradeable delta band ({detail})"
+    if total < ENTRY_CONFLUENCE_MIN_POINTS:
+        return False, total, f"confluence {total:.1f} < {ENTRY_CONFLUENCE_MIN_POINTS:.1f} ({detail})"
+    return True, total, detail
+
+
+def _record_post_loss_setup(symbol, side, exit_market_context, ignition_delta):
+    """Remember where a losing trade failed so the next same-side entry must show fresh evidence."""
+    symbol = str(symbol or "").upper()
+    side = str(side or "").upper()
+    if not symbol or side not in ("CALL", "PUT"):
+        return
+    _post_loss_setup[(symbol, side)] = {
+        "loss_at": datetime.now(central),
+        "reference_price": _safe_float_num((exit_market_context or {}).get("price", 0.0), 0.0),
+        "entry_ignition_delta": _safe_int_num(ignition_delta, 0),
+    }
+
+
+def fresh_setup_confirmed(symbol, side, data):
+    """After a same-side loss, require new evidence (not the same chop) before re-entering."""
+    if not FRESH_SETUP_AFTER_LOSS_ENABLED:
+        return True, "fresh-setup check disabled"
+    symbol = str(symbol or "").upper()
+    side = str(side or "").upper()
+    record = _post_loss_setup.get((symbol, side))
+    if not record:
+        return True, "no prior loss on record"
+
+    loss_at = record.get("loss_at")
+    if not isinstance(loss_at, datetime) or (datetime.now(central) - loss_at) > timedelta(minutes=FRESH_SETUP_LOOKBACK_MINUTES):
+        _post_loss_setup.pop((symbol, side), None)
+        return True, "prior loss outside lookback window"
+
+    data = data or {}
+    call_side = side == "CALL"
+    fresh_break = bool(data.get("fresh_breakout" if call_side else "fresh_breakdown", False))
+    ignition_delta = _safe_int_num(data.get("ignition_delta", 0), 0)
+    trigger = str(data.get("one_minute_trigger", "") or "").upper()
+    price = _safe_float_num(data.get("price", 0.0), 0.0)
+    reference_price = _safe_float_num(record.get("reference_price", 0.0), 0.0)
+
+    signals = []
+    if fresh_break:
+        signals.append("fresh breakout/breakdown")
+    if ignition_delta >= FRESH_SETUP_MIN_IGNITION_DELTA:
+        signals.append(f"renewed ignition {ignition_delta:+d}")
+    if trigger == "BREAKOUT_RETEST":
+        signals.append("retest-confirmed 1m trigger")
+    if reference_price > 0:
+        reset_pct = (price - reference_price) / reference_price
+        if (call_side and reset_pct >= FRESH_SETUP_PRICE_RESET_PCT) or ((not call_side) and reset_pct <= -FRESH_SETUP_PRICE_RESET_PCT):
+            signals.append(f"structure reset {reset_pct * 100:+.2f}% vs prior stop-out")
+
+    if len(signals) >= FRESH_SETUP_MIN_REQUIRED_SIGNALS:
+        return True, f"fresh setup confirmed: {', '.join(signals)}"
+    return False, (
+        f"waiting for fresh setup after prior {side} stop-out "
+        f"(have {len(signals)}/{FRESH_SETUP_MIN_REQUIRED_SIGNALS}: {', '.join(signals) or 'none'})"
+    )
 
 
 def _breakout_hold_confirmation(symbol, side, data):
@@ -6368,6 +6517,13 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         )
 
     is_profit = combined_pnl_pct > 0
+    if final_close and not is_profit:
+        _record_post_loss_setup(
+            trade.get("underlying"),
+            trade.get("side", trade.get("signal", "").split()[-1] if trade.get("signal") else ""),
+            exit_market_context,
+            trade.get("entry_ignition_delta", 0),
+        )
     outcome_label = "PROFIT" if is_profit else "LOSS"
     exit_type_label = "Profit" if is_profit else "Loss"
     exit_icon = "\U0001f7e2" if is_profit else "\U0001f534"
@@ -7403,6 +7559,14 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         _alerted_today["keys"].add(alert_key)
 
+    if not NO_GATING_MODE:
+        fresh_ok, fresh_reason = fresh_setup_confirmed(symbol, side, data)
+        if not fresh_ok:
+            if ALERT_ONLY_COOLDOWN_MINUTES > 0:
+                _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
+            log(f"[{symbol}] Fresh-setup gate: {side} blocked — {fresh_reason}.")
+            return
+
     option = get_option_contract(
         symbol,
         side,
@@ -7434,6 +7598,17 @@ def run_symbol(client, symbol, prefetched_bars=None):
         _alerted_today["keys"].discard(alert_key)
         log(f"[{symbol}] Entry quality checklist blocked {side} — {entry_reason}.")
         return
+
+    if ENTRY_CONFLUENCE_ENABLED and not NO_GATING_MODE:
+        confluence_ok, confluence_points, confluence_detail = classify_entry_confluence(symbol, side, data, option)
+        data["entry_confluence_points"] = confluence_points
+        if not confluence_ok:
+            if ALERT_ONLY_COOLDOWN_MINUTES > 0:
+                _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
+            _alerted_today["keys"].discard(alert_key)
+            log(f"[{symbol}] Entry confluence gate: {side} blocked — {confluence_detail}.")
+            return
+        log(f"[{symbol}] Entry confluence: {side} CONFIRMED — {confluence_points:.1f}/12 ({confluence_detail}).")
 
     if TWO_PLAYBOOK_ENTRY_MODE:
         return {
