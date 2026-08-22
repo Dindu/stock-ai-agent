@@ -294,8 +294,15 @@ PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))  # take-profit
 STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.25"))  # emergency option-premium stop; thesis invalidation exits earlier
 # Adaptive exit profile (expectancy-focused, not trade-count suppression).
 PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "0.12"))
-PARTIAL_CLOSE_FRACTION = float(os.getenv("PARTIAL_CLOSE_FRACTION", "0.50"))
+PARTIAL_CLOSE_FRACTION = float(os.getenv("PARTIAL_CLOSE_FRACTION", "0.70"))
 TRAILING_STOP_GIVEBACK_PCT = float(os.getenv("TRAILING_STOP_GIVEBACK_PCT", "0.10"))
+THESIS_STRUCTURE_TOLERANCE_PCT = float(os.getenv("THESIS_STRUCTURE_TOLERANCE_PCT", "0.0010"))
+THESIS_SWING_BREAK_TOLERANCE_PCT = float(os.getenv("THESIS_SWING_BREAK_TOLERANCE_PCT", "0.0008"))
+THESIS_LEVEL_TOLERANCE_PCT = float(os.getenv("THESIS_LEVEL_TOLERANCE_PCT", "0.0012"))
+THESIS_REVERSAL_SLOPE_PCT = float(os.getenv("THESIS_REVERSAL_SLOPE_PCT", "0.0005"))
+EMERGENCY_DATA_FAIL_EXIT_ENABLED = os.getenv("EMERGENCY_DATA_FAIL_EXIT_ENABLED", "1") == "1"
+EMERGENCY_DATA_FAIL_CYCLES = int(os.getenv("EMERGENCY_DATA_FAIL_CYCLES", "3"))
+RUNNER_UNDERLYING_TRAIL_PCT = float(os.getenv("RUNNER_UNDERLYING_TRAIL_PCT", "0.0035"))
 # High-conviction runner profile (applies only when entry quality is strong).
 RUNNER_EXIT_PROFILE_ENABLED = os.getenv("RUNNER_EXIT_PROFILE_ENABLED", "1") == "1"
 RUNNER_MIN_SCORE = int(os.getenv("RUNNER_MIN_SCORE", "75"))
@@ -305,8 +312,6 @@ RUNNER_TARGET_PCT = float(os.getenv("RUNNER_TARGET_PCT", "0.24"))
 RUNNER_PARTIAL_TP_PCT = float(os.getenv("RUNNER_PARTIAL_TP_PCT", "0.14"))
 RUNNER_PARTIAL_CLOSE_FRACTION = float(os.getenv("RUNNER_PARTIAL_CLOSE_FRACTION", "0.35"))
 RUNNER_TRAILING_GIVEBACK_PCT = float(os.getenv("RUNNER_TRAILING_GIVEBACK_PCT", "0.08"))
-MOMENTUM_FAIL_EXIT_ENABLED = os.getenv("MOMENTUM_FAIL_EXIT_ENABLED", "1") == "1"
-MOMENTUM_FAIL_MIN_PNL_PCT = float(os.getenv("MOMENTUM_FAIL_MIN_PNL_PCT", "0.08"))
 MAX_TRADE_HOLD_MINUTES = int(os.getenv("MAX_TRADE_HOLD_MINUTES", "90"))
 # Regime-aware target/stop profile.
 ADAPTIVE_EXIT_PROFILE_ENABLED = os.getenv("ADAPTIVE_EXIT_PROFILE_ENABLED", "1") == "1"
@@ -5967,30 +5972,74 @@ def get_current_option_price(trade):
         return None
 
 
-def _momentum_failed(trade):
-    """Return True when underlying structure no longer supports the open side."""
-    if _option_client is None:
-        return False
+def _underlying_thesis_state(trade):
+    """Return thesis status from underlying structure, independent of option premium PnL."""
     try:
-        symbol = str(trade.get("underlying", "") or "")
+        symbol = str(trade.get("underlying", "") or "").upper()
         side = str(trade.get("side", "") or "").upper()
         if not symbol or side not in ("CALL", "PUT"):
-            return False
+            return {"ready": False, "invalid": False, "reason": "MISSING TRADE CONTEXT", "price": 0.0, "vwap": 0.0, "ema20": 0.0}
 
         client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
         bars = fetch_bars(client, symbol)
-        if bars is None or bars.empty or len(bars) < 25:
-            return False
+        if bars is None or bars.empty or len(bars) < 30:
+            return {"ready": False, "invalid": False, "reason": "NO UNDERLYING BARS", "price": 0.0, "vwap": 0.0, "ema20": 0.0}
+
         df = calculate_indicators(bars)
+        if df is None or df.empty or len(df) < 8:
+            return {"ready": False, "invalid": False, "reason": "INSUFFICIENT INDICATORS", "price": 0.0, "vwap": 0.0, "ema20": 0.0}
+
         latest = df.iloc[-1]
-        price = float(latest["close"])
-        vwap = float(latest["VWAP"]) if not pd.isna(latest["VWAP"]) else price
-        ema20 = float(latest["EMA20"]) if not pd.isna(latest["EMA20"]) else price
+        price = _safe_float_num(latest.get("close"), 0.0)
+        vwap = _safe_float_num(latest.get("VWAP"), price)
+        ema20 = _safe_float_num(latest.get("EMA20"), price)
+        if price <= 0 or vwap <= 0 or ema20 <= 0:
+            return {"ready": False, "invalid": False, "reason": "INVALID INDICATOR VALUES", "price": price, "vwap": vwap, "ema20": ema20}
+
+        ema20_back = _safe_float_num(df["EMA20"].iloc[-4], ema20)
+        ema20_slope_pct = ((ema20 - ema20_back) / ema20_back) if ema20_back else 0.0
+        recent_swing_low = _safe_float_num(df["low"].iloc[-6:-1].min(), price)
+        recent_swing_high = _safe_float_num(df["high"].iloc[-6:-1].max(), price)
+        setup = str(trade.get("setup_type", trade.get("entry_timing", "")) or "").upper()
+        entry_support = _safe_float_num(trade.get("entry_support_level"), 0.0)
+        entry_resistance = _safe_float_num(trade.get("entry_resistance_level"), 0.0)
+
         if side == "CALL":
-            return price < min(vwap, ema20)
-        return price > max(vwap, ema20)
-    except Exception:
-        return False
+            below_structure = price < (min(vwap, ema20) * (1.0 - max(0.0, THESIS_STRUCTURE_TOLERANCE_PCT)))
+            higher_low_broken = price < (recent_swing_low * (1.0 - max(0.0, THESIS_SWING_BREAK_TOLERANCE_PCT)))
+            breakout_fail = (
+                ("BREAKOUT" in setup or "CONTINUATION" in setup)
+                and entry_resistance > 0
+                and price < (entry_resistance * (1.0 - max(0.0, THESIS_LEVEL_TOLERANCE_PCT)))
+            )
+            regime_reversal = ema20_slope_pct <= -abs(THESIS_REVERSAL_SLOPE_PCT) and price < ema20
+
+            if breakout_fail:
+                return {"ready": True, "invalid": True, "reason": "BREAKOUT/RETEST FAILED", "price": price, "vwap": vwap, "ema20": ema20}
+            if higher_low_broken and below_structure:
+                return {"ready": True, "invalid": True, "reason": "HIGHER-LOW STRUCTURE BROKE", "price": price, "vwap": vwap, "ema20": ema20}
+            if below_structure and regime_reversal:
+                return {"ready": True, "invalid": True, "reason": "LOST VWAP/EMA20 WITH REVERSAL", "price": price, "vwap": vwap, "ema20": ema20}
+            return {"ready": True, "invalid": False, "reason": "CALL THESIS INTACT", "price": price, "vwap": vwap, "ema20": ema20}
+
+        above_structure = price > (max(vwap, ema20) * (1.0 + max(0.0, THESIS_STRUCTURE_TOLERANCE_PCT)))
+        lower_high_broken = price > (recent_swing_high * (1.0 + max(0.0, THESIS_SWING_BREAK_TOLERANCE_PCT)))
+        breakdown_fail = (
+            ("BREAKDOWN" in setup or "REJECT" in setup)
+            and entry_support > 0
+            and price > (entry_support * (1.0 + max(0.0, THESIS_LEVEL_TOLERANCE_PCT)))
+        )
+        regime_reversal = ema20_slope_pct >= abs(THESIS_REVERSAL_SLOPE_PCT) and price > ema20
+
+        if breakdown_fail:
+            return {"ready": True, "invalid": True, "reason": "BREAKDOWN/RETEST FAILED", "price": price, "vwap": vwap, "ema20": ema20}
+        if lower_high_broken and above_structure:
+            return {"ready": True, "invalid": True, "reason": "LOWER-HIGH STRUCTURE BROKE", "price": price, "vwap": vwap, "ema20": ema20}
+        if above_structure and regime_reversal:
+            return {"ready": True, "invalid": True, "reason": "RECLAIMED VWAP/EMA20 WITH REVERSAL", "price": price, "vwap": vwap, "ema20": ema20}
+        return {"ready": True, "invalid": False, "reason": "PUT THESIS INTACT", "price": price, "vwap": vwap, "ema20": ema20}
+    except Exception as e:
+        return {"ready": False, "invalid": False, "reason": f"THESIS CHECK ERROR: {e}", "price": 0.0, "vwap": 0.0, "ema20": 0.0}
 
 
 def track_open_trades():
@@ -6065,25 +6114,21 @@ def track_open_trades():
         trailing_giveback_pct = float(trade.get("trailing_giveback_pct", TRAILING_STOP_GIVEBACK_PCT) or TRAILING_STOP_GIVEBACK_PCT)
         held_minutes = max(1, int((datetime.now(central) - trade.get("opened_at", datetime.now(central))).total_seconds() // 60))
 
-        # 1) Primary thesis exit: close when the underlying loses the VWAP/EMA20
-        # structure that justified the trade. The option-premium stop is only the
-        # emergency backstop and should not routinely force exits while the thesis
-        # is still intact.
-        if pnl_pct <= MOMENTUM_FAIL_MIN_PNL_PCT and _momentum_failed(trade):
-            close_trade(trade, current_price, "MOMENTUM FAILURE", pnl_pct)
-            continue
+        # 1) Primary exit: underlying thesis invalidation (not option PnL).
+        thesis_state = _underlying_thesis_state(trade)
+        if thesis_state.get("ready"):
+            trade["thesis_data_fail_count"] = 0
+            if thesis_state.get("invalid"):
+                close_trade(trade, current_price, f"THESIS INVALIDATION: {thesis_state.get('reason', 'STRUCTURE FAILED')}", pnl_pct)
+                continue
+        else:
+            miss_count = int(trade.get("thesis_data_fail_count", 0) or 0) + 1
+            trade["thesis_data_fail_count"] = miss_count
+            if EMERGENCY_DATA_FAIL_EXIT_ENABLED and miss_count >= max(1, EMERGENCY_DATA_FAIL_CYCLES):
+                close_trade(trade, current_price, "EMERGENCY EXIT: UNDERLYING DATA MONITORING FAILED", pnl_pct)
+                continue
 
-        # 2) Profit target.
-        if pnl_pct >= target_pct:
-            close_trade(trade, current_price, "TARGET HIT", pnl_pct)
-            continue
-
-        # 3) Emergency option-premium stop only.
-        if pnl_pct <= -stop_pct:
-            close_trade(trade, current_price, "STOP LOSS", pnl_pct)
-            continue
-
-        # 2) Take partial profit and let remainder run.
+        # 2) Profit management: take partial profits first, then trail runner.
         if (not partial_taken) and current_price >= partial_target and int(trade.get("qty", 0) or 0) > 1:
             partial_qty = max(1, int(round(int(trade.get("qty", 0)) * max(0.1, min(0.9, partial_close_fraction)))))
             close_trade(trade, current_price, "PARTIAL TAKE PROFIT", pnl_pct, close_qty=partial_qty, final_close=False)
@@ -6091,20 +6136,38 @@ def track_open_trades():
             trade["stop"] = max(float(trade.get("stop", 0.0) or 0.0), float(trade.get("entry", 0.0) or 0.0) * 0.99)
             continue
 
-        # 3) Momentum-failure exit for non-performing trades.
-        if MOMENTUM_FAIL_EXIT_ENABLED and pnl_pct <= MOMENTUM_FAIL_MIN_PNL_PCT and _momentum_failed(trade):
-            close_trade(trade, current_price, "MOMENTUM FAILURE", pnl_pct)
+        # Single-lot trades cannot scale out; allow full target exit.
+        if (not partial_taken) and int(trade.get("qty", 0) or 0) <= 1 and pnl_pct >= target_pct:
+            close_trade(trade, current_price, "TARGET HIT", pnl_pct)
             continue
 
-        # 4) Time stop: if the trade has sat too long, get out before theta decay eats the thesis.
+        # 3) Runner trailing after partial take (underlying-based, not option-premium-based).
+        if partial_taken and thesis_state.get("ready"):
+            side = str(trade.get("side", "") or "").upper()
+            underlying_now = _safe_float_num(thesis_state.get("price"), 0.0)
+            trail_pct = max(0.0005, abs(RUNNER_UNDERLYING_TRAIL_PCT))
+            if side == "CALL" and underlying_now > 0:
+                peak = max(_safe_float_num(trade.get("runner_peak_underlying"), underlying_now), underlying_now)
+                trade["runner_peak_underlying"] = peak
+                if underlying_now <= peak * (1.0 - trail_pct):
+                    close_trade(trade, current_price, "RUNNER TRAIL HIT (UNDERLYING)", pnl_pct)
+                    continue
+            if side == "PUT" and underlying_now > 0:
+                trough = min(_safe_float_num(trade.get("runner_trough_underlying"), underlying_now) or underlying_now, underlying_now)
+                trade["runner_trough_underlying"] = trough
+                if underlying_now >= trough * (1.0 + trail_pct):
+                    close_trade(trade, current_price, "RUNNER TRAIL HIT (UNDERLYING)", pnl_pct)
+                    continue
+
+        # 4) Emergency option-premium stop as risk backstop only.
+        if pnl_pct <= -stop_pct:
+            close_trade(trade, current_price, "EMERGENCY STOP LOSS", pnl_pct)
+            continue
+
+        # 5) Time stop: if the trade has sat too long, exit to avoid prolonged theta decay.
         if MAX_TRADE_HOLD_MINUTES > 0 and held_minutes >= MAX_TRADE_HOLD_MINUTES:
             close_trade(trade, current_price, f"TIME EXIT ({held_minutes}m)", pnl_pct)
             continue
-
-        # 5) Trailing stop after partial take.
-        max_seen = float(trade.get("max_pnl_pct", 0.0) or 0.0)
-        if partial_taken and max_seen > 0 and pnl_pct <= (max_seen - max(0.02, trailing_giveback_pct)):
-            close_trade(trade, current_price, "TRAILING STOP", pnl_pct)
 
 
 def _capture_exit_market_context(trade):
@@ -6271,16 +6334,25 @@ def _trade_exit_explanation(trade, reason, entry_price, exit_price, pnl_pct, mar
     if reason_text == "TARGET HIT":
         target_pct = float(trade.get("target_pct", PROFIT_TARGET_PCT) or PROFIT_TARGET_PCT) * 100
         return f"The {side} idea followed through. {structure_text}. {price_move}; the +{target_pct:.0f}% target was reached."
+    if reason_text.startswith("THESIS INVALIDATION"):
+        return f"The {side} idea was exited because the underlying thesis broke. {structure_text}. {price_move}."
     if reason_text == "STOP LOSS":
         stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT) * 100
         if structure_failed:
             return f"The {side} idea lost support. {structure_text}. {price_move}, so the -{stop_pct:.0f}% risk stop closed it."
         return f"The option weakened before the underlying trend clearly broke. {structure_text}. {price_move}; the -{stop_pct:.0f}% risk stop closed it."
+    if reason_text == "EMERGENCY STOP LOSS":
+        stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT) * 100
+        return f"Emergency risk backstop triggered at -{stop_pct:.0f}% option PnL. {structure_text}. {price_move}."
+    if reason_text.startswith("EMERGENCY EXIT"):
+        return f"Emergency risk protocol exited the trade because monitoring reliability degraded. {structure_text}. {price_move}."
     if reason_text == "MOMENTUM FAILURE":
         structure = "below VWAP and EMA20" if "CALL" in side else "above VWAP and EMA20"
         return f"The {side} idea lost momentum: price moved {structure}. {structure_text}. {price_move}."
     if reason_text == "PARTIAL TAKE PROFIT":
         return f"The {side} idea followed through. {structure_text}. {price_move}; the first profit objective was realized."
+    if reason_text.startswith("RUNNER TRAIL HIT"):
+        return f"The {side} runner gave back enough underlying progress to hit the trail. {structure_text}. {price_move}."
     if reason_text == "TRAILING STOP":
         max_seen = float(trade.get("max_pnl_pct", pnl_pct) or pnl_pct) * 100
         return f"The initial {side} move worked, then gave back gains. {structure_text}. Profit retraced from +{max_seen:.2f}% and the trailing stop closed it."
@@ -6582,6 +6654,14 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     outcome_reason_label = "Profit reason" if is_profit else "Loss reason"
 
     short_reason = str(reason or "EXIT").split("|", 1)[0].strip()
+    if short_reason.startswith("THESIS INVALIDATION"):
+        short_reason = "THESIS INVALIDATED"
+    elif short_reason.startswith("EMERGENCY STOP LOSS"):
+        short_reason = "EMERGENCY OPTION STOP"
+    elif short_reason.startswith("RUNNER TRAIL HIT"):
+        short_reason = "RUNNER TRAILING STOP"
+    elif short_reason.startswith("TIME EXIT"):
+        short_reason = "TIME EXIT"
     is_partial = (not final_close and close_qty_int < current_qty)
     shown_dollar = _combined_dollar if (final_close and _combined_cost > 0) else ((exit_px - entry_px) * close_qty_int * 100.0)
     if abs(shown_dollar - int(round(shown_dollar))) < 0.005:
@@ -6606,7 +6686,8 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     exit_message = (
         f"{line1}\n"
         f"`${entry_px:.2f}` → `${exit_px:.2f}` · `{duration_min}m` · Qty `{close_qty_int}`\n"
-        f"{line3}"
+        f"{line3}\n"
+        f"Reason: {short_reason}"
     )
     exit_color = DISCORD_COLOR_CALL if is_profit else DISCORD_COLOR_PUT
     exit_sent = send_discord_bot_reply(trade.get("entry_message_id"), exit_message, color=exit_color)
