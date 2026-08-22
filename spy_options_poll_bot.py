@@ -427,6 +427,7 @@ ONE_MINUTE_MAX_TRIGGER_AGE_BARS = int(os.getenv("ONE_MINUTE_MAX_TRIGGER_AGE_BARS
 ONE_MINUTE_RECLAIM_WINDOW_BARS = int(os.getenv("ONE_MINUTE_RECLAIM_WINDOW_BARS", "3"))
 ONE_MINUTE_REQUIRE_CLOSED_BAR = os.getenv("ONE_MINUTE_REQUIRE_CLOSED_BAR", "1") == "1"
 ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD = os.getenv("ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD", "1") == "1"
+SNIPER_WATCH_ALERT_COOLDOWN_MINUTES = int(os.getenv("SNIPER_WATCH_ALERT_COOLDOWN_MINUTES", "30"))
 
 # Stricter confirmation for recovery-style CALL entries to reduce weak bounce losses.
 RECOVERY_CALL_STRICT_ENABLED = os.getenv("RECOVERY_CALL_STRICT_ENABLED", "1") == "1"
@@ -474,6 +475,8 @@ _trading_client: "TradingClient | None" = None
 _option_client: "OptionHistoricalDataClient | None" = None
 # (symbol, side) -> datetime after which re-alerting is allowed (post-trade cooldown).
 _alert_cooldowns: "dict[tuple, datetime]" = {}
+# (symbol, side) -> datetime after which another near-entry sniper watch alert is allowed.
+_sniper_watch_cooldowns: "dict[tuple, datetime]" = {}
 # (symbol, side) -> reference state from the most recent losing trade, used to require
 # a genuinely fresh setup (not the same chop) before re-entering the same side same day.
 _post_loss_setup: "dict[tuple, dict]" = {}
@@ -6578,20 +6581,32 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     )
     outcome_reason_label = "Profit reason" if is_profit else "Loss reason"
 
+    short_reason = str(reason or "EXIT").split("|", 1)[0].strip()
+    is_partial = (not final_close and close_qty_int < current_qty)
+    shown_dollar = _combined_dollar if (final_close and _combined_cost > 0) else ((exit_px - entry_px) * close_qty_int * 100.0)
+    if abs(shown_dollar - int(round(shown_dollar))) < 0.005:
+        net_str = f"${int(round(shown_dollar)):+d}"
+    else:
+        net_str = f"${shown_dollar:+.2f}"
+
+    if is_partial:
+        status_icon = "\U0001f4b0"
+        net_icon = "\U0001f512" if shown_dollar >= 0 else "\U0001f534"
+        line1 = f"{status_icon} **{trade['underlying']} {trade['side']}** · {outcome_pnl_pct * 100:+.2f}% · PARTIAL"
+        line3 = f"{net_icon} {net_str}"
+    elif outcome_pnl_pct >= 0:
+        status_icon = "\u2705"
+        line1 = f"{status_icon} **{trade['underlying']} {trade['side']}** · {outcome_pnl_pct * 100:+.2f}%"
+        line3 = f"\U0001f4b0 {net_str}"
+    else:
+        status_icon = "\U0001f6d1"
+        line1 = f"{status_icon} **{trade['underlying']} {trade['side']}** · {outcome_pnl_pct * 100:+.2f}%"
+        line3 = f"\U0001f534 {net_str} · {short_reason}"
+
     exit_message = (
-        f"{exit_icon} **{exit_type_label} — {exit_header} | {trade['side']} - {pnl_pct * 100:+.2f}%**\n"
-        f"\U0001f3f7\ufe0f **{exit_scope}**\n\n"
-        f"------------------------------\n"
-        f"\U0001f4b2 **Current Price:** `${exit_px:.2f}`\n"
-        f"\U0001f4e6 **Qty:** closed `{close_qty_int}/{current_qty}`"
-        f" | remaining `{remaining_qty}`\n"
-        f"\U0001f4ca **Trade:** `${entry_px:.2f} -> ${exit_px:.2f}` | `{duration_min}m`\n"
-        f"\U0001f4c9 **Result:** `{reason}`{combined_note}\n"
-        f"\U0001f9e0 **{outcome_reason_label}:** {exit_explanation}\n"
-        f"\U0001f3c6 **Grade:** `{grade}`\n\n"
-        f"\U0001f4cc **Outcome:** `{outcome_label} {outcome_pnl_pct * 100:+.2f}%`\n"
-        f"Opened: `{trade['opened_at']:%Y-%m-%d %H:%M:%S %Z}`\n"
-        f"Closed: `{closed_at:%Y-%m-%d %H:%M:%S %Z}`"
+        f"{line1}\n"
+        f"`${entry_px:.2f}` → `${exit_px:.2f}` · `{duration_min}m` · Qty `{close_qty_int}`\n"
+        f"{line3}"
     )
     exit_color = DISCORD_COLOR_CALL if is_profit else DISCORD_COLOR_PUT
     exit_sent = send_discord_bot_reply(trade.get("entry_message_id"), exit_message, color=exit_color)
@@ -6828,18 +6843,25 @@ def try_open_paper_trade(symbol, side, option, data):
     entry_option_oi = int(trade.get("entry_option_oi", 0) or 0)
     underlying_entry_price = float(trade.get("underlying_entry_price", data.get("price", 0.0) or 0.0) or 0.0)
 
+    side_suffix = "C" if trade['side'] == 'CALL' else "P"
+    strike_contract = f"{strike_text}{side_suffix}"
+    primary_score = int(data.get("bull_score", score) if trade['side'] == 'CALL' else data.get("bear_score", score))
+    setup_compact = "PULLBACK" if "PULLBACK" in setup.upper() else ("BREAKOUT" if "BREAKOUT" in setup.upper() else setup.upper())
+    trigger_raw = str((trade.get("one_minute_trigger") or data.get("one_minute_trigger") or "") or "").upper()
+    if trigger_raw == "FIRST_PULLBACK":
+        trigger_compact = "1M RECLAIM + VOL"
+    elif trigger_raw == "BREAKOUT_RETEST":
+        trigger_compact = "RETEST CONFIRMED"
+    elif trigger_raw == "MOMENTUM_COMPRESSION":
+        trigger_compact = "COMPRESSION BREAK"
+    else:
+        trigger_compact = "SNIPER CONFIRMED"
+
     entry_msg = send_discord(
-        f"\U0001f680 **ENTRY ALERT — {entry_header} | {trade['side']} | ${trade['entry']:.2f} | {expiry_mmdd}**\n\n"
-        f"------------------------------\n"
-        f"\U0001f3af **Underlying Entry:** `${underlying_entry_price:.2f}` | Timing: `{entry_timing}`\n"
-        f"\U0001f4ca **Setup:** `{setup}` | Score: `{score_line}`\n"
-        f"\U0001f3c6 **Entry Grade:** `{grade}` {'🟢' if grade == 'A' else '🔵' if grade == 'B' else '🟡' if grade == 'C' else '🔴'}\n"
-        f"⚡ **Why Now:** `{why_now_line}`\n"
-        f"\U0001f3af **Plan:** Entry `${trade['entry']:.2f}` | Partial `${target_1:.2f}` (+{partial_tp_pct*100:.0f}%) | "
-        f"Final `${target_2:.2f}` (+{target_pct:.0f}%) | Stop `-{stop_pct:.0f}%`\n"
-        f"🕐 **Opened:** `{trade['opened_at']:%Y-%m-%d %H:%M:%S %Z}`\n"
-        f"{news_context_block}\n\n"
-        f"\U0001f4cc **Action:** ENTERED (`{trade['qty']}` contract{'s' if trade['qty'] != 1 else ''})",
+        f"\U0001f3af **{trade['underlying']} {trade['side']}** · {expiry_mmdd} · {strike_contract}\n"
+        f"\U0001f4b5 `${trade['entry']:.2f}` · Spot `${underlying_entry_price:.2f}` · Qty `{trade['qty']}`\n"
+        f"\U0001f525 {'Bull' if trade['side'] == 'CALL' else 'Bear'} `{primary_score}` · {setup_compact} · {trigger_compact}\n"
+        f"\U0001f3af `${target_1:.2f}` / `${target_2:.2f}` · \U0001f6e1\ufe0f `-{stop_pct:.0f}%` · `{trade['opened_at']:%H:%M CT}`",
         color=DISCORD_COLOR_CALL if trade['side'] == 'CALL' else DISCORD_COLOR_PUT,
         wait_for_response=True,
         webhook_url=DISCORD_WEBHOOK_LIVE_TRADES_URL,
@@ -7543,6 +7565,31 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE:
         playbook_ok, playbook, playbook_reason = playbook_entry_ok(side, data, symbol)
         if not playbook_ok:
+            if (
+                "1m sniper trigger not confirmed" in str(playbook_reason).lower()
+                and SNIPER_WATCH_ALERT_COOLDOWN_MINUTES > 0
+            ):
+                watch_key = (symbol, side)
+                watch_until = _sniper_watch_cooldowns.get(watch_key)
+                watch_now = datetime.now(central)
+                if watch_until is None or watch_now >= watch_until:
+                    side_score = int(data.get("bull_score", 0) if side == "CALL" else data.get("bear_score", 0))
+                    dominance = int((data.get("bull_score", 0) - data.get("bear_score", 0)) if side == "CALL" else (data.get("bear_score", 0) - data.get("bull_score", 0)))
+                    setup_guess = classify_entry_playbook(side, data)
+                    if setup_guess and side_score >= max(SCORE_SIGNAL, 60) and dominance >= max(10, SCORE_DOMINANCE - 2):
+                        setup_label = "PULLBACK READY" if "PULLBACK" in setup_guess else "BREAKOUT READY"
+                        wait_label = "1M RECLAIM + VOL" if "PULLBACK" in setup_guess else "RETEST CONFIRMED"
+                        watch_msg = (
+                            f"\U0001f440 **{symbol} {side}** · SNIPER WATCH\n"
+                            f"\U0001f525 {'Bull' if side == 'CALL' else 'Bear'} `{side_score}` · {setup_label}\n"
+                            f"\u23f3 Waiting: {wait_label}"
+                        )
+                        send_discord(
+                            watch_msg,
+                            color=DISCORD_COLOR_WARN,
+                            webhook_url=DISCORD_WEBHOOK_LIVE_TRADES_URL,
+                        )
+                        _sniper_watch_cooldowns[watch_key] = watch_now + timedelta(minutes=SNIPER_WATCH_ALERT_COOLDOWN_MINUTES)
             log(f"[{symbol}] Playbook gate: {side} blocked — {playbook_reason}.")
             return
         data["entry_playbook"] = playbook
