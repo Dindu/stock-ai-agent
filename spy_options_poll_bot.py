@@ -341,6 +341,14 @@ OPTION_RELAXED_FALLBACK_ALERT_ONLY = os.getenv("OPTION_RELAXED_FALLBACK_ALERT_ON
 # Entry-quality confluence: compensating multi-factor check (not a single pass/fail score).
 ENTRY_CONFLUENCE_ENABLED = os.getenv("ENTRY_CONFLUENCE_ENABLED", "1") == "1"
 ENTRY_CONFLUENCE_MIN_POINTS = float(os.getenv("ENTRY_CONFLUENCE_MIN_POINTS", "7.0"))  # out of 12
+V2_ENTRY_QUALITY_ENABLED = os.getenv("V2_ENTRY_QUALITY_ENABLED", "1") == "1"
+V2_ENTRY_QUALITY_MIN_SCORE = float(os.getenv("V2_ENTRY_QUALITY_MIN_SCORE", "70.0"))
+V2_ENTRY_WEIGHT_TREND = float(os.getenv("V2_ENTRY_WEIGHT_TREND", "25.0"))
+V2_ENTRY_WEIGHT_LOCATION = float(os.getenv("V2_ENTRY_WEIGHT_LOCATION", "20.0"))
+V2_ENTRY_WEIGHT_SETUP = float(os.getenv("V2_ENTRY_WEIGHT_SETUP", "20.0"))
+V2_ENTRY_WEIGHT_TRIGGER = float(os.getenv("V2_ENTRY_WEIGHT_TRIGGER", "15.0"))
+V2_ENTRY_WEIGHT_CONTEXT_RS = float(os.getenv("V2_ENTRY_WEIGHT_CONTEXT_RS", "10.0"))
+V2_ENTRY_WEIGHT_CONTRACT = float(os.getenv("V2_ENTRY_WEIGHT_CONTRACT", "10.0"))
 # Fresh-setup-after-loss: require new evidence before re-entering the same (symbol, side)
 # after a stop-out, instead of a blanket block or an unconditional re-entry.
 FRESH_SETUP_AFTER_LOSS_ENABLED = os.getenv("FRESH_SETUP_AFTER_LOSS_ENABLED", "1") == "1"
@@ -2050,6 +2058,112 @@ def classify_entry_confluence(symbol, side, data, option):
     if total < ENTRY_CONFLUENCE_MIN_POINTS:
         return False, total, f"confluence {total:.1f} < {ENTRY_CONFLUENCE_MIN_POINTS:.1f} ({detail})"
     return True, total, detail
+
+
+def unified_entry_quality_v2(symbol, side, data, option):
+    """Unified V2 entry decision using weighted evidence instead of chained vetoes."""
+    side = str(side or "").upper()
+    call_side = side == "CALL"
+    data = data or {}
+    option = option or {}
+
+    side_score = _safe_float_num(data.get("bull_score" if call_side else "bear_score", 0.0), 0.0)
+    opp_score = _safe_float_num(data.get("bear_score" if call_side else "bull_score", 0.0), 0.0)
+    delta_5m, _ = _score_trend_deltas(data, side)
+    dominance = side_score - opp_score
+    momentum_quality = _safe_float_num(data.get("momentum_quality", 0.0), 0.0)
+
+    if dominance >= 30 and (delta_5m is None or delta_5m >= 0):
+        trend_score = min(100.0, 0.65 * side_score + 0.35 * max(0.0, momentum_quality))
+    elif dominance >= 15:
+        trend_score = min(100.0, 0.55 * side_score + 0.25 * max(0.0, momentum_quality) + 10.0)
+    else:
+        trend_score = min(100.0, 0.45 * side_score + 0.20 * max(0.0, momentum_quality))
+
+    ext_pct = abs(_safe_float_num(data.get("vwap_extension_pct", 0.0), 0.0))
+    opposing_level = data.get("resistance_level") if call_side else data.get("support_level")
+    room_atr = _safe_float_num((opposing_level or {}).get("distance_atr", 0.0), 0.0)
+    if ext_pct <= 0.006 and room_atr >= 0.5:
+        location_score = 100.0
+    elif ext_pct <= 0.012 and room_atr >= 0.25:
+        location_score = 70.0
+    elif ext_pct <= 0.018 and room_atr >= 0.15:
+        location_score = 45.0
+    else:
+        location_score = 20.0
+
+    playbook = str(data.get("entry_playbook", "") or "").upper()
+    if playbook in {"PULLBACK_CONTINUATION", "BREAKOUT_CONTINUATION", "BREAKOUT"}:
+        setup_score = 100.0
+    elif playbook:
+        setup_score = 55.0
+    else:
+        setup_score = 0.0
+
+    trigger = str(data.get("one_minute_trigger", "") or "").upper()
+    if trigger == "BREAKOUT_RETEST":
+        trigger_score = 100.0
+    elif trigger == "FIRST_PULLBACK":
+        trigger_score = 85.0
+    elif trigger == "MOMENTUM_COMPRESSION":
+        trigger_score = 75.0
+    elif trigger in {"DISABLED", ""}:
+        trigger_score = 50.0 if not ONE_MINUTE_ENTRY_ENABLED else 20.0
+    else:
+        trigger_score = 35.0
+
+    macro_penalty = _safe_float_num(data.get("macro_penalty", 0.0), 0.0)
+    regime_score = _safe_float_num(
+        data.get("market_regime_score_bull" if call_side else "market_regime_score_bear", 0.0),
+        0.0,
+    )
+    rel_strength = _safe_float_num(
+        data.get("relative_strength_score_bull" if call_side else "relative_strength_score_bear", 0.0),
+        0.0,
+    )
+    context_rs_score = max(0.0, min(100.0, 0.55 * regime_score + 0.45 * rel_strength - macro_penalty))
+
+    delta_abs = abs(_safe_float_num(option.get("delta", 0.0), 0.0))
+    spread_pct = _safe_float_num(option.get("spread_pct", 1.0), 1.0)
+    vol = max(0.0, _safe_float_num(option.get("volume", 0.0), 0.0))
+    oi = max(0.0, _safe_float_num(option.get("open_interest", 0.0), 0.0))
+    if TARGET_OPTION_DELTA_MIN <= delta_abs <= TARGET_OPTION_DELTA_MAX:
+        delta_score = 100.0
+    elif OPTION_ACCEPTABLE_DELTA_MIN <= delta_abs <= OPTION_ACCEPTABLE_DELTA_MAX:
+        delta_score = 75.0
+    elif OPTION_FALLBACK_DELTA_MIN <= delta_abs < OPTION_ACCEPTABLE_DELTA_MIN:
+        delta_score = 50.0
+    else:
+        delta_score = 20.0
+    spread_score = 100.0 if spread_pct <= 0.04 else 75.0 if spread_pct <= 0.08 else 45.0 if spread_pct <= 0.12 else 20.0
+    liquidity_score = 100.0 if (vol >= 500 and oi >= 5000) else 75.0 if (vol >= 250 and oi >= 2500) else 45.0 if (vol >= 100 and oi >= 1000) else 20.0
+    contract_score = max(0.0, min(100.0, 0.45 * delta_score + 0.30 * spread_score + 0.25 * liquidity_score))
+
+    weight_sum = max(
+        1.0,
+        V2_ENTRY_WEIGHT_TREND
+        + V2_ENTRY_WEIGHT_LOCATION
+        + V2_ENTRY_WEIGHT_SETUP
+        + V2_ENTRY_WEIGHT_TRIGGER
+        + V2_ENTRY_WEIGHT_CONTEXT_RS
+        + V2_ENTRY_WEIGHT_CONTRACT,
+    )
+    weighted_total = (
+        trend_score * V2_ENTRY_WEIGHT_TREND
+        + location_score * V2_ENTRY_WEIGHT_LOCATION
+        + setup_score * V2_ENTRY_WEIGHT_SETUP
+        + trigger_score * V2_ENTRY_WEIGHT_TRIGGER
+        + context_rs_score * V2_ENTRY_WEIGHT_CONTEXT_RS
+        + contract_score * V2_ENTRY_WEIGHT_CONTRACT
+    ) / weight_sum
+
+    detail = (
+        f"trend={trend_score:.0f}, location={location_score:.0f}, setup={setup_score:.0f}, "
+        f"trigger={trigger_score:.0f}, context+rs={context_rs_score:.0f}, contract={contract_score:.0f}"
+    )
+    if weighted_total < V2_ENTRY_QUALITY_MIN_SCORE:
+        return False, weighted_total, f"entry quality {weighted_total:.1f} < {V2_ENTRY_QUALITY_MIN_SCORE:.1f} ({detail})"
+    return True, weighted_total, detail
 
 
 def _record_post_loss_setup(symbol, side, exit_market_context, ignition_delta):
@@ -7771,7 +7885,17 @@ def run_symbol(client, symbol, prefetched_bars=None):
         log(f"[{symbol}] Entry quality checklist blocked {side} — {entry_reason}.")
         return
 
-    if ENTRY_CONFLUENCE_ENABLED and not NO_GATING_MODE:
+    if V2_ENTRY_QUALITY_ENABLED and not NO_GATING_MODE:
+        quality_ok, quality_score, quality_detail = unified_entry_quality_v2(symbol, side, data, option)
+        data["entry_quality_v2_score"] = quality_score
+        if not quality_ok:
+            if ALERT_ONLY_COOLDOWN_MINUTES > 0:
+                _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
+            _alerted_today["keys"].discard(alert_key)
+            log(f"[{symbol}] Entry quality V2 gate: {side} blocked — {quality_detail}.")
+            return
+        log(f"[{symbol}] Entry quality V2: {side} CONFIRMED — {quality_score:.1f}/100 ({quality_detail}).")
+    elif ENTRY_CONFLUENCE_ENABLED and not NO_GATING_MODE:
         confluence_ok, confluence_points, confluence_detail = classify_entry_confluence(symbol, side, data, option)
         data["entry_confluence_points"] = confluence_points
         if not confluence_ok:
