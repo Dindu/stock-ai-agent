@@ -349,6 +349,11 @@ V2_ENTRY_WEIGHT_SETUP = float(os.getenv("V2_ENTRY_WEIGHT_SETUP", "20.0"))
 V2_ENTRY_WEIGHT_TRIGGER = float(os.getenv("V2_ENTRY_WEIGHT_TRIGGER", "15.0"))
 V2_ENTRY_WEIGHT_CONTEXT_RS = float(os.getenv("V2_ENTRY_WEIGHT_CONTEXT_RS", "10.0"))
 V2_ENTRY_WEIGHT_CONTRACT = float(os.getenv("V2_ENTRY_WEIGHT_CONTRACT", "10.0"))
+# Shadow measurement only — never gates or blocks a trade. Classifies each V2-evaluated
+# candidate into: BOTH_PASS, V2_ONLY (V2 admits, legacy would have blocked), or
+# LEGACY_ONLY (legacy would have taken it, V2 rejects it).
+V2_ATTRIBUTION_LOG_ENABLED = os.getenv("V2_ATTRIBUTION_LOG_ENABLED", "1") == "1"
+V2_ATTRIBUTION_LOG_FILE = os.getenv("V2_ATTRIBUTION_LOG_FILE", "v2_entry_attribution_log.csv")
 # Fresh-setup-after-loss: require new evidence before re-entering the same (symbol, side)
 # after a stop-out, instead of a blanket block or an unconditional re-entry.
 FRESH_SETUP_AFTER_LOSS_ENABLED = os.getenv("FRESH_SETUP_AFTER_LOSS_ENABLED", "1") == "1"
@@ -2166,6 +2171,64 @@ def unified_entry_quality_v2(symbol, side, data, option):
     return True, weighted_total, detail
 
 
+def _legacy_shadow_verdict(symbol, side, data, option):
+    """Shadow-only: would the pre-V2 pipeline (hard score + confirmed sniper + confluence)
+    have taken this same candidate? Never blocks anything — used solely for attribution.
+    """
+    side_score = _safe_float_num((data or {}).get("bull_score" if side == "CALL" else "bear_score", 0.0), 0.0)
+    min_required_score = min(BREAKOUT_MIN_SCORE, PULLBACK_MIN_SCORE)
+    score_ok = side_score >= min_required_score
+
+    sniper_required = bool(ONE_MINUTE_ENTRY_ENABLED)
+    sniper_ok = bool((data or {}).get("one_minute_entry_confirmed", False)) if sniper_required else True
+
+    confluence_ok, confluence_points, confluence_detail = classify_entry_confluence(symbol, side, data, option)
+
+    legacy_ok = score_ok and sniper_ok and confluence_ok
+    detail = (
+        f"score {side_score:.0f}{'>=' if score_ok else '<'}{min_required_score:.0f}, "
+        f"sniper_confirmed={sniper_ok}, confluence={confluence_points:.1f}/12 ({confluence_detail})"
+    )
+    return legacy_ok, detail
+
+
+def _log_entry_attribution(symbol, side, data, v2_ok, v2_score, legacy_ok, legacy_detail):
+    """Best-effort shadow attribution log — measurement only, never raises or blocks."""
+    if not V2_ATTRIBUTION_LOG_ENABLED:
+        return
+    try:
+        if v2_ok and legacy_ok:
+            bucket = "BOTH_PASS"
+        elif v2_ok and not legacy_ok:
+            bucket = "V2_ONLY"
+        elif (not v2_ok) and legacy_ok:
+            bucket = "LEGACY_ONLY"
+        else:
+            bucket = "BOTH_BLOCK"
+        row = {
+            "timestamp": datetime.now(central).strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol,
+            "side": side,
+            "bucket": bucket,
+            "v2_pass": v2_ok,
+            "v2_score": round(float(v2_score), 1),
+            "legacy_pass": legacy_ok,
+            "legacy_detail": legacy_detail,
+            "setup_type": str((data or {}).get("entry_playbook", "") or ""),
+            "one_minute_trigger": str((data or {}).get("one_minute_trigger", "") or ""),
+        }
+        pd.DataFrame([row]).to_csv(
+            V2_ATTRIBUTION_LOG_FILE,
+            mode="a",
+            header=not os.path.exists(V2_ATTRIBUTION_LOG_FILE),
+            index=False,
+        )
+        log(f"[{symbol}] Shadow attribution: bucket={bucket} (v2={v2_ok}/{v2_score:.1f}, legacy={legacy_ok}: {legacy_detail}).")
+    except Exception as e:
+        log(f"[{symbol}] Shadow attribution logging failed (non-blocking): {e}")
+
+
+
 def _record_post_loss_setup(symbol, side, exit_market_context, ignition_delta):
     """Remember where a losing trade failed so the next same-side entry must show fresh evidence."""
     symbol = str(symbol or "").upper()
@@ -2380,8 +2443,9 @@ def playbook_entry_ok(side, data, symbol=None):
     one_minute_engine_active = bool(ONE_MINUTE_ENTRY_ENABLED)
     one_minute_enabled = bool(one_minute_engine_active and data.get("one_minute_entry_confirmed", False))
     one_minute_trigger = str(data.get("one_minute_trigger", "") or "").upper()
-    if one_minute_engine_active and not one_minute_enabled:
-        return False, None, "1m sniper trigger not confirmed"
+    # V2: an unconfirmed 1m trigger is evidence (weak Trigger score), not an automatic
+    # veto. Fall through to structural playbook/hold-confirmation checks below instead
+    # of terminating the candidate outright. Genuinely invalid structure still blocks.
     playbook = classify_entry_playbook(side, data)
     if one_minute_enabled and one_minute_trigger in {"FIRST_PULLBACK", "BREAKOUT_RETEST", "MOMENTUM_COMPRESSION"}:
         if one_minute_trigger == "FIRST_PULLBACK":
@@ -7405,9 +7469,21 @@ def run_symbol(client, symbol, prefetched_bars=None):
         data["promoted_quality_ok"] = False
 
     # Hard minimum score gate with dynamic threshold from regime + continuation quality.
-    enforce_hard_gate = HARD_SCORE_GATE_ENABLED and (
-        (not NO_GATING_MODE) or HARD_SCORE_GATE_IN_NO_GATING_MODE
+    # V2: this score is evidence feeding the unified Trend score, not an automatic veto —
+    # only enforced as a hard block in legacy (non-V2) mode.
+    enforce_hard_gate = (
+        HARD_SCORE_GATE_ENABLED
+        and (not (V2_ENTRY_QUALITY_ENABLED and TWO_PLAYBOOK_ENTRY_MODE))
+        and ((not NO_GATING_MODE) or HARD_SCORE_GATE_IN_NO_GATING_MODE)
     )
+    if HARD_SCORE_GATE_ENABLED and V2_ENTRY_QUALITY_ENABLED and TWO_PLAYBOOK_ENTRY_MODE:
+        side_score = data["bull_score"] if side == "CALL" else data["bear_score"]
+        min_required_score = min(BREAKOUT_MIN_SCORE, PULLBACK_MIN_SCORE)
+        if side_score < min_required_score:
+            log(
+                f"[{symbol}] Hard score gate (advisory under V2): {side} {side_score} < {min_required_score} "
+                "— not blocking, letting unified entry quality decide."
+            )
     if enforce_hard_gate:
         side_score = data["bull_score"] if side == "CALL" else data["bear_score"]
         min_required_score = (
@@ -7888,6 +7964,8 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if V2_ENTRY_QUALITY_ENABLED and not NO_GATING_MODE:
         quality_ok, quality_score, quality_detail = unified_entry_quality_v2(symbol, side, data, option)
         data["entry_quality_v2_score"] = quality_score
+        legacy_ok, legacy_detail = _legacy_shadow_verdict(symbol, side, data, option)
+        _log_entry_attribution(symbol, side, data, quality_ok, quality_score, legacy_ok, legacy_detail)
         if not quality_ok:
             if ALERT_ONLY_COOLDOWN_MINUTES > 0:
                 _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
