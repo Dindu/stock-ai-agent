@@ -4171,15 +4171,40 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
                 _reject(f"[{symbol}] Contract {contract_sym} rejected — bid ${bid:.2f} < ${min_bid:.2f} minimum.")
                 continue
 
+            mid = (bid + ask) / 2 if (bid + ask) > 0 else 0.01
+            spread_pct = (ask - bid) / mid
+
             if not is_etf:
                 # In strict mode, accept stock contracts when either intraday volume OR OI passes minimum.
                 # In no-gating mode, bypass this liquidity gate and rely on bid/spread checks only.
                 if (not NO_GATING_MODE) and vol < STOCK_MIN_OPTION_VOLUME and oi < STOCK_MIN_OPTION_OPEN_INTEREST:
-                    _reject(
-                        f"[{symbol}] Contract {contract_sym} rejected — volume {vol} < {STOCK_MIN_OPTION_VOLUME} "
-                        f"and OI {oi} < {STOCK_MIN_OPTION_OPEN_INTEREST}."
-                    )
-                    continue
+                    liquidity_state, oi_age_days = _classify_liquidity_data_state(oi_date, vol)
+                    tight_live_market = bid > 0 and ask > 0 and spread_pct <= LIQUIDITY_SUBSTITUTE_MAX_SPREAD_PCT
+                    quote_age_seconds = None
+                    if quote_ts is not None:
+                        try:
+                            now_utc = datetime.now(timezone.utc)
+                            ts = quote_ts if quote_ts.tzinfo else quote_ts.replace(tzinfo=timezone.utc)
+                            quote_age_seconds = (now_utc - ts).total_seconds()
+                        except Exception:
+                            quote_age_seconds = None
+                    quote_is_fresh = quote_age_seconds is not None and quote_age_seconds <= LIQUIDITY_SUBSTITUTE_MAX_QUOTE_AGE_SECONDS
+
+                    if liquidity_state in ("LIQUIDITY_DATA_STALE", "LIQUIDITY_DATA_MISSING") and tight_live_market and quote_is_fresh:
+                        print(
+                            f"[{symbol}] LIQUIDITY SUBSTITUTE (discovery stage): {contract_sym} "
+                            f"metadata={liquidity_state} oi={oi} oi_date={oi_date or 'unknown'} volume={vol} "
+                            f"bid={bid:.2f} ask={ask:.2f} spread={spread_pct*100:.2f}% quote_age="
+                            f"{'unknown' if quote_age_seconds is None else f'{quote_age_seconds:.1f}s'}",
+                            flush=True,
+                        )
+                    else:
+                        _reject(
+                            f"[{symbol}] Contract {contract_sym} rejected — volume {vol} < {STOCK_MIN_OPTION_VOLUME} "
+                            f"and OI {oi} < {STOCK_MIN_OPTION_OPEN_INTEREST} [{liquidity_state}, "
+                            f"quote_age={quote_age_seconds if quote_age_seconds is not None else 'unknown'}]."
+                        )
+                        continue
                 if NO_GATING_MODE and vol < STOCK_MIN_OPTION_VOLUME and oi < STOCK_MIN_OPTION_OPEN_INTEREST:
                     print(
                         f"[{symbol}] No-gating override: accepting {contract_sym} despite low volume/OI "
@@ -4187,8 +4212,6 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
                         flush=True,
                     )
 
-            mid = (bid + ask) / 2 if (bid + ask) > 0 else 0.01
-            spread_pct = (ask - bid) / mid
             if spread_pct > max_spread_pct:
                 _reject(
                     f"[{symbol}] Contract {contract_sym} rejected — spread {spread_pct*100:.1f}% > {max_spread_pct*100:.0f}% max."
