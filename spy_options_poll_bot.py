@@ -134,7 +134,7 @@ CLOSING_NO_TRADE_MINUTES = int(os.getenv("CLOSING_NO_TRADE_MINUTES", "30"))
 LOOKBACK_BARS = 120
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
 MIN_DTE = int(os.getenv("MIN_DTE", "1"))   # Minimum DTE (exclude 0DTE)
-MAX_DTE = int(os.getenv("MAX_DTE", "3"))  # Max DTE window; set <=0 for no upper bound
+MAX_DTE = int(os.getenv("MAX_DTE", "5"))  # Max DTE window; set <=0 for no upper bound
 VOLUME_MULTIPLIER = 1.5
 
 # Scoring thresholds (0-100)
