@@ -7303,6 +7303,45 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     log(f"[{trade['underlying']}] Closed {trade['contract']} ({reason}, {pnl_pct * 100:+.2f}%)")
 
 
+def _refresh_option_quote_before_execution(symbol, option):
+    """Re-pull a live snapshot for the selected contract right before submitting
+    an order. The contract-search cache can be up to OPTION_SEARCH_CACHE_TTL_SECONDS
+    old — this refresh prevents executing on a stale/since-widened quote.
+    """
+    if _option_client is None:
+        return True, "option client unavailable, skipping refresh (fail-open)"
+    contract_sym = str(option.get("contract", "") or "")
+    if not contract_sym:
+        return False, "no contract symbol to refresh"
+    try:
+        snap_req = OptionSnapshotRequest(symbol_or_symbols=contract_sym, feed=OPTIONS_FEED)
+        snaps = _option_client.get_option_snapshot(snap_req)
+        snap = snaps.get(contract_sym) if isinstance(snaps, dict) else snaps
+        if not snap:
+            return False, f"no live snapshot returned for {contract_sym}"
+        q = getattr(snap, "latest_quote", None) or getattr(snap, "quote", None)
+        if q is None:
+            return False, f"no live quote returned for {contract_sym}"
+        bid = _safe_float_num(getattr(q, "bid_price", 0.0), 0.0)
+        ask = _safe_float_num(getattr(q, "ask_price", 0.0), 0.0)
+        if bid <= 0.0 and ask <= 0.0:
+            return False, "NO_QUOTE on execution refresh"
+        mid = (bid + ask) / 2.0 if (bid + ask) > 0 else 0.01
+        spread_pct = (ask - bid) / mid
+        max_spread_pct = ETF_MAX_OPTION_SPREAD_PCT if symbol in ETF_SYMBOLS else STOCK_MAX_OPTION_SPREAD_PCT
+        if spread_pct > max_spread_pct:
+            return False, f"spread widened to {spread_pct*100:.1f}% > {max_spread_pct*100:.0f}% max on execution refresh"
+        daily = getattr(snap, "daily_bar", None)
+        if daily is not None:
+            option["volume"] = _safe_int_num(getattr(daily, "volume", option.get("volume", 0)), option.get("volume", 0))
+        option["bid"] = bid
+        option["ask"] = ask
+        option["spread_pct"] = spread_pct
+        return True, f"refreshed: bid=${bid:.2f} ask=${ask:.2f} spread={spread_pct*100:.1f}%"
+    except Exception as e:
+        return False, f"quote refresh failed: {type(e).__name__}: {e}"
+
+
 def try_open_paper_trade(symbol, side, option, data):
     """Open a paper trade if trading is enabled and we have capacity. Returns True if opened."""
     if not ENABLE_ALPACA_PAPER_TRADING:
@@ -7328,6 +7367,14 @@ def try_open_paper_trade(symbol, side, option, data):
         return False
     if _trading_client is None:
         return False
+
+    # The contract search result may be cached for up to OPTION_SEARCH_CACHE_TTL_SECONDS —
+    # re-validate the live quote/spread right before committing capital.
+    refresh_ok, refresh_reason = _refresh_option_quote_before_execution(symbol, option)
+    if not refresh_ok:
+        log(f"[{symbol}] Execution-time quote refresh failed for {option.get('contract', '')}: {refresh_reason} — skipping entry.")
+        return False
+    log(f"[{symbol}] Execution-time quote refresh: {refresh_reason}")
 
     score = int(data.get("effective_score", data["bull_score"] if side == "CALL" else data["bear_score"]))
     raw_score = int(data.get("raw_entry_score", score))
