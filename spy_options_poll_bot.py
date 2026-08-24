@@ -80,14 +80,6 @@ TOP_STOCK_SYMBOLS = {
     "ADBE", "HOOD", "ORCL",
 }
 AGGRESSIVE_STOCK_SYMBOLS = {"TSLA", "AMD", "PLTR", "GOOGL"}
-# Shadow-only liquidity tier classification (see _shadow_tier_liquidity_check) — logging only,
-# does not gate contract selection until validated against real fills/outcomes.
-MEGA_LIQUID_SYMBOLS = {"AAPL", "NVDA", "MSFT", "AMZN", "TSLA", "GOOGL", "AMD"}
-TIER_LIQUIDITY_THRESHOLDS = {
-    "ETF":          {"min_oi": 2000, "min_volume": 200, "max_spread_pct": 0.03},
-    "MEGA_LIQUID":  {"min_oi": 500,  "min_volume": 50,  "max_spread_pct": 0.06},
-    "STANDARD":     {"min_oi": 100,  "min_volume": 10,  "max_spread_pct": 0.10},
-}
 DEFAULT_SYMBOLS = "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,TSLA,AMD,PLTR,GOOGL,AVGO,ADBE,HOOD,ORCL"
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
 ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")
@@ -134,8 +126,7 @@ CLOSING_NO_TRADE_MINUTES = int(os.getenv("CLOSING_NO_TRADE_MINUTES", "30"))
 LOOKBACK_BARS = 120
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
 MIN_DTE = int(os.getenv("MIN_DTE", "1"))   # Minimum DTE (exclude 0DTE)
-MAX_DTE = int(os.getenv("MAX_DTE", "3"))  # Primary DTE window (normally 1-3)
-FALLBACK_MAX_DTE = int(os.getenv("FALLBACK_MAX_DTE", "5"))  # If primary window has no tradeable contract, extend to 4-5 DTE
+MAX_DTE = int(os.getenv("MAX_DTE", "3"))  # Max DTE window; set <=0 for no upper bound
 VOLUME_MULTIPLIER = 1.5
 
 # Scoring thresholds (0-100)
@@ -150,19 +141,6 @@ BREAKOUT_MIN_SCORE = int(os.getenv("BREAKOUT_MIN_SCORE", str(SCORE_SIGNAL)))
 PULLBACK_MIN_SCORE = int(os.getenv("PULLBACK_MIN_SCORE", str(SCORE_SIGNAL)))
 PLAYBOOK_MIN_DOMINANCE = int(os.getenv("PLAYBOOK_MIN_DOMINANCE", str(SCORE_DOMINANCE)))
 PLAYBOOK_MAX_VWAP_EXTENSION = float(os.getenv("PLAYBOOK_MAX_VWAP_EXTENSION", "0.012"))
-# Tiered VWAP extension (replaces the single static cutoff above as the actual gate).
-# NORMAL: <= PLAYBOOK_MAX_VWAP_EXTENSION. EXTENDED: allowed only with strong confirmation.
-# VERY_EXTENDED: always blocked — not overridden by any confirmation (frozen risk guard).
-PLAYBOOK_VWAP_EXTENDED_MAX = float(os.getenv("PLAYBOOK_VWAP_EXTENDED_MAX", "0.016"))
-PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_SCORE = int(os.getenv("PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_SCORE", "70"))
-PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_DOMINANCE = int(os.getenv("PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_DOMINANCE", "55"))
-PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_VOLX = float(os.getenv("PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_VOLX", "1.50"))
-PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_PATTERN = float(os.getenv("PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_PATTERN", "80.0"))
-# Shadow telemetry only — logs what the decision would be at these caps, never gates.
-VWAP_SHADOW_CAPS_PCT = [0.0120, 0.0140, 0.0160, 0.0180, 0.0200]
-# Armed breakout setups: patience window (in completed 5m bars) before a pending
-# breakout/pullback expires without confirmation.
-ARMED_SETUP_MAX_BARS = int(os.getenv("ARMED_SETUP_MAX_BARS", "3"))
 PULLBACK_RECLAIM_TOLERANCE = float(os.getenv("PULLBACK_RECLAIM_TOLERANCE", "0.003"))
 PULLBACK_MIN_SCORE_DELTA = int(os.getenv("PULLBACK_MIN_SCORE_DELTA", "0"))
 BREAKOUT_HOLD_CONFIRMATION_ENABLED = os.getenv("BREAKOUT_HOLD_CONFIRMATION_ENABLED", "1") == "1"
@@ -313,32 +291,11 @@ ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
 # Set to 0 to keep the bot in pure alert mode (no orders submitted, no tracking).
 ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "1"
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))  # take-profit at +20%
-STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.25"))  # emergency option-premium stop; thesis invalidation exits earlier
+STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.10"))  # base stop-loss at -10%
 # Adaptive exit profile (expectancy-focused, not trade-count suppression).
 PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "0.12"))
-PARTIAL_CLOSE_FRACTION = float(os.getenv("PARTIAL_CLOSE_FRACTION", "0.70"))
+PARTIAL_CLOSE_FRACTION = float(os.getenv("PARTIAL_CLOSE_FRACTION", "0.50"))
 TRAILING_STOP_GIVEBACK_PCT = float(os.getenv("TRAILING_STOP_GIVEBACK_PCT", "0.10"))
-THESIS_STRUCTURE_TOLERANCE_PCT = float(os.getenv("THESIS_STRUCTURE_TOLERANCE_PCT", "0.0010"))
-THESIS_SWING_BREAK_TOLERANCE_PCT = float(os.getenv("THESIS_SWING_BREAK_TOLERANCE_PCT", "0.0008"))
-THESIS_LEVEL_TOLERANCE_PCT = float(os.getenv("THESIS_LEVEL_TOLERANCE_PCT", "0.0012"))
-THESIS_REVERSAL_SLOPE_PCT = float(os.getenv("THESIS_REVERSAL_SLOPE_PCT", "0.0005"))
-# Score-deterioration exit: complements structural thesis checks. It requires a
-# large directional-score collapse to persist before exiting, so one noisy scan
-# cannot kill an otherwise healthy trade.
-THESIS_SCORE_EXIT_ENABLED = os.getenv("THESIS_SCORE_EXIT_ENABLED", "1") == "1"
-THESIS_SCORE_DROP_POINTS = int(os.getenv("THESIS_SCORE_DROP_POINTS", "20"))
-THESIS_SCORE_CURRENT_FLOOR = int(os.getenv("THESIS_SCORE_CURRENT_FLOOR", "50"))
-THESIS_SCORE_MIN_DOMINANCE = int(os.getenv("THESIS_SCORE_MIN_DOMINANCE", "8"))
-THESIS_SCORE_CONFIRM_CYCLES = int(os.getenv("THESIS_SCORE_CONFIRM_CYCLES", "2"))
-THESIS_SCORE_CONFIRM_SECONDS = float(os.getenv("THESIS_SCORE_CONFIRM_SECONDS", "10"))
-EMERGENCY_DATA_FAIL_EXIT_ENABLED = os.getenv("EMERGENCY_DATA_FAIL_EXIT_ENABLED", "1") == "1"
-EMERGENCY_DATA_FAIL_CYCLES = int(os.getenv("EMERGENCY_DATA_FAIL_CYCLES", "3"))
-RUNNER_UNDERLYING_TRAIL_PCT = float(os.getenv("RUNNER_UNDERLYING_TRAIL_PCT", "0.0035"))
-# Second, independent guard alongside the underlying runner trail: protects the
-# option's own P&L peak once a runner has shown strong gains, since delta/gamma/IV
-# decay can erode option profit well before the underlying thesis actually breaks.
-RUNNER_PNL_TRAIL_ACTIVATE = float(os.getenv("RUNNER_PNL_TRAIL_ACTIVATE", "0.15"))
-RUNNER_PNL_MAX_GIVEBACK = float(os.getenv("RUNNER_PNL_MAX_GIVEBACK", "0.08"))
 # High-conviction runner profile (applies only when entry quality is strong).
 RUNNER_EXIT_PROFILE_ENABLED = os.getenv("RUNNER_EXIT_PROFILE_ENABLED", "1") == "1"
 RUNNER_MIN_SCORE = int(os.getenv("RUNNER_MIN_SCORE", "75"))
@@ -348,6 +305,8 @@ RUNNER_TARGET_PCT = float(os.getenv("RUNNER_TARGET_PCT", "0.24"))
 RUNNER_PARTIAL_TP_PCT = float(os.getenv("RUNNER_PARTIAL_TP_PCT", "0.14"))
 RUNNER_PARTIAL_CLOSE_FRACTION = float(os.getenv("RUNNER_PARTIAL_CLOSE_FRACTION", "0.35"))
 RUNNER_TRAILING_GIVEBACK_PCT = float(os.getenv("RUNNER_TRAILING_GIVEBACK_PCT", "0.08"))
+MOMENTUM_FAIL_EXIT_ENABLED = False
+MOMENTUM_FAIL_MIN_PNL_PCT = float(os.getenv("MOMENTUM_FAIL_MIN_PNL_PCT", "0.06"))
 MAX_TRADE_HOLD_MINUTES = int(os.getenv("MAX_TRADE_HOLD_MINUTES", "90"))
 # Regime-aware target/stop profile.
 ADAPTIVE_EXIT_PROFILE_ENABLED = os.getenv("ADAPTIVE_EXIT_PROFILE_ENABLED", "1") == "1"
@@ -358,57 +317,14 @@ HIGH_VOL_STOP_PCT = float(os.getenv("HIGH_VOL_STOP_PCT", "0.14"))
 LOW_VOL_TARGET_PCT = float(os.getenv("LOW_VOL_TARGET_PCT", "0.16"))
 LOW_VOL_STOP_PCT = float(os.getenv("LOW_VOL_STOP_PCT", "0.14"))
 # Option contract ranking preferences.
-TARGET_OPTION_DELTA_MIN = float(os.getenv("TARGET_OPTION_DELTA_MIN", "0.45"))
-TARGET_OPTION_DELTA_MAX = float(os.getenv("TARGET_OPTION_DELTA_MAX", "0.65"))
-# Hard floor/ceiling — contracts outside this band are never selected, regardless of OI/spread.
-OPTION_ACCEPTABLE_DELTA_MIN = float(os.getenv("OPTION_ACCEPTABLE_DELTA_MIN", "0.35"))
-OPTION_ACCEPTABLE_DELTA_MAX = float(os.getenv("OPTION_ACCEPTABLE_DELTA_MAX", "0.75"))
-# Below the acceptable band, only allow contracts with excellent liquidity — never on OI alone.
-OPTION_FALLBACK_DELTA_MIN = float(os.getenv("OPTION_FALLBACK_DELTA_MIN", "0.30"))
-OPTION_FALLBACK_MIN_VOLUME = float(os.getenv("OPTION_FALLBACK_MIN_VOLUME", "500"))
-OPTION_FALLBACK_MIN_OI = float(os.getenv("OPTION_FALLBACK_MIN_OI", "5000"))
-OPTION_FALLBACK_MAX_SPREAD_PCT = float(os.getenv("OPTION_FALLBACK_MAX_SPREAD_PCT", "0.10"))
+TARGET_OPTION_DELTA_MIN = float(os.getenv("TARGET_OPTION_DELTA_MIN", "0.35"))
+TARGET_OPTION_DELTA_MAX = float(os.getenv("TARGET_OPTION_DELTA_MAX", "0.50"))
 OPTION_RANK_SPREAD_WEIGHT = float(os.getenv("OPTION_RANK_SPREAD_WEIGHT", "0.50"))
 OPTION_RANK_LIQUIDITY_WEIGHT = float(os.getenv("OPTION_RANK_LIQUIDITY_WEIGHT", "0.35"))
 OPTION_RANK_DELTA_WEIGHT = float(os.getenv("OPTION_RANK_DELTA_WEIGHT", "0.15"))
 OPTION_RANK_STRIKE_DISTANCE_WEIGHT = float(os.getenv("OPTION_RANK_STRIKE_DISTANCE_WEIGHT", "0.45"))
 OPTION_MAX_STRIKE_DISTANCE_PCT = float(os.getenv("OPTION_MAX_STRIKE_DISTANCE_PCT", "0.012"))
 OPTION_RELAXED_FALLBACK_ALERT_ONLY = os.getenv("OPTION_RELAXED_FALLBACK_ALERT_ONLY", "1") == "1"
-# Entry-quality confluence: compensating multi-factor check (not a single pass/fail score).
-ENTRY_CONFLUENCE_ENABLED = os.getenv("ENTRY_CONFLUENCE_ENABLED", "1") == "1"
-ENTRY_CONFLUENCE_MIN_POINTS = float(os.getenv("ENTRY_CONFLUENCE_MIN_POINTS", "7.0"))  # out of 12
-V2_ENTRY_QUALITY_ENABLED = os.getenv("V2_ENTRY_QUALITY_ENABLED", "1") == "1"
-V2_ENTRY_QUALITY_MIN_SCORE = float(os.getenv("V2_ENTRY_QUALITY_MIN_SCORE", "70.0"))
-V2_ENTRY_WEIGHT_TREND = float(os.getenv("V2_ENTRY_WEIGHT_TREND", "25.0"))
-V2_ENTRY_WEIGHT_LOCATION = float(os.getenv("V2_ENTRY_WEIGHT_LOCATION", "20.0"))
-V2_ENTRY_WEIGHT_SETUP = float(os.getenv("V2_ENTRY_WEIGHT_SETUP", "20.0"))
-V2_ENTRY_WEIGHT_TRIGGER = float(os.getenv("V2_ENTRY_WEIGHT_TRIGGER", "15.0"))
-V2_ENTRY_WEIGHT_CONTEXT_RS = float(os.getenv("V2_ENTRY_WEIGHT_CONTEXT_RS", "10.0"))
-V2_ENTRY_WEIGHT_CONTRACT = float(os.getenv("V2_ENTRY_WEIGHT_CONTRACT", "10.0"))
-# Shadow measurement only — never gates or blocks a trade. Classifies each V2-evaluated
-# candidate into: BOTH_PASS, V2_ONLY (V2 admits, legacy would have blocked), or
-# LEGACY_ONLY (legacy would have taken it, V2 rejects it).
-V2_ATTRIBUTION_LOG_ENABLED = os.getenv("V2_ATTRIBUTION_LOG_ENABLED", "1") == "1"
-V2_ATTRIBUTION_LOG_FILE = os.getenv("V2_ATTRIBUTION_LOG_FILE", "v2_entry_attribution_log.csv")
-# Measurement only — logs Trend/Location/Setup/Trigger/Context before contract search,
-# so a rejected contract search doesn't hide what V2 saw in the underlying setup.
-V2_PRE_CONTRACT_LOG_ENABLED = os.getenv("V2_PRE_CONTRACT_LOG_ENABLED", "1") == "1"
-# Contract-search cache: avoids re-running the full Alpaca chain/snapshot query
-# (which can take 10-20s) for the same symbol/side/price within a short window.
-# Pure performance measure — does not change which contracts are selected/rejected.
-OPTION_SEARCH_CACHE_ENABLED = os.getenv("OPTION_SEARCH_CACHE_ENABLED", "1") == "1"
-OPTION_SEARCH_CACHE_TTL_SECONDS = int(os.getenv("OPTION_SEARCH_CACHE_TTL_SECONDS", "20"))
-# A "no valid contract" result must expire much faster than a successful selection —
-# option quotes/spreads can turn tradable again within seconds, and an entry-ready
-# candidate (playbook already passed) should never be killed by a stale negative.
-OPTION_SEARCH_NEGATIVE_CACHE_TTL_SECONDS = int(os.getenv("OPTION_SEARCH_NEGATIVE_CACHE_TTL_SECONDS", "4"))
-# Fresh-setup-after-loss: require new evidence before re-entering the same (symbol, side)
-# after a stop-out, instead of a blanket block or an unconditional re-entry.
-FRESH_SETUP_AFTER_LOSS_ENABLED = os.getenv("FRESH_SETUP_AFTER_LOSS_ENABLED", "1") == "1"
-FRESH_SETUP_LOOKBACK_MINUTES = int(os.getenv("FRESH_SETUP_LOOKBACK_MINUTES", "240"))
-FRESH_SETUP_MIN_IGNITION_DELTA = int(os.getenv("FRESH_SETUP_MIN_IGNITION_DELTA", "20"))
-FRESH_SETUP_MIN_REQUIRED_SIGNALS = int(os.getenv("FRESH_SETUP_MIN_REQUIRED_SIGNALS", "2"))
-FRESH_SETUP_PRICE_RESET_PCT = float(os.getenv("FRESH_SETUP_PRICE_RESET_PCT", "0.0015"))  # 0.15%
 # Legacy profit-protection env vars are retained for backward compatibility,
 # but are intentionally not used in exit logic.
 PROFIT_PROTECT_ARM_PCT = float(os.getenv("PROFIT_PROTECT_ARM_PCT", "0.04"))
@@ -462,13 +378,6 @@ PROMOTED_STOCK_ENTRY_MIN_OPTION_OI = int(os.getenv("PROMOTED_STOCK_ENTRY_MIN_OPT
 # OCC open interest is prior-session settlement, so short-dated strikes look illiquid even when actively traded.
 ENTRY_VOLUME_SUBSTITUTES_OI = os.getenv("ENTRY_VOLUME_SUBSTITUTES_OI", "1") == "1"
 ENTRY_MIN_OPTION_DAY_VOLUME = int(os.getenv("ENTRY_MIN_OPTION_DAY_VOLUME", "1000"))
-# When OI/day-volume metadata is stale or missing (see _classify_liquidity_data_state),
-# a live bid/ask this tight is accepted as evidence of real tradability instead of an
-# automatic veto on stale metadata alone.
-LIQUIDITY_SUBSTITUTE_MAX_SPREAD_PCT = float(os.getenv("LIQUIDITY_SUBSTITUTE_MAX_SPREAD_PCT", "0.06"))
-# A tight spread only counts as evidence if the quote itself was pulled recently —
-# otherwise a stale-but-narrow quote could pass by coincidence, not real liquidity.
-LIQUIDITY_SUBSTITUTE_MAX_QUOTE_AGE_SECONDS = float(os.getenv("LIQUIDITY_SUBSTITUTE_MAX_QUOTE_AGE_SECONDS", "20.0"))
 PROMOTED_CONT_MIN_MOMENTUM_SCORE = float(os.getenv("PROMOTED_CONT_MIN_MOMENTUM_SCORE", "36"))
 PROMOTED_MIN_DOMINANCE = int(os.getenv("PROMOTED_MIN_DOMINANCE", "20"))
 PROMOTED_MIN_DELTA_5M = int(os.getenv("PROMOTED_MIN_DELTA_5M", "2"))
@@ -487,20 +396,11 @@ ONE_MINUTE_ENTRY_ENABLED = os.getenv("ONE_MINUTE_ENTRY_ENABLED", "1") == "1"
 ONE_MINUTE_LOOKBACK_BARS = int(os.getenv("ONE_MINUTE_LOOKBACK_BARS", "60"))
 ONE_MINUTE_EMA9_TOUCH_TOLERANCE = float(os.getenv("ONE_MINUTE_EMA9_TOUCH_TOLERANCE", "0.0015"))
 ONE_MINUTE_LEVEL_RETEST_TOLERANCE = float(os.getenv("ONE_MINUTE_LEVEL_RETEST_TOLERANCE", "0.0015"))
-ONE_MINUTE_MIN_VOLUME_RATIO = float(os.getenv("ONE_MINUTE_MIN_VOLUME_RATIO", "1.20"))
-# Stronger FIRST_PULLBACK confirmation: require the 5m directional score to still be building.
-FIRST_PULLBACK_MIN_SCORE_DELTA = int(os.getenv("FIRST_PULLBACK_MIN_SCORE_DELTA", "2"))
-# Minimum 1m trigger-candle follow-through as a fraction of price.
-ONE_MINUTE_MIN_TRIGGER_MOVE_PCT = float(os.getenv("ONE_MINUTE_MIN_TRIGGER_MOVE_PCT", "0.0005"))
+ONE_MINUTE_MIN_VOLUME_RATIO = float(os.getenv("ONE_MINUTE_MIN_VOLUME_RATIO", "1.10"))
 ONE_MINUTE_COMPRESSION_PCT = float(os.getenv("ONE_MINUTE_COMPRESSION_PCT", "0.0035"))
 ONE_MINUTE_MAX_TRIGGER_AGE_BARS = int(os.getenv("ONE_MINUTE_MAX_TRIGGER_AGE_BARS", "6"))
-# Reclaim confirmation window: look for a bullish/bearish reclaim across the last N closed
-# 1m bars instead of requiring the single latest bar to beat the immediately prior bar's
-# high/low (audit showed that single-bar rule was the dominant 1m-sniper blocker).
-ONE_MINUTE_RECLAIM_WINDOW_BARS = int(os.getenv("ONE_MINUTE_RECLAIM_WINDOW_BARS", "3"))
 ONE_MINUTE_REQUIRE_CLOSED_BAR = os.getenv("ONE_MINUTE_REQUIRE_CLOSED_BAR", "1") == "1"
 ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD = os.getenv("ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD", "1") == "1"
-SNIPER_WATCH_ALERT_COOLDOWN_MINUTES = int(os.getenv("SNIPER_WATCH_ALERT_COOLDOWN_MINUTES", "30"))
 
 # Stricter confirmation for recovery-style CALL entries to reduce weak bounce losses.
 RECOVERY_CALL_STRICT_ENABLED = os.getenv("RECOVERY_CALL_STRICT_ENABLED", "1") == "1"
@@ -548,11 +448,6 @@ _trading_client: "TradingClient | None" = None
 _option_client: "OptionHistoricalDataClient | None" = None
 # (symbol, side) -> datetime after which re-alerting is allowed (post-trade cooldown).
 _alert_cooldowns: "dict[tuple, datetime]" = {}
-# (symbol, side) -> datetime after which another near-entry sniper watch alert is allowed.
-_sniper_watch_cooldowns: "dict[tuple, datetime]" = {}
-# (symbol, side) -> reference state from the most recent losing trade, used to require
-# a genuinely fresh setup (not the same chop) before re-entering the same side same day.
-_post_loss_setup: "dict[tuple, dict]" = {}
 # Authorized gspread Spreadsheet object (None if not configured / failed).
 _gsheet: "gspread.Spreadsheet | None" = None
 _last_gsheet_init_attempt: "datetime | None" = None
@@ -1556,14 +1451,6 @@ def dynamic_min_required_score(symbol, side, data):
         else:
             return DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK
 
-    # Base score before regime/momentum relief or penalty.
-    if symbol in ETF_SYMBOLS:
-        base = DYNAMIC_HARD_GATE_MIN_FLOOR_ETF
-    elif is_top_stock:
-        base = TOP_STOCK_HARD_GATE_MIN_FLOOR
-    else:
-        base = DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK
-
     m = _side_metric_bundle(data, side)
     entry_timing = _classify_entry_timing(data or {}, side)
     relief = 0
@@ -2048,415 +1935,37 @@ def classify_entry_playbook(side, data):
     return None
 
 
-def classify_entry_confluence(symbol, side, data, option):
-    """Score DIRECTION/LOCATION/STRUCTURE/TIMING/CONTEXT/CONTRACT (0-2 each, 12 max).
-
-    This is a compensating check, not six independent gates: a very strong
-    category (e.g. a clean breakout-retest) can offset one mediocre category.
-    Only STRUCTURE (a valid playbook) and CONTRACT (a tradeable option) are
-    mandatory — everything else can trade off against everything else.
-    """
-    side = str(side or "").upper()
-    call_side = side == "CALL"
-    data = data or {}
-    option = option or {}
-    points = {}
-
-    # DIRECTION — score dominance and 5m trend both point the same way.
-    score = _safe_float_num(data.get("bull_score" if call_side else "bear_score", 0.0), 0.0)
-    opposite = _safe_float_num(data.get("bear_score" if call_side else "bull_score", 0.0), 0.0)
-    delta_5m, _ = _score_trend_deltas(data, side)
-    dominance = score - opposite
-    if dominance >= 30 and delta_5m is not None and delta_5m >= 0:
-        points["direction"] = 2.0
-    elif dominance >= 10 or (delta_5m is not None and delta_5m >= 0):
-        points["direction"] = 1.0
-    else:
-        points["direction"] = 0.0
-
-    # LOCATION — reasonable distance from VWAP/EMA20, room before opposing S/R.
-    ext_pct = abs(_safe_float_num(data.get("vwap_extension_pct", 0.0), 0.0))
-    opposing_level = data.get("resistance_level") if call_side else data.get("support_level")
-    opposing_room_atr = _safe_float_num((opposing_level or {}).get("distance_atr", 999.0), 999.0)
-    if ext_pct <= 0.006 and opposing_room_atr >= 0.5:
-        points["location"] = 2.0
-    elif ext_pct <= 0.012 and opposing_room_atr >= 0.25:
-        points["location"] = 1.0
-    else:
-        points["location"] = 0.0
-
-    # STRUCTURE — mandatory: must be a named, valid playbook.
-    playbook = str(data.get("entry_playbook", "") or "")
-    points["structure"] = 2.0 if playbook in {"BREAKOUT", "PULLBACK_CONTINUATION", "BREAKOUT_CONTINUATION"} else 0.0
-
-    # TIMING — 1m sniper trigger quality.
-    trigger = str(data.get("one_minute_trigger", "") or "").upper()
-    if trigger == "BREAKOUT_RETEST":
-        points["timing"] = 2.0
-    elif trigger in {"FIRST_PULLBACK", "MOMENTUM_COMPRESSION"}:
-        points["timing"] = 1.0
-    else:
-        points["timing"] = 0.0
-
-    # CONTEXT — SPY/QQQ tape not strongly contradictory.
-    macro_penalty = _safe_float_num(data.get("macro_penalty", 0.0), 0.0)
-    if macro_penalty <= 0:
-        points["context"] = 2.0
-    elif macro_penalty <= 12:
-        points["context"] = 1.0
-    else:
-        points["context"] = 0.0
-
-    # CONTRACT — mandatory: delta must fall in the preferred/acceptable band.
-    opt_delta = abs(_safe_float_num(option.get("delta", 0.0), 0.0))
-    if TARGET_OPTION_DELTA_MIN <= opt_delta <= TARGET_OPTION_DELTA_MAX:
-        points["contract"] = 2.0
-    elif OPTION_ACCEPTABLE_DELTA_MIN <= opt_delta <= OPTION_ACCEPTABLE_DELTA_MAX:
-        points["contract"] = 1.0
-    else:
-        points["contract"] = 0.0
-
-    total = sum(points.values())
-    detail = ", ".join(f"{k}={v:.0f}" for k, v in points.items())
-
-    if points["structure"] <= 0.0:
-        return False, total, f"no valid structure ({detail})"
-    if points["contract"] <= 0.0:
-        return False, total, f"contract outside tradeable delta band ({detail})"
-    if total < ENTRY_CONFLUENCE_MIN_POINTS:
-        return False, total, f"confluence {total:.1f} < {ENTRY_CONFLUENCE_MIN_POINTS:.1f} ({detail})"
-    return True, total, detail
-
-
-def _v2_pre_contract_scores(symbol, side, data):
-    """Compute Trend/Location/Setup/Trigger/Context+RS — everything V2 can score
-    before a contract is even found. Pure evidence computation, no gating.
-    """
-    side = str(side or "").upper()
-    call_side = side == "CALL"
-    data = data or {}
-
-    side_score = _safe_float_num(data.get("bull_score" if call_side else "bear_score", 0.0), 0.0)
-    opp_score = _safe_float_num(data.get("bear_score" if call_side else "bull_score", 0.0), 0.0)
-    delta_5m, _ = _score_trend_deltas(data, side)
-    dominance = side_score - opp_score
-    momentum_quality = _safe_float_num(data.get("momentum_quality", 0.0), 0.0)
-
-    if dominance >= 30 and (delta_5m is None or delta_5m >= 0):
-        trend_score = min(100.0, 0.65 * side_score + 0.35 * max(0.0, momentum_quality))
-    elif dominance >= 15:
-        trend_score = min(100.0, 0.55 * side_score + 0.25 * max(0.0, momentum_quality) + 10.0)
-    else:
-        trend_score = min(100.0, 0.45 * side_score + 0.20 * max(0.0, momentum_quality))
-
-    ext_pct = abs(_safe_float_num(data.get("vwap_extension_pct", 0.0), 0.0))
-    opposing_level = data.get("resistance_level") if call_side else data.get("support_level")
-    room_atr = _safe_float_num((opposing_level or {}).get("distance_atr", 0.0), 0.0)
-    # Location combines anti-chase (VWAP extension) with actual room to the next
-    # opposing structure. Tight room now meaningfully discounts otherwise strong
-    # breakout scores instead of being almost free evidence.
-    if ext_pct <= 0.006:
-        extension_score = 100.0
-    elif ext_pct <= 0.012:
-        extension_score = 75.0
-    elif ext_pct <= 0.018:
-        extension_score = 45.0
-    else:
-        extension_score = 20.0
-    if room_atr >= 1.50:
-        room_score = 100.0
-    elif room_atr >= 1.00:
-        room_score = 80.0
-    elif room_atr >= 0.65:
-        room_score = 60.0
-    elif room_atr >= 0.35:
-        room_score = 35.0
-    else:
-        room_score = 15.0
-    location_score = 0.55 * extension_score + 0.45 * room_score
-
-    playbook = str(data.get("entry_playbook", "") or "").upper()
-    if playbook in {"PULLBACK_CONTINUATION", "BREAKOUT_CONTINUATION", "BREAKOUT"}:
-        setup_score = 100.0
-    elif playbook:
-        setup_score = 55.0
-    else:
-        setup_score = 0.0
-
-    trigger = str(data.get("one_minute_trigger", "") or "").upper()
-    if trigger == "BREAKOUT_RETEST":
-        trigger_score = 100.0
-    elif trigger == "FIRST_PULLBACK":
-        trigger_score = 85.0
-    elif trigger == "MOMENTUM_COMPRESSION":
-        trigger_score = 75.0
-    elif trigger in {"DISABLED", ""}:
-        trigger_score = 50.0 if not ONE_MINUTE_ENTRY_ENABLED else 20.0
-    else:
-        trigger_score = 35.0
-
-    macro_penalty = _safe_float_num(data.get("macro_penalty", 0.0), 0.0)
-    regime_score = _safe_float_num(
-        data.get("market_regime_score_bull" if call_side else "market_regime_score_bear", 0.0),
-        0.0,
-    )
-    rel_strength = _safe_float_num(
-        data.get("relative_strength_score_bull" if call_side else "relative_strength_score_bear", 0.0),
-        0.0,
-    )
-    # An invalid market-context check (short-term move not yet aligned) is evidence of
-    # weak conviction, not an automatic veto — it discounts Context, it doesn't zero it.
-    context_invalid_penalty = 0.0 if bool(data.get("context_valid", True)) else 25.0
-    context_rs_score = max(
-        0.0,
-        min(100.0, 0.55 * regime_score + 0.45 * rel_strength - macro_penalty - context_invalid_penalty),
-    )
-
-    return {
-        "trend": trend_score,
-        "location": location_score,
-        "setup": setup_score,
-        "trigger": trigger_score,
-        "context_rs": context_rs_score,
-    }
-
-
-def log_v2_pre_contract_components(symbol, side, data):
-    """Measurement only: log what V2 sees before contract search, so a rejected
-    contract search doesn't hide Trend/Location/Setup/Trigger/Context evidence.
-    """
-    if not (V2_ENTRY_QUALITY_ENABLED and V2_PRE_CONTRACT_LOG_ENABLED):
-        return
-    try:
-        scores = _v2_pre_contract_scores(symbol, side, data)
-        log(
-            f"[{symbol}] [V2 PRE-CONTRACT] {side} — trend={scores['trend']:.0f}, "
-            f"location={scores['location']:.0f}, setup={scores['setup']:.0f}, "
-            f"trigger={scores['trigger']:.0f}, context+rs={scores['context_rs']:.0f}, contract=PENDING"
-        )
-    except Exception as e:
-        log(f"[{symbol}] V2 pre-contract logging failed (non-blocking): {e}")
-
-
-def unified_entry_quality_v2(symbol, side, data, option):
-    """Unified V2 entry decision using weighted evidence instead of chained vetoes."""
-    side = str(side or "").upper()
-    option = option or {}
-    scores = _v2_pre_contract_scores(symbol, side, data)
-    trend_score = scores["trend"]
-    location_score = scores["location"]
-    setup_score = scores["setup"]
-    trigger_score = scores["trigger"]
-    context_rs_score = scores["context_rs"]
-
-    delta_abs = abs(_safe_float_num(option.get("delta", 0.0), 0.0))
-    spread_pct = _safe_float_num(option.get("spread_pct", 1.0), 1.0)
-    vol = max(0.0, _safe_float_num(option.get("volume", 0.0), 0.0))
-    oi = max(0.0, _safe_float_num(option.get("open_interest", 0.0), 0.0))
-    if TARGET_OPTION_DELTA_MIN <= delta_abs <= TARGET_OPTION_DELTA_MAX:
-        delta_score = 100.0
-    elif OPTION_ACCEPTABLE_DELTA_MIN <= delta_abs <= OPTION_ACCEPTABLE_DELTA_MAX:
-        delta_score = 75.0
-    elif OPTION_FALLBACK_DELTA_MIN <= delta_abs < OPTION_ACCEPTABLE_DELTA_MIN:
-        delta_score = 50.0
-    else:
-        delta_score = 20.0
-    spread_score = 100.0 if spread_pct <= 0.04 else 75.0 if spread_pct <= 0.08 else 45.0 if spread_pct <= 0.12 else 20.0
-    liquidity_score = 100.0 if (vol >= 500 and oi >= 5000) else 75.0 if (vol >= 250 and oi >= 2500) else 45.0 if (vol >= 100 and oi >= 1000) else 20.0
-    contract_score = max(0.0, min(100.0, 0.45 * delta_score + 0.30 * spread_score + 0.25 * liquidity_score))
-
-    weight_sum = max(
-        1.0,
-        V2_ENTRY_WEIGHT_TREND
-        + V2_ENTRY_WEIGHT_LOCATION
-        + V2_ENTRY_WEIGHT_SETUP
-        + V2_ENTRY_WEIGHT_TRIGGER
-        + V2_ENTRY_WEIGHT_CONTEXT_RS
-        + V2_ENTRY_WEIGHT_CONTRACT,
-    )
-    weighted_total = (
-        trend_score * V2_ENTRY_WEIGHT_TREND
-        + location_score * V2_ENTRY_WEIGHT_LOCATION
-        + setup_score * V2_ENTRY_WEIGHT_SETUP
-        + trigger_score * V2_ENTRY_WEIGHT_TRIGGER
-        + context_rs_score * V2_ENTRY_WEIGHT_CONTEXT_RS
-        + contract_score * V2_ENTRY_WEIGHT_CONTRACT
-    ) / weight_sum
-
-    detail = (
-        f"trend={trend_score:.0f}, location={location_score:.0f}, setup={setup_score:.0f}, "
-        f"trigger={trigger_score:.0f}, context+rs={context_rs_score:.0f}, contract={contract_score:.0f}"
-    )
-    if weighted_total < V2_ENTRY_QUALITY_MIN_SCORE:
-        return False, weighted_total, f"entry quality {weighted_total:.1f} < {V2_ENTRY_QUALITY_MIN_SCORE:.1f} ({detail})"
-    return True, weighted_total, detail
-
-
-def _legacy_shadow_verdict(symbol, side, data, option):
-    """Shadow-only: would the pre-V2 pipeline (hard score + confirmed sniper + confluence)
-    have taken this same candidate? Never blocks anything — used solely for attribution.
-    """
-    side_score = _safe_float_num((data or {}).get("bull_score" if side == "CALL" else "bear_score", 0.0), 0.0)
-    min_required_score = min(BREAKOUT_MIN_SCORE, PULLBACK_MIN_SCORE)
-    score_ok = side_score >= min_required_score
-
-    sniper_required = bool(ONE_MINUTE_ENTRY_ENABLED)
-    sniper_ok = bool((data or {}).get("one_minute_entry_confirmed", False)) if sniper_required else True
-
-    confluence_ok, confluence_points, confluence_detail = classify_entry_confluence(symbol, side, data, option)
-
-    legacy_ok = score_ok and sniper_ok and confluence_ok
-    detail = (
-        f"score {side_score:.0f}{'>=' if score_ok else '<'}{min_required_score:.0f}, "
-        f"sniper_confirmed={sniper_ok}, confluence={confluence_points:.1f}/12 ({confluence_detail})"
-    )
-    return legacy_ok, detail
-
-
-def _log_entry_attribution(symbol, side, data, v2_ok, v2_score, legacy_ok, legacy_detail):
-    """Best-effort shadow attribution log — measurement only, never raises or blocks."""
-    if not V2_ATTRIBUTION_LOG_ENABLED:
-        return
-    try:
-        if v2_ok and legacy_ok:
-            bucket = "BOTH_PASS"
-        elif v2_ok and not legacy_ok:
-            bucket = "V2_ONLY"
-        elif (not v2_ok) and legacy_ok:
-            bucket = "LEGACY_ONLY"
-        else:
-            bucket = "BOTH_BLOCK"
-        row = {
-            "timestamp": datetime.now(central).strftime("%Y-%m-%d %H:%M:%S"),
-            "symbol": symbol,
-            "side": side,
-            "bucket": bucket,
-            "v2_pass": v2_ok,
-            "v2_score": round(float(v2_score), 1),
-            "legacy_pass": legacy_ok,
-            "legacy_detail": legacy_detail,
-            "setup_type": str((data or {}).get("entry_playbook", "") or ""),
-            "one_minute_trigger": str((data or {}).get("one_minute_trigger", "") or ""),
-        }
-        pd.DataFrame([row]).to_csv(
-            V2_ATTRIBUTION_LOG_FILE,
-            mode="a",
-            header=not os.path.exists(V2_ATTRIBUTION_LOG_FILE),
-            index=False,
-        )
-        log(f"[{symbol}] Shadow attribution: bucket={bucket} (v2={v2_ok}/{v2_score:.1f}, legacy={legacy_ok}: {legacy_detail}).")
-    except Exception as e:
-        log(f"[{symbol}] Shadow attribution logging failed (non-blocking): {e}")
-
-
-
-def _record_post_loss_setup(symbol, side, exit_market_context, ignition_delta):
-    """Remember where a losing trade failed so the next same-side entry must show fresh evidence."""
-    symbol = str(symbol or "").upper()
-    side = str(side or "").upper()
-    if not symbol or side not in ("CALL", "PUT"):
-        return
-    _post_loss_setup[(symbol, side)] = {
-        "loss_at": datetime.now(central),
-        "reference_price": _safe_float_num((exit_market_context or {}).get("price", 0.0), 0.0),
-        "entry_ignition_delta": _safe_int_num(ignition_delta, 0),
-    }
-
-
-def fresh_setup_confirmed(symbol, side, data):
-    """After a same-side loss, require new evidence (not the same chop) before re-entering."""
-    if not FRESH_SETUP_AFTER_LOSS_ENABLED:
-        return True, "fresh-setup check disabled"
-    symbol = str(symbol or "").upper()
-    side = str(side or "").upper()
-    record = _post_loss_setup.get((symbol, side))
-    if not record:
-        return True, "no prior loss on record"
-
-    loss_at = record.get("loss_at")
-    if not isinstance(loss_at, datetime) or (datetime.now(central) - loss_at) > timedelta(minutes=FRESH_SETUP_LOOKBACK_MINUTES):
-        _post_loss_setup.pop((symbol, side), None)
-        return True, "prior loss outside lookback window"
-
-    data = data or {}
-    call_side = side == "CALL"
-    fresh_break = bool(data.get("fresh_breakout" if call_side else "fresh_breakdown", False))
-    ignition_delta = _safe_int_num(data.get("ignition_delta", 0), 0)
-    trigger = str(data.get("one_minute_trigger", "") or "").upper()
-    price = _safe_float_num(data.get("price", 0.0), 0.0)
-    reference_price = _safe_float_num(record.get("reference_price", 0.0), 0.0)
-
-    signals = []
-    if fresh_break:
-        signals.append("fresh breakout/breakdown")
-    if ignition_delta >= FRESH_SETUP_MIN_IGNITION_DELTA:
-        signals.append(f"renewed ignition {ignition_delta:+d}")
-    if trigger == "BREAKOUT_RETEST":
-        signals.append("retest-confirmed 1m trigger")
-    if reference_price > 0:
-        reset_pct = (price - reference_price) / reference_price
-        if (call_side and reset_pct >= FRESH_SETUP_PRICE_RESET_PCT) or ((not call_side) and reset_pct <= -FRESH_SETUP_PRICE_RESET_PCT):
-            signals.append(f"structure reset {reset_pct * 100:+.2f}% vs prior stop-out")
-
-    if len(signals) >= FRESH_SETUP_MIN_REQUIRED_SIGNALS:
-        return True, f"fresh setup confirmed: {', '.join(signals)}"
-    return False, (
-        f"waiting for fresh setup after prior {side} stop-out "
-        f"(have {len(signals)}/{FRESH_SETUP_MIN_REQUIRED_SIGNALS}: {', '.join(signals) or 'none'})"
-    )
-
-
 def _breakout_hold_confirmation(symbol, side, data):
-    """Armed breakout state: gives a fresh break up to ARMED_SETUP_MAX_BARS completed
-    5m bars to hold before expiring, instead of a single all-or-nothing next bar.
-    Cancels early on score collapse, dominance disappearing, or structure loss.
-    """
+    """Require the bar after a fresh break to hold beyond the level with momentum."""
     if not BREAKOUT_HOLD_CONFIRMATION_ENABLED or not symbol:
         return None, "disabled"
 
     side = str(side or "").upper()
-    call_side = side == "CALL"
     key = (str(symbol).upper(), side)
     bar_time = (data or {}).get("bar_time")
     price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
-    vwap = _safe_float_num((data or {}).get("vwap", 0.0), 0.0)
-    ema20 = _safe_float_num((data or {}).get("ema20", 0.0), 0.0)
-    score = _safe_float_num((data or {}).get("bull_score" if call_side else "bear_score", 0.0), 0.0)
-    opposite = _safe_float_num((data or {}).get("bear_score" if call_side else "bull_score", 0.0), 0.0)
     fresh_break = bool((data or {}).get("fresh_breakout", False)) if side == "CALL" else bool((data or {}).get("fresh_breakdown", False))
     pending = _breakout_hold_pending.get(key)
 
     if pending:
         if bar_time == pending["bar_time"]:
-            return False, f"ARMED_BREAKOUT_{side}: awaiting next completed bar (bar 1/{ARMED_SETUP_MAX_BARS})"
-
-        bars_elapsed = int(pending.get("bars_elapsed", 0)) + 1
-        if bars_elapsed > ARMED_SETUP_MAX_BARS:
+            return False, "awaiting next completed breakout bar"
+        try:
+            expected_bar_time = pending["bar_time"] + timedelta(minutes=5)
+        except (TypeError, ValueError):
+            expected_bar_time = None
+        if expected_bar_time is not None and bar_time != expected_bar_time:
             _breakout_hold_pending.pop(key, None)
-            return False, f"ARMED SETUP CANCELLED: expired after {ARMED_SETUP_MAX_BARS} bars"
-
+            return False, "breakout hold confirmation expired"
+        _breakout_hold_pending.pop(key, None)
         level = float(pending["level"])
         buffer = level * BREAKOUT_CONFIRMATION_MIN_BUFFER_PCT
         held = price >= level + buffer if side == "CALL" else price <= level - buffer
-
         if not held:
-            dominance_now = score - opposite
-            armed_score = pending.get("armed_score", score)
-            if score < PULLBACK_MIN_SCORE or score < (armed_score * 0.6):
-                _breakout_hold_pending.pop(key, None)
-                return False, f"ARMED SETUP CANCELLED: score collapsed to {score:.0f}"
-            if dominance_now < PLAYBOOK_MIN_DOMINANCE:
-                _breakout_hold_pending.pop(key, None)
-                return False, f"ARMED SETUP CANCELLED: dominance disappeared ({dominance_now:.0f})"
-            structure_lost = (price < min(vwap, ema20)) if call_side else (price > max(vwap, ema20))
-            if structure_lost:
-                _breakout_hold_pending.pop(key, None)
-                return False, "ARMED SETUP CANCELLED: lost VWAP/EMA20 structure"
-            pending["bar_time"] = bar_time
-            pending["bars_elapsed"] = bars_elapsed
-            return False, f"ARMED_BREAKOUT_{side}: still waiting (bar {bars_elapsed + 1}/{ARMED_SETUP_MAX_BARS})"
-
-        _breakout_hold_pending.pop(key, None)
+            return False, (
+                f"breakout hold {price:.2f} did not clear {level:.2f} by "
+                f"{BREAKOUT_CONFIRMATION_MIN_BUFFER_PCT * 100:.2f}%"
+            )
 
         delta_5m, _ = _score_trend_deltas(data or {}, side)
         if delta_5m is None or delta_5m < BREAKOUT_CONFIRMATION_MIN_SCORE_DELTA:
@@ -2479,18 +1988,13 @@ def _breakout_hold_confirmation(symbol, side, data):
         if opposing_indices:
             return False, f"breakout confirmation blocked by {'/'.join(opposing_indices)} macro alignment"
         if held:
-            return True, f"breakout held {level:.2f} on bar {bars_elapsed}/{ARMED_SETUP_MAX_BARS}"
+            return True, f"breakout held {level:.2f} on next completed bar"
         return False, f"breakout failed to hold {level:.2f}"
 
     if fresh_break:
         level = _safe_float_num((data or {}).get("recent_high" if side == "CALL" else "recent_low", price), price)
-        _breakout_hold_pending[key] = {
-            "bar_time": bar_time,
-            "level": level,
-            "bars_elapsed": 0,
-            "armed_score": score,
-        }
-        return False, f"ARMED_BREAKOUT_{side}: fresh breakout at {level:.2f}; awaiting hold confirmation"
+        _breakout_hold_pending[key] = {"bar_time": bar_time, "level": level}
+        return False, f"fresh breakout at {level:.2f}; awaiting hold confirmation"
     return None, "no pending breakout"
 
 
@@ -2568,34 +2072,6 @@ def marginal_call_entry_ok(score, data):
     return True, "marginal CALL quality confirmed"
 
 
-def _log_vwap_shadow_telemetry(symbol, side, extension, playbook, one_minute_trigger, score, dominance_val, volume_ratio, pattern_quality):
-    """Shadow-only: what would the tiered VWAP decision be at other caps? Never gates
-    anything — pure evidence for calibrating PLAYBOOK_MAX_VWAP_EXTENSION later.
-    """
-    try:
-        would_pass = {}
-        for cap in VWAP_SHADOW_CAPS_PCT:
-            if extension <= cap:
-                would_pass[f"{cap*100:.2f}%"] = True
-            else:
-                extended_override = (
-                    playbook == "PULLBACK_CONTINUATION"
-                    and one_minute_trigger == "FIRST_PULLBACK"
-                    and score >= PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_SCORE
-                    and dominance_val >= PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_DOMINANCE
-                    and volume_ratio >= PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_VOLX
-                    and pattern_quality >= PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_PATTERN
-                    and extension <= PLAYBOOK_VWAP_EXTENDED_MAX
-                )
-                would_pass[f"{cap*100:.2f}%"] = bool(extended_override)
-        log(
-            f"[{symbol}] [VWAP SHADOW] {side} extension={extension*100:.2f}% playbook={playbook} "
-            f"would_pass_at={would_pass}"
-        )
-    except Exception as e:
-        log(f"[{symbol}] VWAP shadow telemetry failed (non-blocking): {e}")
-
-
 def playbook_entry_ok(side, data, symbol=None):
     """Apply the minimum technical conditions for a named entry playbook."""
     side = str(side or "").upper()
@@ -2617,9 +2093,8 @@ def playbook_entry_ok(side, data, symbol=None):
     one_minute_engine_active = bool(ONE_MINUTE_ENTRY_ENABLED)
     one_minute_enabled = bool(one_minute_engine_active and data.get("one_minute_entry_confirmed", False))
     one_minute_trigger = str(data.get("one_minute_trigger", "") or "").upper()
-    # V2: an unconfirmed 1m trigger is evidence (weak Trigger score), not an automatic
-    # veto. Fall through to structural playbook/hold-confirmation checks below instead
-    # of terminating the candidate outright. Genuinely invalid structure still blocks.
+    if one_minute_engine_active and not one_minute_enabled:
+        return False, None, "1m sniper trigger not confirmed"
     playbook = classify_entry_playbook(side, data)
     if one_minute_enabled and one_minute_trigger in {"FIRST_PULLBACK", "BREAKOUT_RETEST", "MOMENTUM_COMPRESSION"}:
         if one_minute_trigger == "FIRST_PULLBACK":
@@ -2696,48 +2171,26 @@ def playbook_entry_ok(side, data, symbol=None):
                     f"{support_distance_atr:.2f} ATR away "
                     f"(touches={support_touches}, strength={support_strength:.0f}/100)"
                 )
-
-    # FIRST_PULLBACK is a trigger, not sufficient proof by itself. Require the 5m
-    # directional score to still be building so stale pullbacks do not re-enter a fading move.
-    # delta_5m is None when 5m-ago history isn't available yet (cold start/warmup gap) —
-    # that's "unknown", not "failed freshness", so it must not be treated as a block.
-    if (
-        playbook not in ("BREAKOUT", "BREAKOUT_CONTINUATION")
-        and one_minute_enabled
-        and one_minute_trigger == "FIRST_PULLBACK"
-        and delta_5m is not None
-        and delta_5m < FIRST_PULLBACK_MIN_SCORE_DELTA
-    ):
-        return False, playbook, (
-            f"FIRST_PULLBACK blocked -- 5m directional score delta {delta_5m} "
-            f"< +{FIRST_PULLBACK_MIN_SCORE_DELTA}; waiting for fresh continuation"
-        )
-
     is_breakout_continuation = continuation_confirmed is True
     min_score = (
         BREAKOUT_CONTINUATION_MIN_SCORE if is_breakout_continuation
         else BREAKOUT_MIN_SCORE if playbook == "BREAKOUT"
         else PULLBACK_MIN_SCORE
     )
-    # V2: raw score is Trend evidence for Unified Entry Quality, not a second hard
-    # veto here — the outer hard-score gate is already advisory-only under V2.
-    score_gate_authority = not (V2_ENTRY_QUALITY_ENABLED and TWO_PLAYBOOK_ENTRY_MODE)
-    if score_gate_authority and score < min_score:
+    if score < min_score:
         return False, playbook, f"score {score:.0f} < {min_score}"
     if is_breakout_continuation:
         pass
     elif score < SCORE_STRONG:
-        # V2: early-entry volume ratio is Volume/Trigger evidence, not a binary kill
-        # switch — the 1m sniper (e.g. BREAKOUT_RETEST) already measures its own volume.
-        if score_gate_authority and volume_ratio < VOLUME_MULTIPLIER:
+        if volume_ratio < VOLUME_MULTIPLIER:
             return False, playbook, (
                 f"early-entry volume ratio {volume_ratio:.2f} < {VOLUME_MULTIPLIER:.2f}"
             )
-        if score_gate_authority and (delta_5m is None or delta_5m <= 0):
+        if delta_5m is None or delta_5m <= 0:
             return False, playbook, (
                 f"early-entry 5m score delta {delta_5m} is not rising"
             )
-    elif score_gate_authority and volume_ratio < 1.0:
+    elif volume_ratio < 1.0:
         return False, playbook, (
             f"confirmed-entry volume ratio {volume_ratio:.2f} < 1.00"
         )
@@ -2751,32 +2204,8 @@ def playbook_entry_ok(side, data, symbol=None):
         marginal_call_ok, marginal_call_reason = marginal_call_entry_ok(score, data)
         if not marginal_call_ok:
             return False, playbook, marginal_call_reason
-
-    # Tiered VWAP extension: NORMAL passes freely, EXTENDED requires strong
-    # confirmation, VERY_EXTENDED is never overridden (proven risk guard, frozen).
-    dominance_val = score - opposite
-    pattern_quality = _safe_float_num(
-        (data or {}).get("pattern_quality_score_bull" if call_side else "pattern_quality_score_bear", 0.0), 0.0
-    )
-    _log_vwap_shadow_telemetry(symbol, side, extension, playbook, one_minute_trigger, score, dominance_val, volume_ratio, pattern_quality)
-    if extension > PLAYBOOK_VWAP_EXTENDED_MAX:
-        return False, playbook, (
-            f"VWAP extension {extension * 100:.2f}% > {PLAYBOOK_VWAP_EXTENDED_MAX * 100:.2f}% (VERY_EXTENDED)"
-        )
     if extension > PLAYBOOK_MAX_VWAP_EXTENSION:
-        extended_override = (
-            playbook == "PULLBACK_CONTINUATION"
-            and one_minute_trigger == "FIRST_PULLBACK"
-            and score >= PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_SCORE
-            and dominance_val >= PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_DOMINANCE
-            and volume_ratio >= PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_VOLX
-            and pattern_quality >= PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_PATTERN
-        )
-        if not extended_override:
-            return False, playbook, (
-                f"VWAP extension {extension * 100:.2f}% > {PLAYBOOK_MAX_VWAP_EXTENSION * 100:.2f}% (EXTENDED, "
-                f"confirmation insufficient for override)"
-            )
+        return False, playbook, f"VWAP extension {extension * 100:.2f}% > {PLAYBOOK_MAX_VWAP_EXTENSION * 100:.2f}%"
     if delta_5m is not None and delta_5m < -4:
         return False, playbook, f"directional score fading ({delta_5m:+d} over 5m)"
     if is_breakout_continuation:
@@ -3666,21 +3095,6 @@ def analyze(df, client, symbol):
         # ALLOW: Trend/breakout trade - near/above VWAP and momentum aligned
         if price_to_vwap_pct >= -0.8 and momentum_2bar >= 0.05 and momentum_pct >= 0.0:
             return True, "CALL context valid: trend aligned"
-        # ALLOW: Controlled pullback inside an intact uptrend — a negative 2-bar print alone
-        # doesn't mean low conviction here; hand off to the playbook/1m sniper (reclaim +
-        # volume confirmation) instead of killing the candidate before it gets evaluated.
-        if (
-            TWO_PLAYBOOK_ENTRY_MODE
-            and ema20_rising
-            and rsi >= 45
-            and price_to_vwap_pct >= -1.0
-            and momentum_pct >= -0.3
-            and -1.5 <= momentum_2bar < 0.05
-        ):
-            return True, (
-                f"CALL allowed: controlled pullback in intact uptrend (VWAP {price_to_vwap_pct:.1f}%, "
-                f"2bar {momentum_2bar:.2f}%, 5bar {momentum_pct:.2f}%) — handing to playbook/1m sniper"
-            )
         # REJECT: no clear bullish structure yet
         return False, (
             f"CALL rejected: low conviction (VWAP {price_to_vwap_pct:.1f}%, "
@@ -3710,20 +3124,6 @@ def analyze(df, client, symbol):
         # ALLOW: Trend/breakdown trade - near/below VWAP and momentum aligned
         if price_to_vwap_pct <= 0.8 and momentum_2bar <= -0.05 and momentum_pct <= 0.0:
             return True, "PUT context valid: trend aligned"
-        # ALLOW: Controlled bounce inside an intact downtrend — mirror of the CALL case;
-        # hand off to the playbook/1m sniper instead of killing the candidate outright.
-        if (
-            TWO_PLAYBOOK_ENTRY_MODE
-            and ema20_falling
-            and rsi <= 55
-            and price_to_vwap_pct <= 1.0
-            and momentum_pct <= 0.3
-            and -0.05 < momentum_2bar <= 1.5
-        ):
-            return True, (
-                f"PUT allowed: controlled bounce in intact downtrend (VWAP {price_to_vwap_pct:.1f}%, "
-                f"2bar {momentum_2bar:.2f}%, 5bar {momentum_pct:.2f}%) — handing to playbook/1m sniper"
-            )
         # REJECT: no clear bearish structure yet
         return False, (
             f"PUT rejected: low conviction (VWAP {price_to_vwap_pct:.1f}%, "
@@ -3743,41 +3143,29 @@ def analyze(df, client, symbol):
     # The dominant side must lead by SCORE_DOMINANCE points; otherwise NO TRADE.
     diff = bull_score - bear_score
 
-    # V2: market-context validation is Context evidence, not an automatic veto —
-    # the legacy path (below) still enforces it as a hard NO TRADE.
-    context_gate_authority = not (TWO_PLAYBOOK_ENTRY_MODE and V2_ENTRY_QUALITY_ENABLED)
-    context_valid, context_reason = True, ""
     if bull_score >= strong_threshold and diff >= SCORE_DOMINANCE:
         call_valid, call_reason = validate_call_context()
-        context_valid, context_reason = call_valid, call_reason
-        if call_valid or not context_gate_authority:
+        if call_valid:
             side, score, tier, signal = "CALL", bull_score, "STRONG", "STRONG CALL"
-            if not call_valid:
-                print(f"[{symbol}] {call_reason} | Score was {bull_score} (above threshold) — advisory under V2, not blocking", flush=True)
         else:
             side, score, tier, signal = "NO TRADE", bull_score, "REJECTED", f"STRONG_CALL_CONTEXT_FAIL"
             print(f"[{symbol}] {call_reason} | Score was {bull_score} (above threshold)", flush=True)
     elif bear_score >= strong_threshold and -diff >= SCORE_DOMINANCE:
         put_valid, put_reason = validate_put_context()
-        context_valid, context_reason = put_valid, put_reason
-        if put_valid or not context_gate_authority:
+        if put_valid:
             side, score, tier, signal = "PUT", bear_score, "STRONG", "STRONG PUT"
-            if not put_valid:
-                print(f"[{symbol}] {put_reason} | Score was {bear_score} (above threshold) — advisory under V2, not blocking", flush=True)
         else:
             side, score, tier, signal = "NO TRADE", bear_score, "REJECTED", f"STRONG_PUT_CONTEXT_FAIL"
             print(f"[{symbol}] {put_reason} | Score was {bear_score} (above threshold)", flush=True)
     elif bull_score >= SCORE_SIGNAL and diff >= SCORE_DOMINANCE:
-        call_valid, call_reason = validate_call_context()
-        context_valid, context_reason = call_valid, call_reason
-        if call_valid or not context_gate_authority:
+        call_valid, _ = validate_call_context()
+        if call_valid:
             side, score, tier, signal = "CALL", bull_score, "SIGNAL", "CALL"
         else:
             side, score, tier, signal = "NO TRADE", bull_score, "REJECTED", "SIGNAL_CALL_CONTEXT_FAIL"
     elif bear_score >= SCORE_SIGNAL and -diff >= SCORE_DOMINANCE:
-        put_valid, put_reason = validate_put_context()
-        context_valid, context_reason = put_valid, put_reason
-        if put_valid or not context_gate_authority:
+        put_valid, _ = validate_put_context()
+        if put_valid:
             side, score, tier, signal = "PUT", bear_score, "SIGNAL", "PUT"
         else:
             side, score, tier, signal = "NO TRADE", bear_score, "REJECTED", "SIGNAL_PUT_CONTEXT_FAIL"
@@ -3812,8 +3200,6 @@ def analyze(df, client, symbol):
     print(f"[{symbol}]   Bear components: {bear_breakdown}", flush=True)
         # ATR diagnostics only - does NOT block or approve trades.
     atr14 = float(latest.get("ATR14", float("nan")))
-    vwap_dist_atr = float("nan")
-    ema20_dist_atr = float("nan")
 
     if pd.notna(atr14) and atr14 > 0:
         vwap_dist_atr = abs(price - vwap) / atr14 if vwap else float("nan")
@@ -3846,6 +3232,29 @@ def analyze(df, client, symbol):
             f"{structure_label} dist={structure_dist_atr:.2f} ATR",
             flush=True,
         )
+
+        # Horizontal S/R diagnostics only.
+        if support_level:
+            print(
+                f"[{symbol}]   H-SUPPORT ${support_level['level']:.2f} | "
+                f"touches={support_level['touches']} | "
+                f"strength={support_level['strength']:.0f}/100 | "
+                f"distance={support_level['distance_atr']:.2f} ATR",
+                flush=True,
+            )
+        else:
+            print(f"[{symbol}]   H-SUPPORT none", flush=True)
+
+        if resistance_level:
+            print(
+                f"[{symbol}]   H-RESISTANCE ${resistance_level['level']:.2f} | "
+                f"touches={resistance_level['touches']} | "
+                f"strength={resistance_level['strength']:.0f}/100 | "
+                f"distance={resistance_level['distance_atr']:.2f} ATR",
+                flush=True,
+            )
+        else:
+            print(f"[{symbol}]   H-RESISTANCE none", flush=True)
 
         # Horizontal S/R diagnostics only.
         if support_level:
@@ -3913,9 +3322,6 @@ def analyze(df, client, symbol):
         "ema20_slope_pct": ema20_slope_pct,
         "volume_accel": volume_accel,
         "momentum_quality": momentum_quality,
-        "atr14": atr14,
-        "vwap_dist_atr": vwap_dist_atr,
-        "ema20_dist_atr": ema20_dist_atr,
         "bullish_candle": bullish_candle,
         "bearish_candle": bearish_candle,
         "bull_score": bull_score,
@@ -3942,136 +3348,11 @@ def analyze(df, client, symbol):
         "side": side,
         "signal": signal,
         "sentiment": sentiment,
-        "context_valid": context_valid,
-        "context_reason": context_reason,
     }
 
     return side, data
 
-_option_search_cache: "dict[tuple, dict]" = {}
-
-
-def _option_search_price_bucket(price):
-    """Quantize price into a fixed-width bucket so the cache tolerates small ticks
-    but still refreshes once the underlying has moved meaningfully.
-    """
-    price = float(price or 0.0)
-    if price >= 500:
-        step = 0.50
-    elif price >= 100:
-        step = 0.10
-    else:
-        step = 0.02
-    return round(price / step) if step > 0 else 0
-
-
-def _liquidity_tier(symbol):
-    """Shadow classification only — does not gate anything yet. Lets us log what
-    tier-based thresholds would decide before committing to new hard numbers.
-    """
-    symbol = str(symbol or "").upper()
-    if symbol in ETF_SYMBOLS:
-        return "ETF"
-    if symbol in MEGA_LIQUID_SYMBOLS:
-        return "MEGA_LIQUID"
-    return "STANDARD"
-
-
-def _shadow_tier_liquidity_check(symbol, oi, vol, spread_pct):
-    """Log-only: what a symbol-class-aware liquidity rule would decide, so real
-    thresholds can eventually be set from evidence instead of intuition.
-    """
-    tier = _liquidity_tier(symbol)
-    thresholds = TIER_LIQUIDITY_THRESHOLDS.get(tier, TIER_LIQUIDITY_THRESHOLDS["STANDARD"])
-    would_pass = (
-        spread_pct <= thresholds["max_spread_pct"]
-        and (oi >= thresholds["min_oi"] or vol >= thresholds["min_volume"])
-    )
-    log(
-        f"[{symbol}] [SHADOW TIER={tier}] would_pass={would_pass} "
-        f"(oi={oi}>={thresholds['min_oi']} or vol={vol}>={thresholds['min_volume']}, "
-        f"spread={spread_pct*100:.1f}%<={thresholds['max_spread_pct']*100:.0f}%)"
-    )
-
-
-def _log_contract_data_quality(symbol, candidate):
-    """Measurement only: distinguish live quote/trade data from stale OI metadata
-    so a rejection can be attributed to genuine illiquidity vs. a data-freshness gap.
-    """
-    try:
-        bid = float(candidate.get("bid", 0.0) or 0.0)
-        ask = float(candidate.get("ask", 0.0) or 0.0)
-        bid_size = int(candidate.get("bid_size", 0) or 0)
-        ask_size = int(candidate.get("ask_size", 0) or 0)
-        mid = (bid + ask) / 2 if (bid + ask) > 0 else 0.0
-        spread_pct = float(candidate.get("spread_pct", 0.0) or 0.0)
-        vol = int(candidate.get("volume", 0) or 0)
-        oi = int(candidate.get("open_interest", 0) or 0)
-        oi_date_raw = str(candidate.get("open_interest_date", "") or "")
-        oi_age_days = "unknown"
-        try:
-            if oi_date_raw:
-                oi_age_days = (date.today() - date.fromisoformat(oi_date_raw[:10])).days
-        except Exception:
-            oi_age_days = "unknown"
-        quote_ts = candidate.get("quote_timestamp")
-        trade_ts = candidate.get("trade_timestamp")
-        log(
-            f"[{symbol}] Contract data check: {candidate.get('contract', '')} "
-            f"bid=${bid:.2f}({bid_size}) ask=${ask:.2f}({ask_size}) mid=${mid:.2f} spread={spread_pct*100:.1f}% "
-            f"quote_ts={quote_ts or 'unavailable'} trade_ts={trade_ts or 'unavailable'} "
-            f"day_vol={vol} oi={oi} oi_asof={oi_date_raw or 'unknown'} oi_age_days={oi_age_days}"
-        )
-        _shadow_tier_liquidity_check(symbol, oi, vol, spread_pct)
-    except Exception as e:
-        log(f"[{symbol}] Contract data quality logging failed (non-blocking): {e}")
-
-
 def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_from_vwap=None):
-    """Cached wrapper around ``_get_option_contract_uncached``.
-
-    Short-lived cache only — never changes which contract is selected or rejected,
-    it just avoids re-running the same expensive Alpaca chain/snapshot query within
-    a few seconds of an identical prior search.
-    """
-    if not OPTION_SEARCH_CACHE_ENABLED:
-        primary = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=MIN_DTE, search_max_dte=MAX_DTE)
-        if primary is not None or FALLBACK_MAX_DTE <= MAX_DTE:
-            return primary
-        fallback_min = max(MIN_DTE, MAX_DTE + 1)
-        log(f"[{symbol}] No tradeable contract in {MIN_DTE}-{MAX_DTE} DTE; extending search to {fallback_min}-{FALLBACK_MAX_DTE} DTE.")
-        return _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=fallback_min, search_max_dte=FALLBACK_MAX_DTE)
-
-    setup_type = str((data or {}).get("entry_playbook", "") or (data or {}).get("setup_type", "") or "")
-    bar_time = (data or {}).get("bar_time")
-    if setup_type and bar_time is not None:
-        cache_key = (symbol, signal, setup_type, bar_time)
-    else:
-        cache_key = (symbol, signal, _option_search_price_bucket(underlying_price))
-    now = datetime.now(central)
-    cached = _option_search_cache.get(cache_key)
-    if cached and cached["expires_at"] > now:
-        log(f"[{symbol}] Contract search cache hit ({signal}) — reusing result from {(now - cached['cached_at']).total_seconds():.0f}s ago.")
-        return cached["result"]
-
-    result = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=MIN_DTE, search_max_dte=MAX_DTE)
-    if result is None and FALLBACK_MAX_DTE > MAX_DTE:
-        fallback_min = max(MIN_DTE, MAX_DTE + 1)
-        log(f"[{symbol}] No tradeable contract in {MIN_DTE}-{MAX_DTE} DTE; extending search to {fallback_min}-{FALLBACK_MAX_DTE} DTE.")
-        result = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=fallback_min, search_max_dte=FALLBACK_MAX_DTE)
-    is_negative = result is None
-    ttl_seconds = OPTION_SEARCH_NEGATIVE_CACHE_TTL_SECONDS if is_negative else OPTION_SEARCH_CACHE_TTL_SECONDS
-    if is_negative:
-        log(f"[{symbol}] Contract search found no valid contract — caching negative result for only {ttl_seconds}s (not the full {OPTION_SEARCH_CACHE_TTL_SECONDS}s).")
-    _option_search_cache[cache_key] = {
-        "result": result,
-        "cached_at": now,
-        "expires_at": now + timedelta(seconds=max(1, ttl_seconds)),
-    }
-    return result
-
-
-def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, max_ext_from_vwap=None, search_min_dte=None, search_max_dte=None):
     """Fetch the best available >=MIN_DTE option contract from Alpaca.
 
     When ``data`` and ``max_ext_from_vwap`` are provided, run entry-quality prechecks
@@ -4082,10 +3363,8 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
         return None
     try:
         today = date.today()
-        effective_min_dte = MIN_DTE if search_min_dte is None else max(MIN_DTE, int(search_min_dte))
-        effective_max_dte = MAX_DTE if search_max_dte is None else int(search_max_dte)
-        min_exp = today + timedelta(days=effective_min_dte)
-        max_exp = today + timedelta(days=effective_max_dte) if effective_max_dte > 0 else None
+        min_exp = today + timedelta(days=MIN_DTE)
+        max_exp = today + timedelta(days=MAX_DTE) if MAX_DTE > 0 else None
         option_type = "call" if signal == "CALL" else "put"
 
         req_kwargs = {
@@ -4112,42 +3391,7 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
             )
         exp_range = f"{min_exp}–{max_exp}" if max_exp is not None else f">={min_exp}"
         if not contracts:
-            strike_lo = round(underlying_price * 0.95, 2)
-            strike_hi = round(underlying_price * 1.05, 2)
-            print(
-                f"[{symbol}] No option contracts found ({option_type}, expiry {exp_range}, "
-                f"strike [{strike_lo:.2f}, {strike_hi:.2f}]) — either NO_EXPIRATION_IN_WINDOW "
-                f"or NO_STRIKES_IN_WINDOW for this chain.",
-                flush=True,
-            )
-            # Diagnostic-only: same expiry window with no strike bound, to isolate whether
-            # the narrow +/-5% strike band (vs a genuine expiry-availability gap) is at fault.
-            # Never used for selection — logging only.
-            try:
-                diag_kwargs = dict(req_kwargs)
-                diag_kwargs.pop("strike_price_gte", None)
-                diag_kwargs.pop("strike_price_lte", None)
-                diag_result = _trading_client.get_option_contracts(GetOptionContractsRequest(**diag_kwargs))
-                diag_contracts = (
-                    diag_result if isinstance(diag_result, list)
-                    else (getattr(diag_result, "option_contracts", None) or getattr(diag_result, "contracts", None) or [])
-                )
-                if not diag_contracts:
-                    print(
-                        f"[{symbol}] DIAGNOSTIC: 0 contracts for {option_type} even with no strike bound "
-                        f"in expiry {exp_range} — this expiry window has no chain at all for this name.",
-                        flush=True,
-                    )
-                else:
-                    strikes = sorted({float(c.strike_price) for c in diag_contracts})
-                    print(
-                        f"[{symbol}] DIAGNOSTIC: {len(diag_contracts)} contract(s) exist for {option_type} in "
-                        f"expiry {exp_range} once strike bound is removed — available strikes "
-                        f"{strikes[:3]}...{strikes[-3:]} (band [{strike_lo:.2f}, {strike_hi:.2f}] excluded all of them).",
-                        flush=True,
-                    )
-            except Exception as diag_err:
-                print(f"[{symbol}] DIAGNOSTIC query failed (non-blocking): {diag_err}", flush=True)
+            print(f"[{symbol}] No option contracts found ({option_type}, {exp_range}).", flush=True)
             return None
 
         print(f"[{symbol}] {len(contracts)} contract(s) returned by Alpaca for {option_type} {exp_range}.", flush=True)
@@ -4211,8 +3455,6 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
             bid = ask = last = 0.0
             vol = 0
             last_trade_size = 0
-            bid_size = ask_size = 0
-            quote_ts = trade_ts = None
             oi = _safe_int(getattr(candidate, "open_interest", 0), 0)
             oi_date = str(getattr(candidate, "open_interest_date", "") or "")
             if snap:
@@ -4224,13 +3466,9 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
                 if q is not None:
                     bid = _safe_float(getattr(q, "bid_price", 0.0), 0.0)
                     ask = _safe_float(getattr(q, "ask_price", 0.0), 0.0)
-                    bid_size = _safe_int(getattr(q, "bid_size", 0), 0)
-                    ask_size = _safe_int(getattr(q, "ask_size", 0), 0)
-                    quote_ts = getattr(q, "timestamp", None)
                 if t is not None:
                     last = _safe_float(getattr(t, "price", 0.0), 0.0)
                     last_trade_size = _safe_int(getattr(t, "size", 0), 0)
-                    trade_ts = getattr(t, "timestamp", None)
                 # Daily bar volume is today's cumulative flow; last-trade size is a single print.
                 if daily is not None:
                     vol = _safe_int(getattr(daily, "volume", 0), 0)
@@ -4240,50 +3478,19 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
 
             dte = (exp_date - today).days
 
-            # NO_QUOTE is a data-integrity reject, distinct from a genuine thin-liquidity
-            # rejection: there's nothing to trade against at all, live or stale.
-            if bid <= 0.0 and ask <= 0.0:
-                _reject(f"[{symbol}] Contract {contract_sym} rejected — NO_QUOTE (no live bid/ask returned).")
-                continue
-
             if bid < min_bid:
                 _reject(f"[{symbol}] Contract {contract_sym} rejected — bid ${bid:.2f} < ${min_bid:.2f} minimum.")
                 continue
-
-            mid = (bid + ask) / 2 if (bid + ask) > 0 else 0.01
-            spread_pct = (ask - bid) / mid
 
             if not is_etf:
                 # In strict mode, accept stock contracts when either intraday volume OR OI passes minimum.
                 # In no-gating mode, bypass this liquidity gate and rely on bid/spread checks only.
                 if (not NO_GATING_MODE) and vol < STOCK_MIN_OPTION_VOLUME and oi < STOCK_MIN_OPTION_OPEN_INTEREST:
-                    liquidity_state, oi_age_days = _classify_liquidity_data_state(oi_date, vol)
-                    tight_live_market = bid > 0 and ask > 0 and spread_pct <= LIQUIDITY_SUBSTITUTE_MAX_SPREAD_PCT
-                    quote_age_seconds = None
-                    if quote_ts is not None:
-                        try:
-                            now_utc = datetime.now(timezone.utc)
-                            ts = quote_ts if quote_ts.tzinfo else quote_ts.replace(tzinfo=timezone.utc)
-                            quote_age_seconds = (now_utc - ts).total_seconds()
-                        except Exception:
-                            quote_age_seconds = None
-                    quote_is_fresh = quote_age_seconds is not None and quote_age_seconds <= LIQUIDITY_SUBSTITUTE_MAX_QUOTE_AGE_SECONDS
-
-                    if liquidity_state in ("LIQUIDITY_DATA_STALE", "LIQUIDITY_DATA_MISSING") and tight_live_market and quote_is_fresh:
-                        print(
-                            f"[{symbol}] LIQUIDITY SUBSTITUTE (discovery stage): {contract_sym} "
-                            f"metadata={liquidity_state} oi={oi} oi_date={oi_date or 'unknown'} volume={vol} "
-                            f"bid={bid:.2f} ask={ask:.2f} spread={spread_pct*100:.2f}% quote_age="
-                            f"{'unknown' if quote_age_seconds is None else f'{quote_age_seconds:.1f}s'}",
-                            flush=True,
-                        )
-                    else:
-                        _reject(
-                            f"[{symbol}] Contract {contract_sym} rejected — volume {vol} < {STOCK_MIN_OPTION_VOLUME} "
-                            f"and OI {oi} < {STOCK_MIN_OPTION_OPEN_INTEREST} [{liquidity_state}, "
-                            f"quote_age={quote_age_seconds if quote_age_seconds is not None else 'unknown'}]."
-                        )
-                        continue
+                    _reject(
+                        f"[{symbol}] Contract {contract_sym} rejected — volume {vol} < {STOCK_MIN_OPTION_VOLUME} "
+                        f"and OI {oi} < {STOCK_MIN_OPTION_OPEN_INTEREST}."
+                    )
+                    continue
                 if NO_GATING_MODE and vol < STOCK_MIN_OPTION_VOLUME and oi < STOCK_MIN_OPTION_OPEN_INTEREST:
                     print(
                         f"[{symbol}] No-gating override: accepting {contract_sym} despite low volume/OI "
@@ -4291,6 +3498,8 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
                         flush=True,
                     )
 
+            mid = (bid + ask) / 2 if (bid + ask) > 0 else 0.01
+            spread_pct = (ask - bid) / mid
             if spread_pct > max_spread_pct:
                 _reject(
                     f"[{symbol}] Contract {contract_sym} rejected — spread {spread_pct*100:.1f}% > {max_spread_pct*100:.0f}% max."
@@ -4305,15 +3514,11 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
                 "strike":        float(candidate.strike_price),
                 "bid":           bid,
                 "ask":           ask,
-                "bid_size":      bid_size,
-                "ask_size":      ask_size,
                 "last":          last,
                 "volume":        vol,
                 "last_trade_size": last_trade_size,
                 "open_interest": oi,
                 "open_interest_date": oi_date,
-                "quote_timestamp": quote_ts,
-                "trade_timestamp": trade_ts,
                 "delta":         delta_val,
                 "spread_pct":    spread_pct,
                 "slippage_est":  slippage_est,
@@ -4343,44 +3548,6 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
                     continue
 
             passed_candidates.append(option_candidate)
-
-        # Hard delta filter — never select a contract outside the acceptable delta band
-        # (e.g. a 0.13-delta lottery ticket) just because it has better OI/spread.
-        # Rejecting the contract only skips this expiry/type search, not the underlying setup —
-        # the caller still searches other expiries/strikes before giving up on the trade.
-        if passed_candidates:
-            in_delta_band = [
-                c for c in passed_candidates
-                if OPTION_ACCEPTABLE_DELTA_MIN <= abs(_safe_float(c.get("delta", 0.0), 0.0)) <= OPTION_ACCEPTABLE_DELTA_MAX
-            ]
-            if in_delta_band:
-                passed_candidates = in_delta_band
-            else:
-                # Below the acceptable band, allow through only with excellent liquidity —
-                # never on OI alone (this is exactly how the SPY 0.13-delta contract got picked).
-                fallback_band = [
-                    c for c in passed_candidates
-                    if OPTION_FALLBACK_DELTA_MIN <= abs(_safe_float(c.get("delta", 0.0), 0.0)) < OPTION_ACCEPTABLE_DELTA_MIN
-                    and _safe_float(c.get("volume", 0.0), 0.0) >= OPTION_FALLBACK_MIN_VOLUME
-                    and _safe_float(c.get("open_interest", 0.0), 0.0) >= OPTION_FALLBACK_MIN_OI
-                    and _safe_float(c.get("spread_pct", 1.0), 1.0) <= OPTION_FALLBACK_MAX_SPREAD_PCT
-                ]
-                if fallback_band:
-                    print(
-                        f"[{symbol}] No contracts in preferred delta band — using fallback delta "
-                        f"[{OPTION_FALLBACK_DELTA_MIN:.2f}, {OPTION_ACCEPTABLE_DELTA_MIN:.2f}) contract with "
-                        f"excellent liquidity.",
-                        flush=True,
-                    )
-                    passed_candidates = fallback_band
-                else:
-                    print(
-                        f"[{symbol}] No contracts within acceptable delta band "
-                        f"[{OPTION_ACCEPTABLE_DELTA_MIN:.2f}, {OPTION_ACCEPTABLE_DELTA_MAX:.2f}] or fallback band "
-                        f"({len(passed_candidates)} candidate(s) rejected on delta) — skipping this contract search.",
-                        flush=True,
-                    )
-                    passed_candidates = []
 
         if passed_candidates:
             # Prefer near-ATM contracts when available; fall back to full pool if not.
@@ -4414,7 +3581,6 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
                 f"rank={option_candidate_rank(best):.3f}",
                 flush=True,
             )
-            _log_contract_data_quality(symbol, best)
             return best
 
         if (
@@ -4432,7 +3598,6 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
                 f"reason={best_relaxed.get('_entry_precheck_reason', 'entry precheck failed')}",
                 flush=True,
             )
-            _log_contract_data_quality(symbol, best_relaxed)
             return best_relaxed
 
         if rejection_total > rejection_logged:
@@ -4562,13 +3727,7 @@ def one_minute_entry_timing(symbol, side, bars_1m, five_min_data):
         five_aligned = five_price > five_vwap and five_price > five_ema20 and five_price > five_ema50
         micro_high = float(recent["high"].iloc[:-1].max()) if len(recent) > 1 else float(prev["high"])
         pullback_touch = float(recent["low"].min()) <= ema9 * (1.0 + ONE_MINUTE_EMA9_TOUCH_TOLERANCE)
-        # Reclaim within the last N closed bars (not just the single latest bar vs. the
-        # immediately prior bar) — a bullish candle closing back above the pre-pullback
-        # high, with price still holding above EMA9 now.
-        reclaim_window = df.iloc[-ONE_MINUTE_RECLAIM_WINDOW_BARS:]
-        reclaim = bool(
-            ((reclaim_window["close"] > reclaim_window["open"]) & (reclaim_window["close"] > micro_high)).any()
-        ) and price > ema9
+        reclaim = price > float(prev["high"]) and price > ema9 and bullish
         near_vwap = abs(price - one_vwap) / max(price, 0.01) <= ONE_MINUTE_LEVEL_RETEST_TOLERANCE
         level_retest = float(latest["low"]) <= micro_high * (1.0 + ONE_MINUTE_LEVEL_RETEST_TOLERANCE) and price > micro_high and bullish
         compression_window = df.iloc[-4:-1]
@@ -4578,8 +3737,7 @@ def one_minute_entry_timing(symbol, side, bars_1m, five_min_data):
             compression = rng <= ONE_MINUTE_COMPRESSION_PCT
         momentum_break = compression and price > float(compression_window["high"].max()) and bullish and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO
 
-        trigger_move_pct = abs(price - float(prev["close"])) / max(abs(float(prev["close"])), 0.01) if float(prev["close"]) else 0.0
-        if five_aligned and ema9_slope > 0 and pullback_touch and reclaim and (near_vwap or price > five_vwap) and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO and trigger_move_pct >= ONE_MINUTE_MIN_TRIGGER_MOVE_PCT:
+        if five_aligned and ema9_slope > 0 and pullback_touch and reclaim and (near_vwap or price > five_vwap):
             return "FIRST_PULLBACK", f"1m EMA9 pullback/reclaim confirmed; volx={vol_ratio:.2f}"
         if five_aligned and level_retest and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO:
             return "BREAKOUT_RETEST", f"1m breakout retest confirmed; volx={vol_ratio:.2f}"
@@ -4594,12 +3752,7 @@ def one_minute_entry_timing(symbol, side, bars_1m, five_min_data):
     five_aligned = five_price < five_vwap and five_price < five_ema20 and five_price < five_ema50
     micro_low = float(recent["low"].iloc[:-1].min()) if len(recent) > 1 else float(prev["low"])
     pullback_touch = float(recent["high"].max()) >= ema9 * (1.0 - ONE_MINUTE_EMA9_TOUCH_TOLERANCE)
-    # Mirror of the CALL-side reclaim window: bearish candle closing back below the
-    # pre-bounce low within the last N bars, with price still holding below EMA9 now.
-    reclaim_window = df.iloc[-ONE_MINUTE_RECLAIM_WINDOW_BARS:]
-    reclaim = bool(
-        ((reclaim_window["close"] < reclaim_window["open"]) & (reclaim_window["close"] < micro_low)).any()
-    ) and price < ema9
+    reclaim = price < float(prev["low"]) and price < ema9 and bearish
     near_vwap = abs(price - one_vwap) / max(price, 0.01) <= ONE_MINUTE_LEVEL_RETEST_TOLERANCE
     level_retest = float(latest["high"]) >= micro_low * (1.0 - ONE_MINUTE_LEVEL_RETEST_TOLERANCE) and price < micro_low and bearish
     compression_window = df.iloc[-4:-1]
@@ -4609,8 +3762,7 @@ def one_minute_entry_timing(symbol, side, bars_1m, five_min_data):
         compression = rng <= ONE_MINUTE_COMPRESSION_PCT
     momentum_break = compression and price < float(compression_window["low"].min()) and bearish and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO
 
-    trigger_move_pct = abs(price - float(prev["close"])) / max(abs(float(prev["close"])), 0.01) if float(prev["close"]) else 0.0
-    if five_aligned and ema9_slope < 0 and pullback_touch and reclaim and (near_vwap or price < five_vwap) and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO and trigger_move_pct >= ONE_MINUTE_MIN_TRIGGER_MOVE_PCT:
+    if five_aligned and ema9_slope < 0 and pullback_touch and reclaim and (near_vwap or price < five_vwap):
         return "FIRST_PULLBACK", f"1m EMA9 pullback/reclaim confirmed; volx={vol_ratio:.2f}"
     if five_aligned and level_retest and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO:
         return "BREAKOUT_RETEST", f"1m breakdown retest confirmed; volx={vol_ratio:.2f}"
@@ -4704,26 +3856,6 @@ def _safe_int_num(v, default=0):
         return default
 
 
-def _classify_liquidity_data_state(oi_date_raw, day_volume):
-    """Distinguish stale/missing OI+volume metadata from genuinely bad liquidity.
-
-    Returns (state, oi_age_days). A stale/missing classification lets a tight live
-    bid/ask stand in as evidence of real tradability instead of an absolute veto.
-    """
-    oi_age_days = None
-    try:
-        if oi_date_raw:
-            oi_age_days = (date.today() - date.fromisoformat(str(oi_date_raw)[:10])).days
-    except Exception:
-        oi_age_days = None
-
-    if not oi_date_raw and day_volume <= 0:
-        return "LIQUIDITY_DATA_MISSING", oi_age_days
-    if oi_age_days is not None and oi_age_days >= 1 and day_volume <= 0:
-        return "LIQUIDITY_DATA_STALE", oi_age_days
-    return "LIQUIDITY_ACTUALLY_BAD", oi_age_days
-
-
 def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
     """Final must-pass checklist after an option contract has been selected."""
     if not option:
@@ -4796,9 +3928,8 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
             )
 
     dte = _safe_int_num((option or {}).get("dte", 0), 0)
-    effective_entry_max_dte = max(MAX_DTE, FALLBACK_MAX_DTE) if FALLBACK_MAX_DTE > 0 else MAX_DTE
-    if effective_entry_max_dte > 0 and dte > effective_entry_max_dte:
-        return False, f"DTE {dte} > max {effective_entry_max_dte}"
+    if MAX_DTE > 0 and dte > MAX_DTE:
+        return False, f"DTE {dte} > max {MAX_DTE}"
 
     oi = _safe_int_num((option or {}).get("open_interest", 0), 0)
     min_oi = ETF_ENTRY_MIN_OPTION_OI if symbol in ETF_SYMBOLS else STOCK_ENTRY_MIN_OPTION_OI
@@ -4827,43 +3958,11 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
     if oi < min_oi:
         day_volume = _safe_int_num((option or {}).get("volume", 0), 0)
         if not (ENTRY_VOLUME_SUBSTITUTES_OI and day_volume >= ENTRY_MIN_OPTION_DAY_VOLUME):
-            oi_date_raw = str((option or {}).get("open_interest_date", "") or "")
-            liquidity_state, oi_age_days = _classify_liquidity_data_state(oi_date_raw, day_volume)
-            bid_now = _safe_float_num((option or {}).get("bid", 0.0), 0.0)
-            ask_now = _safe_float_num((option or {}).get("ask", 0.0), 0.0)
-            mid_now = (bid_now + ask_now) / 2.0 if (bid_now + ask_now) > 0 else 0.0
-            live_spread_pct = ((ask_now - bid_now) / mid_now) if mid_now > 0 else float("inf")
-            tight_live_market = bid_now > 0 and ask_now > 0 and live_spread_pct <= LIQUIDITY_SUBSTITUTE_MAX_SPREAD_PCT
-
-            # A tight spread on a stale quote is meaningless — the substitute only counts
-            # if the quote itself was pulled recently. Missing timestamp fails closed.
-            quote_ts = (option or {}).get("quote_timestamp")
-            quote_age_seconds = None
-            if quote_ts is not None:
-                try:
-                    now_utc = datetime.now(timezone.utc)
-                    ts = quote_ts if quote_ts.tzinfo else quote_ts.replace(tzinfo=timezone.utc)
-                    quote_age_seconds = (now_utc - ts).total_seconds()
-                except Exception:
-                    quote_age_seconds = None
-            quote_is_fresh = quote_age_seconds is not None and quote_age_seconds <= LIQUIDITY_SUBSTITUTE_MAX_QUOTE_AGE_SECONDS
-
-            if liquidity_state in ("LIQUIDITY_DATA_STALE", "LIQUIDITY_DATA_MISSING") and tight_live_market and quote_is_fresh:
-                log(
-                    f"[{symbol}] LIQUIDITY SUBSTITUTE: metadata={liquidity_state} oi={oi} "
-                    f"oi_date={oi_date_raw or 'unknown'} volume={day_volume} bid={bid_now:.2f} "
-                    f"ask={ask_now:.2f} spread={live_spread_pct*100:.2f}% quote_age={quote_age_seconds:.1f}s"
-                )
-                if isinstance(option, dict):
-                    option["_liquidity_substitute_used"] = True
-                    option["_liquidity_substitute_mid"] = mid_now
-            else:
-                fail_reason = "quote too stale" if (tight_live_market and not quote_is_fresh) else liquidity_state
-                return False, (
-                    f"open interest {oi} (as of {oi_date_raw or 'unknown'}) < {min_oi} "
-                    f"and day volume {day_volume} < {ENTRY_MIN_OPTION_DAY_VOLUME} "
-                    f"[{fail_reason}, quote_age={quote_age_seconds if quote_age_seconds is not None else 'unknown'}]"
-                )
+            oi_date = str((option or {}).get("open_interest_date", "") or "unknown")
+            return False, (
+                f"open interest {oi} (as of {oi_date}) < {min_oi} "
+                f"and day volume {day_volume} < {ENTRY_MIN_OPTION_DAY_VOLUME}"
+            )
 
     bid = _safe_float_num((option or {}).get("bid", 0.0), 0.0)
     ask = _safe_float_num((option or {}).get("ask", 0.0), 0.0)
@@ -5332,7 +4431,6 @@ def _fetch_stocktwits_trending_symbols():
             headers={"Accept": "application/json", "User-Agent": "stock-ai-agent/1.0"},
         )
         if resp.status_code != 200:
-            log(f"[TRENDING] Stocktwits fetch failed: HTTP {resp.status_code} — {resp.text[:150]}")
             return []
         payload = resp.json() or {}
         raw_items = payload.get("symbols") if isinstance(payload, dict) else []
@@ -5345,13 +4443,8 @@ def _fetch_stocktwits_trending_symbols():
                     sym = str(item or "").upper().strip()
                 if sym:
                     out.append(sym)
-        if not out:
-            log(f"[TRENDING] Stocktwits returned HTTP 200 but 0 usable symbols (payload keys: {list(payload.keys()) if isinstance(payload, dict) else type(payload)}).")
-        else:
-            log(f"[TRENDING] Stocktwits returned {len(out)} symbol(s): {', '.join(out[:10])}")
         return out
-    except Exception as e:
-        log(f"[TRENDING] Stocktwits fetch exception: {type(e).__name__}: {e}")
+    except Exception:
         return []
 
 
@@ -5379,12 +4472,6 @@ def get_trending_symbols(client, base_symbols):
     for path, params in screener_sources:
         payload = _alpaca_data_get_json(path, params=params, timeout=8)
         items = _extract_screener_items(payload)
-        if payload is None:
-            log(f"[TRENDING] Alpaca screener {path} returned no payload (request failed or non-200).")
-        elif not items:
-            log(f"[TRENDING] Alpaca screener {path} returned 0 usable items (payload keys: {list(payload.keys()) if isinstance(payload, dict) else type(payload)}).")
-        else:
-            log(f"[TRENDING] Alpaca screener {path} returned {len(items)} raw item(s).")
         for idx, item in enumerate(items):
             sym = str(item.get("symbol") or item.get("ticker") or "").upper().strip()
             if not sym or sym in ETF_SYMBOLS or sym in base_set:
@@ -6288,11 +5375,6 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "stop_pct":   stop_pct,
         "score":      score,
         "max_pnl_pct": 0.0,
-        "min_pnl_pct": 0.0,
-        "underlying_mfe_pct": 0.0,
-        "underlying_mae_pct": 0.0,
-        "score_deterioration_first_ts": None,
-        "score_deterioration_cycles": 0,
         "runner_profile": bool(runner_profile.get("runner_profile", False)),
         "partial_tp_pct": partial_tp_pct,
         "partial_close_fraction": partial_close_fraction,
@@ -6317,15 +5399,6 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "setup_type": setup_type,
         "entry_ignition_delta": ignition_delta,
         "entry_option_oi": option_oi,
-        "entry_atr14": _safe_float_num((data or {}).get("atr14", 0.0), 0.0),
-        "entry_support_level": ((data or {}).get("support_level") or {}).get("level") if isinstance((data or {}).get("support_level"), dict) else None,
-        "entry_support_touches": ((data or {}).get("support_level") or {}).get("touches") if isinstance((data or {}).get("support_level"), dict) else None,
-        "entry_support_strength": ((data or {}).get("support_level") or {}).get("strength") if isinstance((data or {}).get("support_level"), dict) else None,
-        "entry_support_distance_atr": ((data or {}).get("support_level") or {}).get("distance_atr") if isinstance((data or {}).get("support_level"), dict) else None,
-        "entry_resistance_level": ((data or {}).get("resistance_level") or {}).get("level") if isinstance((data or {}).get("resistance_level"), dict) else None,
-        "entry_resistance_touches": ((data or {}).get("resistance_level") or {}).get("touches") if isinstance((data or {}).get("resistance_level"), dict) else None,
-        "entry_resistance_strength": ((data or {}).get("resistance_level") or {}).get("strength") if isinstance((data or {}).get("resistance_level"), dict) else None,
-        "entry_resistance_distance_atr": ((data or {}).get("resistance_level") or {}).get("distance_atr") if isinstance((data or {}).get("resistance_level"), dict) else None,
         "opened_at":  datetime.now(central),
         "status":     "OPEN",
         "entry_message_id": None,
@@ -6622,109 +5695,30 @@ def get_current_option_price(trade):
         return None
 
 
-def _underlying_thesis_state(trade):
-    """Return thesis status from underlying structure, independent of option premium PnL."""
+def _momentum_failed(trade):
+    """Return True when underlying structure no longer supports the open side."""
+    if _option_client is None:
+        return False
     try:
-        symbol = str(trade.get("underlying", "") or "").upper()
+        symbol = str(trade.get("underlying", "") or "")
         side = str(trade.get("side", "") or "").upper()
         if not symbol or side not in ("CALL", "PUT"):
-            return {"ready": False, "invalid": False, "reason": "MISSING TRADE CONTEXT", "price": 0.0, "vwap": 0.0, "ema20": 0.0}
+            return False
 
         client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
         bars = fetch_bars(client, symbol)
-        if bars is None or bars.empty or len(bars) < 30:
-            return {"ready": False, "invalid": False, "reason": "NO UNDERLYING BARS", "price": 0.0, "vwap": 0.0, "ema20": 0.0}
-
-        # Keep a raw copy because analyze() computes the same score engine used by
-        # live entries. This lets the exit manager react when the original thesis
-        # score collapses even before a hard VWAP/EMA structure break occurs.
-        raw_bars = bars.copy()
+        if bars is None or bars.empty or len(bars) < 25:
+            return False
         df = calculate_indicators(bars)
-        if df is None or df.empty or len(df) < 8:
-            return {"ready": False, "invalid": False, "reason": "INSUFFICIENT INDICATORS", "price": 0.0, "vwap": 0.0, "ema20": 0.0}
-
         latest = df.iloc[-1]
-        price = _safe_float_num(latest.get("close"), 0.0)
-        vwap = _safe_float_num(latest.get("VWAP"), price)
-        ema20 = _safe_float_num(latest.get("EMA20"), price)
-        if price <= 0 or vwap <= 0 or ema20 <= 0:
-            return {"ready": False, "invalid": False, "reason": "INVALID INDICATOR VALUES", "price": price, "vwap": vwap, "ema20": ema20}
-
-        ema20_back = _safe_float_num(df["EMA20"].iloc[-4], ema20)
-        ema20_slope_pct = ((ema20 - ema20_back) / ema20_back) if ema20_back else 0.0
-        recent_swing_low = _safe_float_num(df["low"].iloc[-6:-1].min(), price)
-        recent_swing_high = _safe_float_num(df["high"].iloc[-6:-1].max(), price)
-        setup = str(trade.get("setup_type", trade.get("entry_timing", "")) or "").upper()
-        entry_support = _safe_float_num(trade.get("entry_support_level"), 0.0)
-        entry_resistance = _safe_float_num(trade.get("entry_resistance_level"), 0.0)
-
-        current_side_score = None
-        current_opp_score = None
-        score_drop = None
-        score_deteriorated = False
-        if THESIS_SCORE_EXIT_ENABLED:
-            try:
-                _, score_data = analyze(raw_bars, client, symbol)
-                if score_data:
-                    if side == "CALL":
-                        current_side_score = int(score_data.get("bull_score", 0) or 0)
-                        current_opp_score = int(score_data.get("bear_score", 0) or 0)
-                        entry_side_score = int(trade.get("entry_bull_score", trade.get("score", 0)) or 0)
-                    else:
-                        current_side_score = int(score_data.get("bear_score", 0) or 0)
-                        current_opp_score = int(score_data.get("bull_score", 0) or 0)
-                        entry_side_score = int(trade.get("entry_bear_score", trade.get("score", 0)) or 0)
-                    score_drop = entry_side_score - current_side_score
-                    dominance = current_side_score - current_opp_score
-                    score_deteriorated = (
-                        score_drop >= THESIS_SCORE_DROP_POINTS
-                        and (current_side_score < THESIS_SCORE_CURRENT_FLOOR or dominance < THESIS_SCORE_MIN_DOMINANCE)
-                    )
-            except Exception as score_err:
-                log(f"[{symbol}] Thesis score check failed (structure check still active): {score_err}")
-
-        base_state = {
-            "ready": True, "price": price, "vwap": vwap, "ema20": ema20,
-            "current_side_score": current_side_score, "current_opp_score": current_opp_score,
-            "score_drop": score_drop, "score_deteriorated": score_deteriorated,
-        }
-
+        price = float(latest["close"])
+        vwap = float(latest["VWAP"]) if not pd.isna(latest["VWAP"]) else price
+        ema20 = float(latest["EMA20"]) if not pd.isna(latest["EMA20"]) else price
         if side == "CALL":
-            below_structure = price < (min(vwap, ema20) * (1.0 - max(0.0, THESIS_STRUCTURE_TOLERANCE_PCT)))
-            higher_low_broken = price < (recent_swing_low * (1.0 - max(0.0, THESIS_SWING_BREAK_TOLERANCE_PCT)))
-            breakout_fail = (
-                ("BREAKOUT" in setup or "CONTINUATION" in setup)
-                and entry_resistance > 0
-                and price < (entry_resistance * (1.0 - max(0.0, THESIS_LEVEL_TOLERANCE_PCT)))
-            )
-            regime_reversal = ema20_slope_pct <= -abs(THESIS_REVERSAL_SLOPE_PCT) and price < ema20
-
-            if breakout_fail:
-                return {**base_state, "invalid": True, "reason": "BREAKOUT/RETEST FAILED"}
-            if higher_low_broken and below_structure:
-                return {**base_state, "invalid": True, "reason": "HIGHER-LOW STRUCTURE BROKE"}
-            if below_structure and regime_reversal:
-                return {**base_state, "invalid": True, "reason": "LOST VWAP/EMA20 WITH REVERSAL"}
-            return {**base_state, "invalid": False, "reason": "CALL THESIS INTACT"}
-
-        above_structure = price > (max(vwap, ema20) * (1.0 + max(0.0, THESIS_STRUCTURE_TOLERANCE_PCT)))
-        lower_high_broken = price > (recent_swing_high * (1.0 + max(0.0, THESIS_SWING_BREAK_TOLERANCE_PCT)))
-        breakdown_fail = (
-            ("BREAKDOWN" in setup or "REJECT" in setup)
-            and entry_support > 0
-            and price > (entry_support * (1.0 + max(0.0, THESIS_LEVEL_TOLERANCE_PCT)))
-        )
-        regime_reversal = ema20_slope_pct >= abs(THESIS_REVERSAL_SLOPE_PCT) and price > ema20
-
-        if breakdown_fail:
-            return {**base_state, "invalid": True, "reason": "BREAKDOWN/RETEST FAILED"}
-        if lower_high_broken and above_structure:
-            return {**base_state, "invalid": True, "reason": "LOWER-HIGH STRUCTURE BROKE"}
-        if above_structure and regime_reversal:
-            return {**base_state, "invalid": True, "reason": "RECLAIMED VWAP/EMA20 WITH REVERSAL"}
-        return {**base_state, "invalid": False, "reason": "PUT THESIS INTACT"}
-    except Exception as e:
-        return {"ready": False, "invalid": False, "reason": f"THESIS CHECK ERROR: {e}", "price": 0.0, "vwap": 0.0, "ema20": 0.0}
+            return price < min(vwap, ema20)
+        return price > max(vwap, ema20)
+    except Exception:
+        return False
 
 
 def track_open_trades():
@@ -6785,7 +5779,6 @@ def track_open_trades():
         entry   = trade["entry"]
         pnl_pct = (current_price - entry) / entry if entry else 0.0
         trade["max_pnl_pct"] = max(float(trade.get("max_pnl_pct", 0.0)), pnl_pct)
-        trade["min_pnl_pct"] = min(float(trade.get("min_pnl_pct", 0.0)), pnl_pct)
         log(f"[{trade['underlying']}] {contract_sym} | "
             f"entry ${entry:.2f} (Alpaca) | current ${current_price:.2f} (Alpaca) | "
             f"PnL {pnl_pct * 100:+.2f}%")
@@ -6800,58 +5793,15 @@ def track_open_trades():
         trailing_giveback_pct = float(trade.get("trailing_giveback_pct", TRAILING_STOP_GIVEBACK_PCT) or TRAILING_STOP_GIVEBACK_PCT)
         held_minutes = max(1, int((datetime.now(central) - trade.get("opened_at", datetime.now(central))).total_seconds() // 60))
 
-        # 1) Primary exit: underlying thesis invalidation (not option PnL).
-        thesis_state = _underlying_thesis_state(trade)
-        if thesis_state.get("ready"):
-            trade["thesis_data_fail_count"] = 0
-            # Track underlying MFE/MAE independently of option premium.
-            underlying_now = _safe_float_num(thesis_state.get("price"), 0.0)
-            underlying_entry = _safe_float_num(trade.get("underlying_entry_price"), 0.0)
-            if underlying_now > 0 and underlying_entry > 0:
-                raw_move = (underlying_now - underlying_entry) / underlying_entry
-                directional_move = raw_move if str(trade.get("side", "")).upper() == "CALL" else -raw_move
-                trade["underlying_mfe_pct"] = max(float(trade.get("underlying_mfe_pct", 0.0)), directional_move)
-                trade["underlying_mae_pct"] = min(float(trade.get("underlying_mae_pct", 0.0)), directional_move)
+        # 1) Adaptive hard exits.
+        if pnl_pct >= target_pct:
+            close_trade(trade, current_price, "TARGET HIT", pnl_pct)
+            continue
+        if pnl_pct <= -stop_pct:
+            close_trade(trade, current_price, "STOP LOSS", pnl_pct)
+            continue
 
-            if thesis_state.get("invalid"):
-                close_trade(trade, current_price, f"THESIS INVALIDATION: {thesis_state.get('reason', 'STRUCTURE FAILED')}", pnl_pct)
-                continue
-
-            # Score deterioration must persist across cycles and time. This is the
-            # missing AAPL-style protection: STRONG -> WATCHLIST/NO TRADE collapse
-            # can exit before the emergency option-premium stop is reached.
-            if THESIS_SCORE_EXIT_ENABLED and thesis_state.get("score_deteriorated"):
-                now_ts = time.time()
-                if not trade.get("score_deterioration_first_ts"):
-                    trade["score_deterioration_first_ts"] = now_ts
-                    trade["score_deterioration_cycles"] = 1
-                else:
-                    trade["score_deterioration_cycles"] = int(trade.get("score_deterioration_cycles", 0)) + 1
-                persisted = now_ts - float(trade.get("score_deterioration_first_ts", now_ts))
-                cycles = int(trade.get("score_deterioration_cycles", 0))
-                log(f"[{trade['underlying']}] THESIS SCORE WARNING: side={thesis_state.get('current_side_score')} "
-                    f"opp={thesis_state.get('current_opp_score')} drop={thesis_state.get('score_drop')} "
-                    f"confirm={cycles}/{THESIS_SCORE_CONFIRM_CYCLES} age={persisted:.1f}s")
-                if cycles >= max(1, THESIS_SCORE_CONFIRM_CYCLES) and persisted >= max(0.0, THESIS_SCORE_CONFIRM_SECONDS):
-                    close_trade(
-                        trade, current_price,
-                        f"THESIS INVALIDATION: SCORE DETERIORATION "
-                        f"(drop={thesis_state.get('score_drop')}, side={thesis_state.get('current_side_score')}, "
-                        f"opp={thesis_state.get('current_opp_score')})",
-                        pnl_pct,
-                    )
-                    continue
-            else:
-                trade["score_deterioration_first_ts"] = None
-                trade["score_deterioration_cycles"] = 0
-        else:
-            miss_count = int(trade.get("thesis_data_fail_count", 0) or 0) + 1
-            trade["thesis_data_fail_count"] = miss_count
-            if EMERGENCY_DATA_FAIL_EXIT_ENABLED and miss_count >= max(1, EMERGENCY_DATA_FAIL_CYCLES):
-                close_trade(trade, current_price, "EMERGENCY EXIT: UNDERLYING DATA MONITORING FAILED", pnl_pct)
-                continue
-
-        # 2) Profit management: take partial profits first, then trail runner.
+        # 2) Take partial profit and let remainder run.
         if (not partial_taken) and current_price >= partial_target and int(trade.get("qty", 0) or 0) > 1:
             partial_qty = max(1, int(round(int(trade.get("qty", 0)) * max(0.1, min(0.9, partial_close_fraction)))))
             close_trade(trade, current_price, "PARTIAL TAKE PROFIT", pnl_pct, close_qty=partial_qty, final_close=False)
@@ -6859,48 +5809,20 @@ def track_open_trades():
             trade["stop"] = max(float(trade.get("stop", 0.0) or 0.0), float(trade.get("entry", 0.0) or 0.0) * 0.99)
             continue
 
-        # Single-lot trades cannot scale out; allow full target exit.
-        if (not partial_taken) and int(trade.get("qty", 0) or 0) <= 1 and pnl_pct >= target_pct:
-            close_trade(trade, current_price, "TARGET HIT", pnl_pct)
+        # 3) Momentum-failure exit for non-performing trades.
+        if MOMENTUM_FAIL_EXIT_ENABLED and pnl_pct <= MOMENTUM_FAIL_MIN_PNL_PCT and _momentum_failed(trade):
+            close_trade(trade, current_price, "MOMENTUM FAILURE", pnl_pct)
             continue
 
-        # 3) Runner trailing after partial take (underlying-based, not option-premium-based).
-        if partial_taken and thesis_state.get("ready"):
-            side = str(trade.get("side", "") or "").upper()
-            underlying_now = _safe_float_num(thesis_state.get("price"), 0.0)
-            trail_pct = max(0.0005, abs(RUNNER_UNDERLYING_TRAIL_PCT))
-            if side == "CALL" and underlying_now > 0:
-                peak = max(_safe_float_num(trade.get("runner_peak_underlying"), underlying_now), underlying_now)
-                trade["runner_peak_underlying"] = peak
-                if underlying_now <= peak * (1.0 - trail_pct):
-                    close_trade(trade, current_price, "RUNNER TRAIL HIT (UNDERLYING)", pnl_pct)
-                    continue
-            if side == "PUT" and underlying_now > 0:
-                trough = min(_safe_float_num(trade.get("runner_trough_underlying"), underlying_now) or underlying_now, underlying_now)
-                trade["runner_trough_underlying"] = trough
-                if underlying_now >= trough * (1.0 + trail_pct):
-                    close_trade(trade, current_price, "RUNNER TRAIL HIT (UNDERLYING)", pnl_pct)
-                    continue
-
-        # 3b) Independent option-P&L peak-giveback guard for the runner. The underlying
-        # can stay technically intact while delta/gamma/IV decay erodes most of the
-        # option's own peak gain — this protects that peak without replacing the
-        # underlying-based trail above.
-        if partial_taken:
-            runner_peak_pnl = float(trade.get("max_pnl_pct", pnl_pct) or pnl_pct)
-            if runner_peak_pnl >= RUNNER_PNL_TRAIL_ACTIVATE and pnl_pct <= (runner_peak_pnl - RUNNER_PNL_MAX_GIVEBACK):
-                close_trade(trade, current_price, "RUNNER PNL GIVEBACK STOP", pnl_pct)
-                continue
-
-        # 4) Emergency option-premium stop as risk backstop only.
-        if pnl_pct <= -stop_pct:
-            close_trade(trade, current_price, "EMERGENCY STOP LOSS", pnl_pct)
-            continue
-
-        # 5) Time stop: if the trade has sat too long, exit to avoid prolonged theta decay.
+        # 4) Time stop: if the trade has sat too long, get out before theta decay eats the thesis.
         if MAX_TRADE_HOLD_MINUTES > 0 and held_minutes >= MAX_TRADE_HOLD_MINUTES:
             close_trade(trade, current_price, f"TIME EXIT ({held_minutes}m)", pnl_pct)
             continue
+
+        # 5) Trailing stop after partial take.
+        max_seen = float(trade.get("max_pnl_pct", 0.0) or 0.0)
+        if partial_taken and max_seen > 0 and pnl_pct <= (max_seen - max(0.02, trailing_giveback_pct)):
+            close_trade(trade, current_price, "TRAILING STOP", pnl_pct)
 
 
 def _capture_exit_market_context(trade):
@@ -7067,31 +5989,16 @@ def _trade_exit_explanation(trade, reason, entry_price, exit_price, pnl_pct, mar
     if reason_text == "TARGET HIT":
         target_pct = float(trade.get("target_pct", PROFIT_TARGET_PCT) or PROFIT_TARGET_PCT) * 100
         return f"The {side} idea followed through. {structure_text}. {price_move}; the +{target_pct:.0f}% target was reached."
-    if reason_text.startswith("THESIS INVALIDATION"):
-        return f"The {side} idea was exited because the underlying thesis broke. {structure_text}. {price_move}."
     if reason_text == "STOP LOSS":
         stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT) * 100
         if structure_failed:
             return f"The {side} idea lost support. {structure_text}. {price_move}, so the -{stop_pct:.0f}% risk stop closed it."
         return f"The option weakened before the underlying trend clearly broke. {structure_text}. {price_move}; the -{stop_pct:.0f}% risk stop closed it."
-    if reason_text == "EMERGENCY STOP LOSS":
-        stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT) * 100
-        return f"Emergency risk backstop triggered at -{stop_pct:.0f}% option PnL. {structure_text}. {price_move}."
-    if reason_text.startswith("EMERGENCY EXIT"):
-        return f"Emergency risk protocol exited the trade because monitoring reliability degraded. {structure_text}. {price_move}."
     if reason_text == "MOMENTUM FAILURE":
         structure = "below VWAP and EMA20" if "CALL" in side else "above VWAP and EMA20"
         return f"The {side} idea lost momentum: price moved {structure}. {structure_text}. {price_move}."
     if reason_text == "PARTIAL TAKE PROFIT":
         return f"The {side} idea followed through. {structure_text}. {price_move}; the first profit objective was realized."
-    if reason_text.startswith("RUNNER TRAIL HIT"):
-        return f"The {side} runner gave back enough underlying progress to hit the trail. {structure_text}. {price_move}."
-    if reason_text == "RUNNER PNL GIVEBACK STOP":
-        peak_pct = float(trade.get("max_pnl_pct", pnl_pct) or pnl_pct) * 100
-        return (
-            f"The {side} runner's option profit peaked near +{peak_pct:.1f}% and gave back too much "
-            f"before the underlying thesis broke. {structure_text}. {price_move}."
-        )
     if reason_text == "TRAILING STOP":
         max_seen = float(trade.get("max_pnl_pct", pnl_pct) or pnl_pct) * 100
         return f"The initial {side} move worked, then gave back gains. {structure_text}. Profit retraced from +{max_seen:.2f}% and the trailing stop closed it."
@@ -7319,12 +6226,6 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     if not exit_confirmed:
         return
 
-    log(
-        f"[{trade.get('underlying')}] TRADE EXCURSION: option_MFE={float(trade.get('max_pnl_pct', 0.0))*100:+.2f}% "
-        f"option_MAE={float(trade.get('min_pnl_pct', 0.0))*100:+.2f}% "
-        f"underlying_MFE={float(trade.get('underlying_mfe_pct', 0.0))*100:+.2f}% "
-        f"underlying_MAE={float(trade.get('underlying_mae_pct', 0.0))*100:+.2f}%"
-    )
     exit_market_context = _capture_exit_market_context(trade)
     emoji = "\u2705" if pnl_pct > 0 else "\u274c"
     outcome_label = "PROFIT" if pnl_pct > 0 else "LOSS"
@@ -7381,13 +6282,6 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         )
 
     is_profit = combined_pnl_pct > 0
-    if final_close and not is_profit:
-        _record_post_loss_setup(
-            trade.get("underlying"),
-            trade.get("side", trade.get("signal", "").split()[-1] if trade.get("signal") else ""),
-            exit_market_context,
-            trade.get("entry_ignition_delta", 0),
-        )
     outcome_label = "PROFIT" if is_profit else "LOSS"
     exit_type_label = "Profit" if is_profit else "Loss"
     exit_icon = "\U0001f7e2" if is_profit else "\U0001f534"
@@ -7398,43 +6292,20 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     )
     outcome_reason_label = "Profit reason" if is_profit else "Loss reason"
 
-    short_reason = str(reason or "EXIT").split("|", 1)[0].strip()
-    if short_reason.startswith("THESIS INVALIDATION"):
-        short_reason = "THESIS INVALIDATED"
-    elif short_reason.startswith("EMERGENCY STOP LOSS"):
-        short_reason = "EMERGENCY OPTION STOP"
-    elif short_reason.startswith("RUNNER TRAIL HIT"):
-        short_reason = "RUNNER TRAILING STOP"
-    elif short_reason.startswith("RUNNER PNL GIVEBACK STOP"):
-        short_reason = "RUNNER PROFIT GIVEBACK"
-    elif short_reason.startswith("TIME EXIT"):
-        short_reason = "TIME EXIT"
-    is_partial = (not final_close and close_qty_int < current_qty)
-    shown_dollar = _combined_dollar if (final_close and _combined_cost > 0) else ((exit_px - entry_px) * close_qty_int * 100.0)
-    if abs(shown_dollar - int(round(shown_dollar))) < 0.005:
-        net_str = f"${int(round(shown_dollar)):+d}"
-    else:
-        net_str = f"${shown_dollar:+.2f}"
-
-    if is_partial:
-        status_icon = "\U0001f4b0"
-        net_icon = "\U0001f512" if shown_dollar >= 0 else "\U0001f534"
-        line1 = f"{status_icon} **{trade['underlying']} {trade['side']}** · {outcome_pnl_pct * 100:+.2f}% · PARTIAL"
-        line3 = f"{net_icon} {net_str}"
-    elif outcome_pnl_pct >= 0:
-        status_icon = "\u2705"
-        line1 = f"{status_icon} **{trade['underlying']} {trade['side']}** · {outcome_pnl_pct * 100:+.2f}%"
-        line3 = f"\U0001f4b0 {net_str}"
-    else:
-        status_icon = "\U0001f6d1"
-        line1 = f"{status_icon} **{trade['underlying']} {trade['side']}** · {outcome_pnl_pct * 100:+.2f}%"
-        line3 = f"\U0001f534 {net_str} · {short_reason}"
-
     exit_message = (
-        f"{line1}\n"
-        f"`${entry_px:.2f}` → `${exit_px:.2f}` · `{duration_min}m` · Qty `{close_qty_int}`\n"
-        f"{line3}\n"
-        f"Reason: {short_reason}"
+        f"{exit_icon} **{exit_type_label} — {exit_header} | {trade['side']} - {pnl_pct * 100:+.2f}%**\n"
+        f"\U0001f3f7\ufe0f **{exit_scope}**\n\n"
+        f"------------------------------\n"
+        f"\U0001f4b2 **Current Price:** `${exit_px:.2f}`\n"
+        f"\U0001f4e6 **Qty:** closed `{close_qty_int}/{current_qty}`"
+        f" | remaining `{remaining_qty}`\n"
+        f"\U0001f4ca **Trade:** `${entry_px:.2f} -> ${exit_px:.2f}` | `{duration_min}m`\n"
+        f"\U0001f4c9 **Result:** `{reason}`{combined_note}\n"
+        f"\U0001f9e0 **{outcome_reason_label}:** {exit_explanation}\n"
+        f"\U0001f3c6 **Grade:** `{grade}`\n\n"
+        f"\U0001f4cc **Outcome:** `{outcome_label} {outcome_pnl_pct * 100:+.2f}%`\n"
+        f"Opened: `{trade['opened_at']:%Y-%m-%d %H:%M:%S %Z}`\n"
+        f"Closed: `{closed_at:%Y-%m-%d %H:%M:%S %Z}`"
     )
     exit_color = DISCORD_COLOR_CALL if is_profit else DISCORD_COLOR_PUT
     exit_sent = send_discord_bot_reply(trade.get("entry_message_id"), exit_message, color=exit_color)
@@ -7545,45 +6416,6 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     log(f"[{trade['underlying']}] Closed {trade['contract']} ({reason}, {pnl_pct * 100:+.2f}%)")
 
 
-def _refresh_option_quote_before_execution(symbol, option):
-    """Re-pull a live snapshot for the selected contract right before submitting
-    an order. The contract-search cache can be up to OPTION_SEARCH_CACHE_TTL_SECONDS
-    old — this refresh prevents executing on a stale/since-widened quote.
-    """
-    if _option_client is None:
-        return True, "option client unavailable, skipping refresh (fail-open)"
-    contract_sym = str(option.get("contract", "") or "")
-    if not contract_sym:
-        return False, "no contract symbol to refresh"
-    try:
-        snap_req = OptionSnapshotRequest(symbol_or_symbols=contract_sym, feed=OPTIONS_FEED)
-        snaps = _option_client.get_option_snapshot(snap_req)
-        snap = snaps.get(contract_sym) if isinstance(snaps, dict) else snaps
-        if not snap:
-            return False, f"no live snapshot returned for {contract_sym}"
-        q = getattr(snap, "latest_quote", None) or getattr(snap, "quote", None)
-        if q is None:
-            return False, f"no live quote returned for {contract_sym}"
-        bid = _safe_float_num(getattr(q, "bid_price", 0.0), 0.0)
-        ask = _safe_float_num(getattr(q, "ask_price", 0.0), 0.0)
-        if bid <= 0.0 and ask <= 0.0:
-            return False, "NO_QUOTE on execution refresh"
-        mid = (bid + ask) / 2.0 if (bid + ask) > 0 else 0.01
-        spread_pct = (ask - bid) / mid
-        max_spread_pct = ETF_MAX_OPTION_SPREAD_PCT if symbol in ETF_SYMBOLS else STOCK_MAX_OPTION_SPREAD_PCT
-        if spread_pct > max_spread_pct:
-            return False, f"spread widened to {spread_pct*100:.1f}% > {max_spread_pct*100:.0f}% max on execution refresh"
-        daily = getattr(snap, "daily_bar", None)
-        if daily is not None:
-            option["volume"] = _safe_int_num(getattr(daily, "volume", option.get("volume", 0)), option.get("volume", 0))
-        option["bid"] = bid
-        option["ask"] = ask
-        option["spread_pct"] = spread_pct
-        return True, f"refreshed: bid=${bid:.2f} ask=${ask:.2f} spread={spread_pct*100:.1f}%"
-    except Exception as e:
-        return False, f"quote refresh failed: {type(e).__name__}: {e}"
-
-
 def try_open_paper_trade(symbol, side, option, data):
     """Open a paper trade if trading is enabled and we have capacity. Returns True if opened."""
     if not ENABLE_ALPACA_PAPER_TRADING:
@@ -7609,14 +6441,6 @@ def try_open_paper_trade(symbol, side, option, data):
         return False
     if _trading_client is None:
         return False
-
-    # The contract search result may be cached for up to OPTION_SEARCH_CACHE_TTL_SECONDS —
-    # re-validate the live quote/spread right before committing capital.
-    refresh_ok, refresh_reason = _refresh_option_quote_before_execution(symbol, option)
-    if not refresh_ok:
-        log(f"[{symbol}] Execution-time quote refresh failed for {option.get('contract', '')}: {refresh_reason} — skipping entry.")
-        return False
-    log(f"[{symbol}] Execution-time quote refresh: {refresh_reason}")
 
     score = int(data.get("effective_score", data["bull_score"] if side == "CALL" else data["bear_score"]))
     raw_score = int(data.get("raw_entry_score", score))
@@ -7669,16 +6493,6 @@ def try_open_paper_trade(symbol, side, option, data):
         log(f"[{symbol}] Order submitted but no fill confirmed within 5s — not tracking trade.")
         return False
 
-    if option.get("_liquidity_substitute_used"):
-        substitute_mid = _safe_float_num(option.get("_liquidity_substitute_mid", 0.0), 0.0)
-        slippage_vs_mid = (fill_price - substitute_mid) if substitute_mid > 0 else None
-        slippage_pct = (slippage_vs_mid / substitute_mid * 100.0) if (slippage_vs_mid is not None and substitute_mid > 0) else None
-        log(
-            f"[{symbol}] LIQUIDITY SUBSTITUTE FILL: contract={option.get('contract', '')} "
-            f"substitute_mid=${substitute_mid:.2f} entry_fill=${fill_price:.2f} "
-            f"slippage_vs_mid={'unknown' if slippage_vs_mid is None else f'${slippage_vs_mid:+.2f} ({slippage_pct:+.1f}%)'}"
-        )
-
     trade = open_trade_record(symbol, signal_label, option, score, fill_price, qty, data=data)
     _open_trades[trade["contract"]] = trade
     _record_trade_open_for_perf(datetime.now(central))
@@ -7728,25 +6542,18 @@ def try_open_paper_trade(symbol, side, option, data):
     entry_option_oi = int(trade.get("entry_option_oi", 0) or 0)
     underlying_entry_price = float(trade.get("underlying_entry_price", data.get("price", 0.0) or 0.0) or 0.0)
 
-    side_suffix = "C" if trade['side'] == 'CALL' else "P"
-    strike_contract = f"{strike_text}{side_suffix}"
-    primary_score = int(data.get("bull_score", score) if trade['side'] == 'CALL' else data.get("bear_score", score))
-    setup_compact = "PULLBACK" if "PULLBACK" in setup.upper() else ("BREAKOUT" if "BREAKOUT" in setup.upper() else setup.upper())
-    trigger_raw = str((trade.get("one_minute_trigger") or data.get("one_minute_trigger") or "") or "").upper()
-    if trigger_raw == "FIRST_PULLBACK":
-        trigger_compact = "1M RECLAIM + VOL"
-    elif trigger_raw == "BREAKOUT_RETEST":
-        trigger_compact = "RETEST CONFIRMED"
-    elif trigger_raw == "MOMENTUM_COMPRESSION":
-        trigger_compact = "COMPRESSION BREAK"
-    else:
-        trigger_compact = "SNIPER CONFIRMED"
-
     entry_msg = send_discord(
-        f"\U0001f3af **{trade['underlying']} {trade['side']}** · {expiry_mmdd} · {strike_contract}\n"
-        f"\U0001f4b5 `${trade['entry']:.2f}` · Spot `${underlying_entry_price:.2f}` · Qty `{trade['qty']}`\n"
-        f"\U0001f525 {'Bull' if trade['side'] == 'CALL' else 'Bear'} `{primary_score}` · {setup_compact} · {trigger_compact}\n"
-        f"\U0001f3af `${target_1:.2f}` / `${target_2:.2f}` · \U0001f6e1\ufe0f `-{stop_pct:.0f}%` · `{trade['opened_at']:%H:%M CT}`",
+        f"\U0001f680 **ENTRY ALERT — {entry_header} | {trade['side']} | ${trade['entry']:.2f} | {expiry_mmdd}**\n\n"
+        f"------------------------------\n"
+        f"\U0001f3af **Underlying Entry:** `${underlying_entry_price:.2f}` | Timing: `{entry_timing}`\n"
+        f"\U0001f4ca **Setup:** `{setup}` | Score: `{score_line}`\n"
+        f"\U0001f3c6 **Entry Grade:** `{grade}` {'🟢' if grade == 'A' else '🔵' if grade == 'B' else '🟡' if grade == 'C' else '🔴'}\n"
+        f"⚡ **Why Now:** `{why_now_line}`\n"
+        f"\U0001f3af **Plan:** Entry `${trade['entry']:.2f}` | Partial `${target_1:.2f}` (+{partial_tp_pct*100:.0f}%) | "
+        f"Final `${target_2:.2f}` (+{target_pct:.0f}%) | Stop `-{stop_pct:.0f}%`\n"
+        f"🕐 **Opened:** `{trade['opened_at']:%Y-%m-%d %H:%M:%S %Z}`\n"
+        f"{news_context_block}\n\n"
+        f"\U0001f4cc **Action:** ENTERED (`{trade['qty']}` contract{'s' if trade['qty'] != 1 else ''})",
         color=DISCORD_COLOR_CALL if trade['side'] == 'CALL' else DISCORD_COLOR_PUT,
         wait_for_response=True,
         webhook_url=DISCORD_WEBHOOK_LIVE_TRADES_URL,
@@ -8095,21 +6902,9 @@ def run_symbol(client, symbol, prefetched_bars=None):
         data["promoted_quality_ok"] = False
 
     # Hard minimum score gate with dynamic threshold from regime + continuation quality.
-    # V2: this score is evidence feeding the unified Trend score, not an automatic veto —
-    # only enforced as a hard block in legacy (non-V2) mode.
-    enforce_hard_gate = (
-        HARD_SCORE_GATE_ENABLED
-        and (not (V2_ENTRY_QUALITY_ENABLED and TWO_PLAYBOOK_ENTRY_MODE))
-        and ((not NO_GATING_MODE) or HARD_SCORE_GATE_IN_NO_GATING_MODE)
+    enforce_hard_gate = HARD_SCORE_GATE_ENABLED and (
+        (not NO_GATING_MODE) or HARD_SCORE_GATE_IN_NO_GATING_MODE
     )
-    if HARD_SCORE_GATE_ENABLED and V2_ENTRY_QUALITY_ENABLED and TWO_PLAYBOOK_ENTRY_MODE:
-        side_score = data["bull_score"] if side == "CALL" else data["bear_score"]
-        min_required_score = min(BREAKOUT_MIN_SCORE, PULLBACK_MIN_SCORE)
-        if side_score < min_required_score:
-            log(
-                f"[{symbol}] Hard score gate (advisory under V2): {side} {side_score} < {min_required_score} "
-                "— not blocking, letting unified entry quality decide."
-            )
     if enforce_hard_gate:
         side_score = data["bull_score"] if side == "CALL" else data["bear_score"]
         min_required_score = (
@@ -8462,34 +7257,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE:
         playbook_ok, playbook, playbook_reason = playbook_entry_ok(side, data, symbol)
         if not playbook_ok:
-            if (
-                "1m sniper trigger not confirmed" in str(playbook_reason).lower()
-                and SNIPER_WATCH_ALERT_COOLDOWN_MINUTES > 0
-            ):
-                watch_key = (symbol, side)
-                watch_until = _sniper_watch_cooldowns.get(watch_key)
-                watch_now = datetime.now(central)
-                if watch_until is None or watch_now >= watch_until:
-                    side_score = int(data.get("bull_score", 0) if side == "CALL" else data.get("bear_score", 0))
-                    dominance = int((data.get("bull_score", 0) - data.get("bear_score", 0)) if side == "CALL" else (data.get("bear_score", 0) - data.get("bull_score", 0)))
-                    setup_guess = classify_entry_playbook(side, data)
-                    if setup_guess and side_score >= max(SCORE_SIGNAL, 60) and dominance >= max(10, SCORE_DOMINANCE - 2):
-                        setup_label = "PULLBACK READY" if "PULLBACK" in setup_guess else "BREAKOUT READY"
-                        wait_label = "1M RECLAIM + VOL" if "PULLBACK" in setup_guess else "RETEST CONFIRMED"
-                        watch_msg = (
-                            f"\U0001f440 **{symbol} {side}** · SNIPER WATCH\n"
-                            f"\U0001f525 {'Bull' if side == 'CALL' else 'Bear'} `{side_score}` · {setup_label}\n"
-                            f"\u23f3 Waiting: {wait_label}"
-                        )
-                        send_discord(
-                            watch_msg,
-                            color=DISCORD_COLOR_WARN,
-                            webhook_url=DISCORD_WEBHOOK_LIVE_TRADES_URL,
-                        )
-                        _sniper_watch_cooldowns[watch_key] = watch_now + timedelta(minutes=SNIPER_WATCH_ALERT_COOLDOWN_MINUTES)
-            reason_text = str(playbook_reason or "")
-            tag = "WAIT" if reason_text.startswith("ARMED_BREAKOUT_") else "BLOCKED"
-            log(f"[{symbol}] Playbook gate: {side} {tag} — {playbook_reason}.")
+            log(f"[{symbol}] Playbook gate: {side} blocked — {playbook_reason}.")
             return
         data["entry_playbook"] = playbook
         data["setup_type"] = playbook
@@ -8549,16 +7317,6 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         _alerted_today["keys"].add(alert_key)
 
-    if not NO_GATING_MODE:
-        fresh_ok, fresh_reason = fresh_setup_confirmed(symbol, side, data)
-        if not fresh_ok:
-            if ALERT_ONLY_COOLDOWN_MINUTES > 0:
-                _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
-            log(f"[{symbol}] Fresh-setup gate: {side} blocked — {fresh_reason}.")
-            return
-
-    log_v2_pre_contract_components(symbol, side, data)
-
     option = get_option_contract(
         symbol,
         side,
@@ -8590,29 +7348,6 @@ def run_symbol(client, symbol, prefetched_bars=None):
         _alerted_today["keys"].discard(alert_key)
         log(f"[{symbol}] Entry quality checklist blocked {side} — {entry_reason}.")
         return
-
-    if V2_ENTRY_QUALITY_ENABLED and not NO_GATING_MODE:
-        quality_ok, quality_score, quality_detail = unified_entry_quality_v2(symbol, side, data, option)
-        data["entry_quality_v2_score"] = quality_score
-        legacy_ok, legacy_detail = _legacy_shadow_verdict(symbol, side, data, option)
-        _log_entry_attribution(symbol, side, data, quality_ok, quality_score, legacy_ok, legacy_detail)
-        if not quality_ok:
-            if ALERT_ONLY_COOLDOWN_MINUTES > 0:
-                _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
-            _alerted_today["keys"].discard(alert_key)
-            log(f"[{symbol}] Entry quality V2 gate: {side} blocked — {quality_detail}.")
-            return
-        log(f"[{symbol}] Entry quality V2: {side} CONFIRMED — {quality_score:.1f}/100 ({quality_detail}).")
-    elif ENTRY_CONFLUENCE_ENABLED and not NO_GATING_MODE:
-        confluence_ok, confluence_points, confluence_detail = classify_entry_confluence(symbol, side, data, option)
-        data["entry_confluence_points"] = confluence_points
-        if not confluence_ok:
-            if ALERT_ONLY_COOLDOWN_MINUTES > 0:
-                _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
-            _alerted_today["keys"].discard(alert_key)
-            log(f"[{symbol}] Entry confluence gate: {side} blocked — {confluence_detail}.")
-            return
-        log(f"[{symbol}] Entry confluence: {side} CONFIRMED — {confluence_points:.1f}/12 ({confluence_detail}).")
 
     if TWO_PLAYBOOK_ENTRY_MODE:
         return {
