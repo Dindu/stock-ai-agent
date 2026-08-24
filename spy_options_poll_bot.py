@@ -387,7 +387,11 @@ V2_PRE_CONTRACT_LOG_ENABLED = os.getenv("V2_PRE_CONTRACT_LOG_ENABLED", "1") == "
 # (which can take 10-20s) for the same symbol/side/price within a short window.
 # Pure performance measure — does not change which contracts are selected/rejected.
 OPTION_SEARCH_CACHE_ENABLED = os.getenv("OPTION_SEARCH_CACHE_ENABLED", "1") == "1"
-OPTION_SEARCH_CACHE_TTL_SECONDS = int(os.getenv("OPTION_SEARCH_CACHE_TTL_SECONDS", "45"))
+OPTION_SEARCH_CACHE_TTL_SECONDS = int(os.getenv("OPTION_SEARCH_CACHE_TTL_SECONDS", "20"))
+# A "no valid contract" result must expire much faster than a successful selection —
+# option quotes/spreads can turn tradable again within seconds, and an entry-ready
+# candidate (playbook already passed) should never be killed by a stale negative.
+OPTION_SEARCH_NEGATIVE_CACHE_TTL_SECONDS = int(os.getenv("OPTION_SEARCH_NEGATIVE_CACHE_TTL_SECONDS", "4"))
 # Fresh-setup-after-loss: require new evidence before re-entering the same (symbol, side)
 # after a stop-out, instead of a blanket block or an unconditional re-entry.
 FRESH_SETUP_AFTER_LOSS_ENABLED = os.getenv("FRESH_SETUP_AFTER_LOSS_ENABLED", "1") == "1"
@@ -4014,10 +4018,14 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
         return cached["result"]
 
     result = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap)
+    is_negative = result is None
+    ttl_seconds = OPTION_SEARCH_NEGATIVE_CACHE_TTL_SECONDS if is_negative else OPTION_SEARCH_CACHE_TTL_SECONDS
+    if is_negative:
+        log(f"[{symbol}] Contract search found no valid contract — caching negative result for only {ttl_seconds}s (not the full {OPTION_SEARCH_CACHE_TTL_SECONDS}s).")
     _option_search_cache[cache_key] = {
         "result": result,
         "cached_at": now,
-        "expires_at": now + timedelta(seconds=max(1, OPTION_SEARCH_CACHE_TTL_SECONDS)),
+        "expires_at": now + timedelta(seconds=max(1, ttl_seconds)),
     }
     return result
 
