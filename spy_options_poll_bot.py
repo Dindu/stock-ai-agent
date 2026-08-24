@@ -354,6 +354,9 @@ V2_ENTRY_WEIGHT_CONTRACT = float(os.getenv("V2_ENTRY_WEIGHT_CONTRACT", "10.0"))
 # LEGACY_ONLY (legacy would have taken it, V2 rejects it).
 V2_ATTRIBUTION_LOG_ENABLED = os.getenv("V2_ATTRIBUTION_LOG_ENABLED", "1") == "1"
 V2_ATTRIBUTION_LOG_FILE = os.getenv("V2_ATTRIBUTION_LOG_FILE", "v2_entry_attribution_log.csv")
+# Measurement only — logs Trend/Location/Setup/Trigger/Context before contract search,
+# so a rejected contract search doesn't hide what V2 saw in the underlying setup.
+V2_PRE_CONTRACT_LOG_ENABLED = os.getenv("V2_PRE_CONTRACT_LOG_ENABLED", "1") == "1"
 # Fresh-setup-after-loss: require new evidence before re-entering the same (symbol, side)
 # after a stop-out, instead of a blanket block or an unconditional re-entry.
 FRESH_SETUP_AFTER_LOSS_ENABLED = os.getenv("FRESH_SETUP_AFTER_LOSS_ENABLED", "1") == "1"
@@ -2065,12 +2068,13 @@ def classify_entry_confluence(symbol, side, data, option):
     return True, total, detail
 
 
-def unified_entry_quality_v2(symbol, side, data, option):
-    """Unified V2 entry decision using weighted evidence instead of chained vetoes."""
+def _v2_pre_contract_scores(symbol, side, data):
+    """Compute Trend/Location/Setup/Trigger/Context+RS — everything V2 can score
+    before a contract is even found. Pure evidence computation, no gating.
+    """
     side = str(side or "").upper()
     call_side = side == "CALL"
     data = data or {}
-    option = option or {}
 
     side_score = _safe_float_num(data.get("bull_score" if call_side else "bear_score", 0.0), 0.0)
     opp_score = _safe_float_num(data.get("bear_score" if call_side else "bull_score", 0.0), 0.0)
@@ -2133,6 +2137,43 @@ def unified_entry_quality_v2(symbol, side, data, option):
         0.0,
         min(100.0, 0.55 * regime_score + 0.45 * rel_strength - macro_penalty - context_invalid_penalty),
     )
+
+    return {
+        "trend": trend_score,
+        "location": location_score,
+        "setup": setup_score,
+        "trigger": trigger_score,
+        "context_rs": context_rs_score,
+    }
+
+
+def log_v2_pre_contract_components(symbol, side, data):
+    """Measurement only: log what V2 sees before contract search, so a rejected
+    contract search doesn't hide Trend/Location/Setup/Trigger/Context evidence.
+    """
+    if not (V2_ENTRY_QUALITY_ENABLED and V2_PRE_CONTRACT_LOG_ENABLED):
+        return
+    try:
+        scores = _v2_pre_contract_scores(symbol, side, data)
+        log(
+            f"[{symbol}] [V2 PRE-CONTRACT] {side} — trend={scores['trend']:.0f}, "
+            f"location={scores['location']:.0f}, setup={scores['setup']:.0f}, "
+            f"trigger={scores['trigger']:.0f}, context+rs={scores['context_rs']:.0f}, contract=PENDING"
+        )
+    except Exception as e:
+        log(f"[{symbol}] V2 pre-contract logging failed (non-blocking): {e}")
+
+
+def unified_entry_quality_v2(symbol, side, data, option):
+    """Unified V2 entry decision using weighted evidence instead of chained vetoes."""
+    side = str(side or "").upper()
+    option = option or {}
+    scores = _v2_pre_contract_scores(symbol, side, data)
+    trend_score = scores["trend"]
+    location_score = scores["location"]
+    setup_score = scores["setup"]
+    trigger_score = scores["trigger"]
+    context_rs_score = scores["context_rs"]
 
     delta_abs = abs(_safe_float_num(option.get("delta", 0.0), 0.0))
     spread_pct = _safe_float_num(option.get("spread_pct", 1.0), 1.0)
@@ -7960,6 +8001,8 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
             log(f"[{symbol}] Fresh-setup gate: {side} blocked — {fresh_reason}.")
             return
+
+    log_v2_pre_contract_components(symbol, side, data)
 
     option = get_option_contract(
         symbol,
