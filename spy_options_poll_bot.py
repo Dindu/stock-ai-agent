@@ -2126,7 +2126,13 @@ def unified_entry_quality_v2(symbol, side, data, option):
         data.get("relative_strength_score_bull" if call_side else "relative_strength_score_bear", 0.0),
         0.0,
     )
-    context_rs_score = max(0.0, min(100.0, 0.55 * regime_score + 0.45 * rel_strength - macro_penalty))
+    # An invalid market-context check (short-term move not yet aligned) is evidence of
+    # weak conviction, not an automatic veto — it discounts Context, it doesn't zero it.
+    context_invalid_penalty = 0.0 if bool(data.get("context_valid", True)) else 25.0
+    context_rs_score = max(
+        0.0,
+        min(100.0, 0.55 * regime_score + 0.45 * rel_strength - macro_penalty - context_invalid_penalty),
+    )
 
     delta_abs = abs(_safe_float_num(option.get("delta", 0.0), 0.0))
     spread_pct = _safe_float_num(option.get("spread_pct", 1.0), 1.0)
@@ -2546,15 +2552,17 @@ def playbook_entry_ok(side, data, symbol=None):
     if is_breakout_continuation:
         pass
     elif score < SCORE_STRONG:
-        if volume_ratio < VOLUME_MULTIPLIER:
+        # V2: early-entry volume ratio is Volume/Trigger evidence, not a binary kill
+        # switch — the 1m sniper (e.g. BREAKOUT_RETEST) already measures its own volume.
+        if score_gate_authority and volume_ratio < VOLUME_MULTIPLIER:
             return False, playbook, (
                 f"early-entry volume ratio {volume_ratio:.2f} < {VOLUME_MULTIPLIER:.2f}"
             )
-        if delta_5m is None or delta_5m <= 0:
+        if score_gate_authority and (delta_5m is None or delta_5m <= 0):
             return False, playbook, (
                 f"early-entry 5m score delta {delta_5m} is not rising"
             )
-    elif volume_ratio < 1.0:
+    elif score_gate_authority and volume_ratio < 1.0:
         return False, playbook, (
             f"confirmed-entry volume ratio {volume_ratio:.2f} < 1.00"
         )
@@ -3536,29 +3544,41 @@ def analyze(df, client, symbol):
     # The dominant side must lead by SCORE_DOMINANCE points; otherwise NO TRADE.
     diff = bull_score - bear_score
 
+    # V2: market-context validation is Context evidence, not an automatic veto —
+    # the legacy path (below) still enforces it as a hard NO TRADE.
+    context_gate_authority = not (TWO_PLAYBOOK_ENTRY_MODE and V2_ENTRY_QUALITY_ENABLED)
+    context_valid, context_reason = True, ""
     if bull_score >= strong_threshold and diff >= SCORE_DOMINANCE:
         call_valid, call_reason = validate_call_context()
-        if call_valid:
+        context_valid, context_reason = call_valid, call_reason
+        if call_valid or not context_gate_authority:
             side, score, tier, signal = "CALL", bull_score, "STRONG", "STRONG CALL"
+            if not call_valid:
+                print(f"[{symbol}] {call_reason} | Score was {bull_score} (above threshold) — advisory under V2, not blocking", flush=True)
         else:
             side, score, tier, signal = "NO TRADE", bull_score, "REJECTED", f"STRONG_CALL_CONTEXT_FAIL"
             print(f"[{symbol}] {call_reason} | Score was {bull_score} (above threshold)", flush=True)
     elif bear_score >= strong_threshold and -diff >= SCORE_DOMINANCE:
         put_valid, put_reason = validate_put_context()
-        if put_valid:
+        context_valid, context_reason = put_valid, put_reason
+        if put_valid or not context_gate_authority:
             side, score, tier, signal = "PUT", bear_score, "STRONG", "STRONG PUT"
+            if not put_valid:
+                print(f"[{symbol}] {put_reason} | Score was {bear_score} (above threshold) — advisory under V2, not blocking", flush=True)
         else:
             side, score, tier, signal = "NO TRADE", bear_score, "REJECTED", f"STRONG_PUT_CONTEXT_FAIL"
             print(f"[{symbol}] {put_reason} | Score was {bear_score} (above threshold)", flush=True)
     elif bull_score >= SCORE_SIGNAL and diff >= SCORE_DOMINANCE:
-        call_valid, _ = validate_call_context()
-        if call_valid:
+        call_valid, call_reason = validate_call_context()
+        context_valid, context_reason = call_valid, call_reason
+        if call_valid or not context_gate_authority:
             side, score, tier, signal = "CALL", bull_score, "SIGNAL", "CALL"
         else:
             side, score, tier, signal = "NO TRADE", bull_score, "REJECTED", "SIGNAL_CALL_CONTEXT_FAIL"
     elif bear_score >= SCORE_SIGNAL and -diff >= SCORE_DOMINANCE:
-        put_valid, _ = validate_put_context()
-        if put_valid:
+        put_valid, put_reason = validate_put_context()
+        context_valid, context_reason = put_valid, put_reason
+        if put_valid or not context_gate_authority:
             side, score, tier, signal = "PUT", bear_score, "SIGNAL", "PUT"
         else:
             side, score, tier, signal = "NO TRADE", bear_score, "REJECTED", "SIGNAL_PUT_CONTEXT_FAIL"
@@ -3746,6 +3766,8 @@ def analyze(df, client, symbol):
         "side": side,
         "signal": signal,
         "sentiment": sentiment,
+        "context_valid": context_valid,
+        "context_reason": context_reason,
     }
 
     return side, data
