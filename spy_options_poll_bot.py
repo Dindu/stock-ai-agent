@@ -2531,12 +2531,19 @@ def playbook_entry_ok(side, data, symbol=None):
 
     # FIRST_PULLBACK is a trigger, not sufficient proof by itself. Require the 5m
     # directional score to still be building so stale pullbacks do not re-enter a fading move.
-    if playbook not in ("BREAKOUT", "BREAKOUT_CONTINUATION") and one_minute_enabled and one_minute_trigger == "FIRST_PULLBACK":
-        if delta_5m is None or delta_5m < FIRST_PULLBACK_MIN_SCORE_DELTA:
-            return False, playbook, (
-                f"FIRST_PULLBACK blocked -- 5m directional score delta {delta_5m} "
-                f"< +{FIRST_PULLBACK_MIN_SCORE_DELTA}; waiting for fresh continuation"
-            )
+    # delta_5m is None when 5m-ago history isn't available yet (cold start/warmup gap) —
+    # that's "unknown", not "failed freshness", so it must not be treated as a block.
+    if (
+        playbook not in ("BREAKOUT", "BREAKOUT_CONTINUATION")
+        and one_minute_enabled
+        and one_minute_trigger == "FIRST_PULLBACK"
+        and delta_5m is not None
+        and delta_5m < FIRST_PULLBACK_MIN_SCORE_DELTA
+    ):
+        return False, playbook, (
+            f"FIRST_PULLBACK blocked -- 5m directional score delta {delta_5m} "
+            f"< +{FIRST_PULLBACK_MIN_SCORE_DELTA}; waiting for fresh continuation"
+        )
 
     is_breakout_continuation = continuation_confirmed is True
     min_score = (
