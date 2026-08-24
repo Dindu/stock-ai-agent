@@ -149,6 +149,19 @@ BREAKOUT_MIN_SCORE = int(os.getenv("BREAKOUT_MIN_SCORE", str(SCORE_SIGNAL)))
 PULLBACK_MIN_SCORE = int(os.getenv("PULLBACK_MIN_SCORE", str(SCORE_SIGNAL)))
 PLAYBOOK_MIN_DOMINANCE = int(os.getenv("PLAYBOOK_MIN_DOMINANCE", str(SCORE_DOMINANCE)))
 PLAYBOOK_MAX_VWAP_EXTENSION = float(os.getenv("PLAYBOOK_MAX_VWAP_EXTENSION", "0.012"))
+# Tiered VWAP extension (replaces the single static cutoff above as the actual gate).
+# NORMAL: <= PLAYBOOK_MAX_VWAP_EXTENSION. EXTENDED: allowed only with strong confirmation.
+# VERY_EXTENDED: always blocked — not overridden by any confirmation (frozen risk guard).
+PLAYBOOK_VWAP_EXTENDED_MAX = float(os.getenv("PLAYBOOK_VWAP_EXTENDED_MAX", "0.016"))
+PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_SCORE = int(os.getenv("PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_SCORE", "70"))
+PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_DOMINANCE = int(os.getenv("PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_DOMINANCE", "55"))
+PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_VOLX = float(os.getenv("PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_VOLX", "1.50"))
+PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_PATTERN = float(os.getenv("PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_PATTERN", "80.0"))
+# Shadow telemetry only — logs what the decision would be at these caps, never gates.
+VWAP_SHADOW_CAPS_PCT = [0.0120, 0.0140, 0.0160, 0.0180, 0.0200]
+# Armed breakout setups: patience window (in completed 5m bars) before a pending
+# breakout/pullback expires without confirmation.
+ARMED_SETUP_MAX_BARS = int(os.getenv("ARMED_SETUP_MAX_BARS", "3"))
 PULLBACK_RECLAIM_TOLERANCE = float(os.getenv("PULLBACK_RECLAIM_TOLERANCE", "0.003"))
 PULLBACK_MIN_SCORE_DELTA = int(os.getenv("PULLBACK_MIN_SCORE_DELTA", "0"))
 BREAKOUT_HOLD_CONFIRMATION_ENABLED = os.getenv("BREAKOUT_HOLD_CONFIRMATION_ENABLED", "1") == "1"
@@ -2346,36 +2359,56 @@ def fresh_setup_confirmed(symbol, side, data):
 
 
 def _breakout_hold_confirmation(symbol, side, data):
-    """Require the bar after a fresh break to hold beyond the level with momentum."""
+    """Armed breakout state: gives a fresh break up to ARMED_SETUP_MAX_BARS completed
+    5m bars to hold before expiring, instead of a single all-or-nothing next bar.
+    Cancels early on score collapse, dominance disappearing, or structure loss.
+    """
     if not BREAKOUT_HOLD_CONFIRMATION_ENABLED or not symbol:
         return None, "disabled"
 
     side = str(side or "").upper()
+    call_side = side == "CALL"
     key = (str(symbol).upper(), side)
     bar_time = (data or {}).get("bar_time")
     price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
+    vwap = _safe_float_num((data or {}).get("vwap", 0.0), 0.0)
+    ema20 = _safe_float_num((data or {}).get("ema20", 0.0), 0.0)
+    score = _safe_float_num((data or {}).get("bull_score" if call_side else "bear_score", 0.0), 0.0)
+    opposite = _safe_float_num((data or {}).get("bear_score" if call_side else "bull_score", 0.0), 0.0)
     fresh_break = bool((data or {}).get("fresh_breakout", False)) if side == "CALL" else bool((data or {}).get("fresh_breakdown", False))
     pending = _breakout_hold_pending.get(key)
 
     if pending:
         if bar_time == pending["bar_time"]:
-            return False, "awaiting next completed breakout bar"
-        try:
-            expected_bar_time = pending["bar_time"] + timedelta(minutes=5)
-        except (TypeError, ValueError):
-            expected_bar_time = None
-        if expected_bar_time is not None and bar_time != expected_bar_time:
+            return False, f"ARMED_BREAKOUT_{side}: awaiting next completed bar (bar 1/{ARMED_SETUP_MAX_BARS})"
+
+        bars_elapsed = int(pending.get("bars_elapsed", 0)) + 1
+        if bars_elapsed > ARMED_SETUP_MAX_BARS:
             _breakout_hold_pending.pop(key, None)
-            return False, "breakout hold confirmation expired"
-        _breakout_hold_pending.pop(key, None)
+            return False, f"ARMED SETUP CANCELLED: expired after {ARMED_SETUP_MAX_BARS} bars"
+
         level = float(pending["level"])
         buffer = level * BREAKOUT_CONFIRMATION_MIN_BUFFER_PCT
         held = price >= level + buffer if side == "CALL" else price <= level - buffer
+
         if not held:
-            return False, (
-                f"breakout hold {price:.2f} did not clear {level:.2f} by "
-                f"{BREAKOUT_CONFIRMATION_MIN_BUFFER_PCT * 100:.2f}%"
-            )
+            dominance_now = score - opposite
+            armed_score = pending.get("armed_score", score)
+            if score < PULLBACK_MIN_SCORE or score < (armed_score * 0.6):
+                _breakout_hold_pending.pop(key, None)
+                return False, f"ARMED SETUP CANCELLED: score collapsed to {score:.0f}"
+            if dominance_now < PLAYBOOK_MIN_DOMINANCE:
+                _breakout_hold_pending.pop(key, None)
+                return False, f"ARMED SETUP CANCELLED: dominance disappeared ({dominance_now:.0f})"
+            structure_lost = (price < min(vwap, ema20)) if call_side else (price > max(vwap, ema20))
+            if structure_lost:
+                _breakout_hold_pending.pop(key, None)
+                return False, "ARMED SETUP CANCELLED: lost VWAP/EMA20 structure"
+            pending["bar_time"] = bar_time
+            pending["bars_elapsed"] = bars_elapsed
+            return False, f"ARMED_BREAKOUT_{side}: still waiting (bar {bars_elapsed + 1}/{ARMED_SETUP_MAX_BARS})"
+
+        _breakout_hold_pending.pop(key, None)
 
         delta_5m, _ = _score_trend_deltas(data or {}, side)
         if delta_5m is None or delta_5m < BREAKOUT_CONFIRMATION_MIN_SCORE_DELTA:
@@ -2398,13 +2431,18 @@ def _breakout_hold_confirmation(symbol, side, data):
         if opposing_indices:
             return False, f"breakout confirmation blocked by {'/'.join(opposing_indices)} macro alignment"
         if held:
-            return True, f"breakout held {level:.2f} on next completed bar"
+            return True, f"breakout held {level:.2f} on bar {bars_elapsed}/{ARMED_SETUP_MAX_BARS}"
         return False, f"breakout failed to hold {level:.2f}"
 
     if fresh_break:
         level = _safe_float_num((data or {}).get("recent_high" if side == "CALL" else "recent_low", price), price)
-        _breakout_hold_pending[key] = {"bar_time": bar_time, "level": level}
-        return False, f"fresh breakout at {level:.2f}; awaiting hold confirmation"
+        _breakout_hold_pending[key] = {
+            "bar_time": bar_time,
+            "level": level,
+            "bars_elapsed": 0,
+            "armed_score": score,
+        }
+        return False, f"ARMED_BREAKOUT_{side}: fresh breakout at {level:.2f}; awaiting hold confirmation"
     return None, "no pending breakout"
 
 
@@ -2480,6 +2518,34 @@ def marginal_call_entry_ok(score, data):
     if bearish_indices:
         return False, f"marginal CALL blocked by bearish {'/'.join(bearish_indices)}"
     return True, "marginal CALL quality confirmed"
+
+
+def _log_vwap_shadow_telemetry(symbol, side, extension, playbook, one_minute_trigger, score, dominance_val, volume_ratio, pattern_quality):
+    """Shadow-only: what would the tiered VWAP decision be at other caps? Never gates
+    anything — pure evidence for calibrating PLAYBOOK_MAX_VWAP_EXTENSION later.
+    """
+    try:
+        would_pass = {}
+        for cap in VWAP_SHADOW_CAPS_PCT:
+            if extension <= cap:
+                would_pass[f"{cap*100:.2f}%"] = True
+            else:
+                extended_override = (
+                    playbook == "PULLBACK_CONTINUATION"
+                    and one_minute_trigger == "FIRST_PULLBACK"
+                    and score >= PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_SCORE
+                    and dominance_val >= PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_DOMINANCE
+                    and volume_ratio >= PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_VOLX
+                    and pattern_quality >= PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_PATTERN
+                    and extension <= PLAYBOOK_VWAP_EXTENDED_MAX
+                )
+                would_pass[f"{cap*100:.2f}%"] = bool(extended_override)
+        log(
+            f"[{symbol}] [VWAP SHADOW] {side} extension={extension*100:.2f}% playbook={playbook} "
+            f"would_pass_at={would_pass}"
+        )
+    except Exception as e:
+        log(f"[{symbol}] VWAP shadow telemetry failed (non-blocking): {e}")
 
 
 def playbook_entry_ok(side, data, symbol=None):
@@ -2637,8 +2703,32 @@ def playbook_entry_ok(side, data, symbol=None):
         marginal_call_ok, marginal_call_reason = marginal_call_entry_ok(score, data)
         if not marginal_call_ok:
             return False, playbook, marginal_call_reason
+
+    # Tiered VWAP extension: NORMAL passes freely, EXTENDED requires strong
+    # confirmation, VERY_EXTENDED is never overridden (proven risk guard, frozen).
+    dominance_val = score - opposite
+    pattern_quality = _safe_float_num(
+        (data or {}).get("pattern_quality_score_bull" if call_side else "pattern_quality_score_bear", 0.0), 0.0
+    )
+    _log_vwap_shadow_telemetry(symbol, side, extension, playbook, one_minute_trigger, score, dominance_val, volume_ratio, pattern_quality)
+    if extension > PLAYBOOK_VWAP_EXTENDED_MAX:
+        return False, playbook, (
+            f"VWAP extension {extension * 100:.2f}% > {PLAYBOOK_VWAP_EXTENDED_MAX * 100:.2f}% (VERY_EXTENDED)"
+        )
     if extension > PLAYBOOK_MAX_VWAP_EXTENSION:
-        return False, playbook, f"VWAP extension {extension * 100:.2f}% > {PLAYBOOK_MAX_VWAP_EXTENSION * 100:.2f}%"
+        extended_override = (
+            playbook == "PULLBACK_CONTINUATION"
+            and one_minute_trigger == "FIRST_PULLBACK"
+            and score >= PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_SCORE
+            and dominance_val >= PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_DOMINANCE
+            and volume_ratio >= PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_VOLX
+            and pattern_quality >= PLAYBOOK_VWAP_EXTENDED_OVERRIDE_MIN_PATTERN
+        )
+        if not extended_override:
+            return False, playbook, (
+                f"VWAP extension {extension * 100:.2f}% > {PLAYBOOK_MAX_VWAP_EXTENSION * 100:.2f}% (EXTENDED, "
+                f"confirmation insufficient for override)"
+            )
     if delta_5m is not None and delta_5m < -4:
         return False, playbook, f"directional score fading ({delta_5m:+d} over 5m)"
     if is_breakout_continuation:
@@ -8059,7 +8149,9 @@ def run_symbol(client, symbol, prefetched_bars=None):
                             webhook_url=DISCORD_WEBHOOK_LIVE_TRADES_URL,
                         )
                         _sniper_watch_cooldowns[watch_key] = watch_now + timedelta(minutes=SNIPER_WATCH_ALERT_COOLDOWN_MINUTES)
-            log(f"[{symbol}] Playbook gate: {side} blocked — {playbook_reason}.")
+            reason_text = str(playbook_reason or "")
+            tag = "WAIT" if reason_text.startswith("ARMED_BREAKOUT_") else "BLOCKED"
+            log(f"[{symbol}] Playbook gate: {side} {tag} — {playbook_reason}.")
             return
         data["entry_playbook"] = playbook
         data["setup_type"] = playbook
