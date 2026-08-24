@@ -443,6 +443,10 @@ PROMOTED_STOCK_ENTRY_MIN_OPTION_OI = int(os.getenv("PROMOTED_STOCK_ENTRY_MIN_OPT
 # OCC open interest is prior-session settlement, so short-dated strikes look illiquid even when actively traded.
 ENTRY_VOLUME_SUBSTITUTES_OI = os.getenv("ENTRY_VOLUME_SUBSTITUTES_OI", "1") == "1"
 ENTRY_MIN_OPTION_DAY_VOLUME = int(os.getenv("ENTRY_MIN_OPTION_DAY_VOLUME", "1000"))
+# When OI/day-volume metadata is stale or missing (see _classify_liquidity_data_state),
+# a live bid/ask this tight is accepted as evidence of real tradability instead of an
+# automatic veto on stale metadata alone.
+LIQUIDITY_SUBSTITUTE_MAX_SPREAD_PCT = float(os.getenv("LIQUIDITY_SUBSTITUTE_MAX_SPREAD_PCT", "0.06"))
 PROMOTED_CONT_MIN_MOMENTUM_SCORE = float(os.getenv("PROMOTED_CONT_MIN_MOMENTUM_SCORE", "36"))
 PROMOTED_MIN_DOMINANCE = int(os.getenv("PROMOTED_MIN_DOMINANCE", "20"))
 PROMOTED_MIN_DELTA_5M = int(os.getenv("PROMOTED_MIN_DELTA_5M", "2"))
@@ -4590,6 +4594,26 @@ def _safe_int_num(v, default=0):
         return default
 
 
+def _classify_liquidity_data_state(oi_date_raw, day_volume):
+    """Distinguish stale/missing OI+volume metadata from genuinely bad liquidity.
+
+    Returns (state, oi_age_days). A stale/missing classification lets a tight live
+    bid/ask stand in as evidence of real tradability instead of an absolute veto.
+    """
+    oi_age_days = None
+    try:
+        if oi_date_raw:
+            oi_age_days = (date.today() - date.fromisoformat(str(oi_date_raw)[:10])).days
+    except Exception:
+        oi_age_days = None
+
+    if not oi_date_raw and day_volume <= 0:
+        return "LIQUIDITY_DATA_MISSING", oi_age_days
+    if oi_age_days is not None and oi_age_days >= 1 and day_volume <= 0:
+        return "LIQUIDITY_DATA_STALE", oi_age_days
+    return "LIQUIDITY_ACTUALLY_BAD", oi_age_days
+
+
 def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
     """Final must-pass checklist after an option contract has been selected."""
     if not option:
@@ -4692,11 +4716,26 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
     if oi < min_oi:
         day_volume = _safe_int_num((option or {}).get("volume", 0), 0)
         if not (ENTRY_VOLUME_SUBSTITUTES_OI and day_volume >= ENTRY_MIN_OPTION_DAY_VOLUME):
-            oi_date = str((option or {}).get("open_interest_date", "") or "unknown")
-            return False, (
-                f"open interest {oi} (as of {oi_date}) < {min_oi} "
-                f"and day volume {day_volume} < {ENTRY_MIN_OPTION_DAY_VOLUME}"
-            )
+            oi_date_raw = str((option or {}).get("open_interest_date", "") or "")
+            liquidity_state, oi_age_days = _classify_liquidity_data_state(oi_date_raw, day_volume)
+            bid_now = _safe_float_num((option or {}).get("bid", 0.0), 0.0)
+            ask_now = _safe_float_num((option or {}).get("ask", 0.0), 0.0)
+            mid_now = (bid_now + ask_now) / 2.0 if (bid_now + ask_now) > 0 else 0.0
+            live_spread_pct = ((ask_now - bid_now) / mid_now) if mid_now > 0 else float("inf")
+            tight_live_market = bid_now > 0 and ask_now > 0 and live_spread_pct <= LIQUIDITY_SUBSTITUTE_MAX_SPREAD_PCT
+
+            if liquidity_state in ("LIQUIDITY_DATA_STALE", "LIQUIDITY_DATA_MISSING") and tight_live_market:
+                log(
+                    f"[{symbol}] OI/volume data is {liquidity_state} (oi={oi}, oi_age={oi_age_days}, "
+                    f"day_vol={day_volume}) but live spread {live_spread_pct*100:.1f}% is tight — "
+                    f"accepting on live quote evidence, not OI metadata."
+                )
+            else:
+                return False, (
+                    f"open interest {oi} (as of {oi_date_raw or 'unknown'}) < {min_oi} "
+                    f"and day volume {day_volume} < {ENTRY_MIN_OPTION_DAY_VOLUME} "
+                    f"[{liquidity_state}]"
+                )
 
     bid = _safe_float_num((option or {}).get("bid", 0.0), 0.0)
     ask = _safe_float_num((option or {}).get("ask", 0.0), 0.0)
