@@ -357,6 +357,11 @@ V2_ATTRIBUTION_LOG_FILE = os.getenv("V2_ATTRIBUTION_LOG_FILE", "v2_entry_attribu
 # Measurement only — logs Trend/Location/Setup/Trigger/Context before contract search,
 # so a rejected contract search doesn't hide what V2 saw in the underlying setup.
 V2_PRE_CONTRACT_LOG_ENABLED = os.getenv("V2_PRE_CONTRACT_LOG_ENABLED", "1") == "1"
+# Contract-search cache: avoids re-running the full Alpaca chain/snapshot query
+# (which can take 10-20s) for the same symbol/side/price within a short window.
+# Pure performance measure — does not change which contracts are selected/rejected.
+OPTION_SEARCH_CACHE_ENABLED = os.getenv("OPTION_SEARCH_CACHE_ENABLED", "1") == "1"
+OPTION_SEARCH_CACHE_TTL_SECONDS = int(os.getenv("OPTION_SEARCH_CACHE_TTL_SECONDS", "45"))
 # Fresh-setup-after-loss: require new evidence before re-entering the same (symbol, side)
 # after a stop-out, instead of a blanket block or an unconditional re-entry.
 FRESH_SETUP_AFTER_LOSS_ENABLED = os.getenv("FRESH_SETUP_AFTER_LOSS_ENABLED", "1") == "1"
@@ -3820,7 +3825,50 @@ def analyze(df, client, symbol):
 
     return side, data
 
+_option_search_cache: "dict[tuple, dict]" = {}
+
+
+def _option_search_price_bucket(price):
+    """Quantize price into a fixed-width bucket so the cache tolerates small ticks
+    but still refreshes once the underlying has moved meaningfully.
+    """
+    price = float(price or 0.0)
+    if price >= 500:
+        step = 0.50
+    elif price >= 100:
+        step = 0.10
+    else:
+        step = 0.02
+    return round(price / step) if step > 0 else 0
+
+
 def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_from_vwap=None):
+    """Cached wrapper around ``_get_option_contract_uncached``.
+
+    Short-lived cache only — never changes which contract is selected or rejected,
+    it just avoids re-running the same expensive Alpaca chain/snapshot query within
+    a few seconds of an identical prior search.
+    """
+    if not OPTION_SEARCH_CACHE_ENABLED:
+        return _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap)
+
+    cache_key = (symbol, signal, _option_search_price_bucket(underlying_price))
+    now = datetime.now(central)
+    cached = _option_search_cache.get(cache_key)
+    if cached and cached["expires_at"] > now:
+        log(f"[{symbol}] Contract search cache hit ({signal}) — reusing result from {(now - cached['cached_at']).total_seconds():.0f}s ago.")
+        return cached["result"]
+
+    result = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap)
+    _option_search_cache[cache_key] = {
+        "result": result,
+        "cached_at": now,
+        "expires_at": now + timedelta(seconds=max(1, OPTION_SEARCH_CACHE_TTL_SECONDS)),
+    }
+    return result
+
+
+def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, max_ext_from_vwap=None):
     """Fetch the best available >=MIN_DTE option contract from Alpaca.
 
     When ``data`` and ``max_ext_from_vwap`` are provided, run entry-quality prechecks
@@ -3859,7 +3907,14 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
             )
         exp_range = f"{min_exp}–{max_exp}" if max_exp is not None else f">={min_exp}"
         if not contracts:
-            print(f"[{symbol}] No option contracts found ({option_type}, {exp_range}).", flush=True)
+            strike_lo = round(underlying_price * 0.95, 2)
+            strike_hi = round(underlying_price * 1.05, 2)
+            print(
+                f"[{symbol}] No option contracts found ({option_type}, expiry {exp_range}, "
+                f"strike [{strike_lo:.2f}, {strike_hi:.2f}]) — either NO_EXPIRATION_IN_WINDOW "
+                f"or NO_STRIKES_IN_WINDOW for this chain.",
+                flush=True,
+            )
             return None
 
         print(f"[{symbol}] {len(contracts)} contract(s) returned by Alpaca for {option_type} {exp_range}.", flush=True)
