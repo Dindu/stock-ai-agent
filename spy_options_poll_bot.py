@@ -447,6 +447,9 @@ ENTRY_MIN_OPTION_DAY_VOLUME = int(os.getenv("ENTRY_MIN_OPTION_DAY_VOLUME", "1000
 # a live bid/ask this tight is accepted as evidence of real tradability instead of an
 # automatic veto on stale metadata alone.
 LIQUIDITY_SUBSTITUTE_MAX_SPREAD_PCT = float(os.getenv("LIQUIDITY_SUBSTITUTE_MAX_SPREAD_PCT", "0.06"))
+# A tight spread only counts as evidence if the quote itself was pulled recently —
+# otherwise a stale-but-narrow quote could pass by coincidence, not real liquidity.
+LIQUIDITY_SUBSTITUTE_MAX_QUOTE_AGE_SECONDS = float(os.getenv("LIQUIDITY_SUBSTITUTE_MAX_QUOTE_AGE_SECONDS", "20.0"))
 PROMOTED_CONT_MIN_MOMENTUM_SCORE = float(os.getenv("PROMOTED_CONT_MIN_MOMENTUM_SCORE", "36"))
 PROMOTED_MIN_DOMINANCE = int(os.getenv("PROMOTED_MIN_DOMINANCE", "20"))
 PROMOTED_MIN_DELTA_5M = int(os.getenv("PROMOTED_MIN_DELTA_5M", "2"))
@@ -4724,17 +4727,34 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
             live_spread_pct = ((ask_now - bid_now) / mid_now) if mid_now > 0 else float("inf")
             tight_live_market = bid_now > 0 and ask_now > 0 and live_spread_pct <= LIQUIDITY_SUBSTITUTE_MAX_SPREAD_PCT
 
-            if liquidity_state in ("LIQUIDITY_DATA_STALE", "LIQUIDITY_DATA_MISSING") and tight_live_market:
+            # A tight spread on a stale quote is meaningless — the substitute only counts
+            # if the quote itself was pulled recently. Missing timestamp fails closed.
+            quote_ts = (option or {}).get("quote_timestamp")
+            quote_age_seconds = None
+            if quote_ts is not None:
+                try:
+                    now_utc = datetime.now(timezone.utc)
+                    ts = quote_ts if quote_ts.tzinfo else quote_ts.replace(tzinfo=timezone.utc)
+                    quote_age_seconds = (now_utc - ts).total_seconds()
+                except Exception:
+                    quote_age_seconds = None
+            quote_is_fresh = quote_age_seconds is not None and quote_age_seconds <= LIQUIDITY_SUBSTITUTE_MAX_QUOTE_AGE_SECONDS
+
+            if liquidity_state in ("LIQUIDITY_DATA_STALE", "LIQUIDITY_DATA_MISSING") and tight_live_market and quote_is_fresh:
                 log(
-                    f"[{symbol}] OI/volume data is {liquidity_state} (oi={oi}, oi_age={oi_age_days}, "
-                    f"day_vol={day_volume}) but live spread {live_spread_pct*100:.1f}% is tight — "
-                    f"accepting on live quote evidence, not OI metadata."
+                    f"[{symbol}] LIQUIDITY SUBSTITUTE: metadata={liquidity_state} oi={oi} "
+                    f"oi_date={oi_date_raw or 'unknown'} volume={day_volume} bid={bid_now:.2f} "
+                    f"ask={ask_now:.2f} spread={live_spread_pct*100:.2f}% quote_age={quote_age_seconds:.1f}s"
                 )
+                if isinstance(option, dict):
+                    option["_liquidity_substitute_used"] = True
+                    option["_liquidity_substitute_mid"] = mid_now
             else:
+                fail_reason = "quote too stale" if (tight_live_market and not quote_is_fresh) else liquidity_state
                 return False, (
                     f"open interest {oi} (as of {oi_date_raw or 'unknown'}) < {min_oi} "
                     f"and day volume {day_volume} < {ENTRY_MIN_OPTION_DAY_VOLUME} "
-                    f"[{liquidity_state}]"
+                    f"[{fail_reason}, quote_age={quote_age_seconds if quote_age_seconds is not None else 'unknown'}]"
                 )
 
     bid = _safe_float_num((option or {}).get("bid", 0.0), 0.0)
@@ -7426,6 +7446,16 @@ def try_open_paper_trade(symbol, side, option, data):
     if fill_price is None:
         log(f"[{symbol}] Order submitted but no fill confirmed within 5s — not tracking trade.")
         return False
+
+    if option.get("_liquidity_substitute_used"):
+        substitute_mid = _safe_float_num(option.get("_liquidity_substitute_mid", 0.0), 0.0)
+        slippage_vs_mid = (fill_price - substitute_mid) if substitute_mid > 0 else None
+        slippage_pct = (slippage_vs_mid / substitute_mid * 100.0) if (slippage_vs_mid is not None and substitute_mid > 0) else None
+        log(
+            f"[{symbol}] LIQUIDITY SUBSTITUTE FILL: contract={option.get('contract', '')} "
+            f"substitute_mid=${substitute_mid:.2f} entry_fill=${fill_price:.2f} "
+            f"slippage_vs_mid={'unknown' if slippage_vs_mid is None else f'${slippage_vs_mid:+.2f} ({slippage_pct:+.1f}%)'}"
+        )
 
     trade = open_trade_record(symbol, signal_label, option, score, fill_price, qty, data=data)
     _open_trades[trade["contract"]] = trade
