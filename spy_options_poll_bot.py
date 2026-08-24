@@ -4077,6 +4077,34 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
                 f"or NO_STRIKES_IN_WINDOW for this chain.",
                 flush=True,
             )
+            # Diagnostic-only: same expiry window with no strike bound, to isolate whether
+            # the narrow +/-5% strike band (vs a genuine expiry-availability gap) is at fault.
+            # Never used for selection — logging only.
+            try:
+                diag_kwargs = dict(req_kwargs)
+                diag_kwargs.pop("strike_price_gte", None)
+                diag_kwargs.pop("strike_price_lte", None)
+                diag_result = _trading_client.get_option_contracts(GetOptionContractsRequest(**diag_kwargs))
+                diag_contracts = (
+                    diag_result if isinstance(diag_result, list)
+                    else (getattr(diag_result, "option_contracts", None) or getattr(diag_result, "contracts", None) or [])
+                )
+                if not diag_contracts:
+                    print(
+                        f"[{symbol}] DIAGNOSTIC: 0 contracts for {option_type} even with no strike bound "
+                        f"in expiry {exp_range} — this expiry window has no chain at all for this name.",
+                        flush=True,
+                    )
+                else:
+                    strikes = sorted({float(c.strike_price) for c in diag_contracts})
+                    print(
+                        f"[{symbol}] DIAGNOSTIC: {len(diag_contracts)} contract(s) exist for {option_type} in "
+                        f"expiry {exp_range} once strike bound is removed — available strikes "
+                        f"{strikes[:3]}...{strikes[-3:]} (band [{strike_lo:.2f}, {strike_hi:.2f}] excluded all of them).",
+                        flush=True,
+                    )
+            except Exception as diag_err:
+                print(f"[{symbol}] DIAGNOSTIC query failed (non-blocking): {diag_err}", flush=True)
             return None
 
         print(f"[{symbol}] {len(contracts)} contract(s) returned by Alpaca for {option_type} {exp_range}.", flush=True)
