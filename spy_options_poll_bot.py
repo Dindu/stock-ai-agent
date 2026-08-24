@@ -2538,7 +2538,10 @@ def playbook_entry_ok(side, data, symbol=None):
         else BREAKOUT_MIN_SCORE if playbook == "BREAKOUT"
         else PULLBACK_MIN_SCORE
     )
-    if score < min_score:
+    # V2: raw score is Trend evidence for Unified Entry Quality, not a second hard
+    # veto here — the outer hard-score gate is already advisory-only under V2.
+    score_gate_authority = not (V2_ENTRY_QUALITY_ENABLED and TWO_PLAYBOOK_ENTRY_MODE)
+    if score_gate_authority and score < min_score:
         return False, playbook, f"score {score:.0f} < {min_score}"
     if is_breakout_continuation:
         pass
