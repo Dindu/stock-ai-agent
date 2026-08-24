@@ -134,7 +134,8 @@ CLOSING_NO_TRADE_MINUTES = int(os.getenv("CLOSING_NO_TRADE_MINUTES", "30"))
 LOOKBACK_BARS = 120
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
 MIN_DTE = int(os.getenv("MIN_DTE", "1"))   # Minimum DTE (exclude 0DTE)
-MAX_DTE = int(os.getenv("MAX_DTE", "5"))  # Max DTE window; set <=0 for no upper bound
+MAX_DTE = int(os.getenv("MAX_DTE", "3"))  # Primary DTE window (normally 1-3)
+FALLBACK_MAX_DTE = int(os.getenv("FALLBACK_MAX_DTE", "5"))  # If primary window has no tradeable contract, extend to 4-5 DTE
 VOLUME_MULTIPLIER = 1.5
 
 # Scoring thresholds (0-100)
@@ -321,6 +322,15 @@ THESIS_STRUCTURE_TOLERANCE_PCT = float(os.getenv("THESIS_STRUCTURE_TOLERANCE_PCT
 THESIS_SWING_BREAK_TOLERANCE_PCT = float(os.getenv("THESIS_SWING_BREAK_TOLERANCE_PCT", "0.0008"))
 THESIS_LEVEL_TOLERANCE_PCT = float(os.getenv("THESIS_LEVEL_TOLERANCE_PCT", "0.0012"))
 THESIS_REVERSAL_SLOPE_PCT = float(os.getenv("THESIS_REVERSAL_SLOPE_PCT", "0.0005"))
+# Score-deterioration exit: complements structural thesis checks. It requires a
+# large directional-score collapse to persist before exiting, so one noisy scan
+# cannot kill an otherwise healthy trade.
+THESIS_SCORE_EXIT_ENABLED = os.getenv("THESIS_SCORE_EXIT_ENABLED", "1") == "1"
+THESIS_SCORE_DROP_POINTS = int(os.getenv("THESIS_SCORE_DROP_POINTS", "20"))
+THESIS_SCORE_CURRENT_FLOOR = int(os.getenv("THESIS_SCORE_CURRENT_FLOOR", "50"))
+THESIS_SCORE_MIN_DOMINANCE = int(os.getenv("THESIS_SCORE_MIN_DOMINANCE", "8"))
+THESIS_SCORE_CONFIRM_CYCLES = int(os.getenv("THESIS_SCORE_CONFIRM_CYCLES", "2"))
+THESIS_SCORE_CONFIRM_SECONDS = float(os.getenv("THESIS_SCORE_CONFIRM_SECONDS", "10"))
 EMERGENCY_DATA_FAIL_EXIT_ENABLED = os.getenv("EMERGENCY_DATA_FAIL_EXIT_ENABLED", "1") == "1"
 EMERGENCY_DATA_FAIL_CYCLES = int(os.getenv("EMERGENCY_DATA_FAIL_CYCLES", "3"))
 RUNNER_UNDERLYING_TRAIL_PCT = float(os.getenv("RUNNER_UNDERLYING_TRAIL_PCT", "0.0035"))
@@ -1546,6 +1556,14 @@ def dynamic_min_required_score(symbol, side, data):
         else:
             return DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK
 
+    # Base score before regime/momentum relief or penalty.
+    if symbol in ETF_SYMBOLS:
+        base = DYNAMIC_HARD_GATE_MIN_FLOOR_ETF
+    elif is_top_stock:
+        base = TOP_STOCK_HARD_GATE_MIN_FLOOR
+    else:
+        base = DYNAMIC_HARD_GATE_MIN_FLOOR_STOCK
+
     m = _side_metric_bundle(data, side)
     entry_timing = _classify_entry_timing(data or {}, side)
     relief = 0
@@ -2134,14 +2152,28 @@ def _v2_pre_contract_scores(symbol, side, data):
     ext_pct = abs(_safe_float_num(data.get("vwap_extension_pct", 0.0), 0.0))
     opposing_level = data.get("resistance_level") if call_side else data.get("support_level")
     room_atr = _safe_float_num((opposing_level or {}).get("distance_atr", 0.0), 0.0)
-    if ext_pct <= 0.006 and room_atr >= 0.5:
-        location_score = 100.0
-    elif ext_pct <= 0.012 and room_atr >= 0.25:
-        location_score = 70.0
-    elif ext_pct <= 0.018 and room_atr >= 0.15:
-        location_score = 45.0
+    # Location combines anti-chase (VWAP extension) with actual room to the next
+    # opposing structure. Tight room now meaningfully discounts otherwise strong
+    # breakout scores instead of being almost free evidence.
+    if ext_pct <= 0.006:
+        extension_score = 100.0
+    elif ext_pct <= 0.012:
+        extension_score = 75.0
+    elif ext_pct <= 0.018:
+        extension_score = 45.0
     else:
-        location_score = 20.0
+        extension_score = 20.0
+    if room_atr >= 1.50:
+        room_score = 100.0
+    elif room_atr >= 1.00:
+        room_score = 80.0
+    elif room_atr >= 0.65:
+        room_score = 60.0
+    elif room_atr >= 0.35:
+        room_score = 35.0
+    else:
+        room_score = 15.0
+    location_score = 0.55 * extension_score + 0.45 * room_score
 
     playbook = str(data.get("entry_playbook", "") or "").upper()
     if playbook in {"PULLBACK_CONTINUATION", "BREAKOUT_CONTINUATION", "BREAKOUT"}:
@@ -4003,7 +4035,12 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
     a few seconds of an identical prior search.
     """
     if not OPTION_SEARCH_CACHE_ENABLED:
-        return _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap)
+        primary = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=MIN_DTE, search_max_dte=MAX_DTE)
+        if primary is not None or FALLBACK_MAX_DTE <= MAX_DTE:
+            return primary
+        fallback_min = max(MIN_DTE, MAX_DTE + 1)
+        log(f"[{symbol}] No tradeable contract in {MIN_DTE}-{MAX_DTE} DTE; extending search to {fallback_min}-{FALLBACK_MAX_DTE} DTE.")
+        return _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=fallback_min, search_max_dte=FALLBACK_MAX_DTE)
 
     setup_type = str((data or {}).get("entry_playbook", "") or (data or {}).get("setup_type", "") or "")
     bar_time = (data or {}).get("bar_time")
@@ -4017,7 +4054,11 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
         log(f"[{symbol}] Contract search cache hit ({signal}) — reusing result from {(now - cached['cached_at']).total_seconds():.0f}s ago.")
         return cached["result"]
 
-    result = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap)
+    result = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=MIN_DTE, search_max_dte=MAX_DTE)
+    if result is None and FALLBACK_MAX_DTE > MAX_DTE:
+        fallback_min = max(MIN_DTE, MAX_DTE + 1)
+        log(f"[{symbol}] No tradeable contract in {MIN_DTE}-{MAX_DTE} DTE; extending search to {fallback_min}-{FALLBACK_MAX_DTE} DTE.")
+        result = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=fallback_min, search_max_dte=FALLBACK_MAX_DTE)
     is_negative = result is None
     ttl_seconds = OPTION_SEARCH_NEGATIVE_CACHE_TTL_SECONDS if is_negative else OPTION_SEARCH_CACHE_TTL_SECONDS
     if is_negative:
@@ -4030,7 +4071,7 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
     return result
 
 
-def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, max_ext_from_vwap=None):
+def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, max_ext_from_vwap=None, search_min_dte=None, search_max_dte=None):
     """Fetch the best available >=MIN_DTE option contract from Alpaca.
 
     When ``data`` and ``max_ext_from_vwap`` are provided, run entry-quality prechecks
@@ -4041,8 +4082,10 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
         return None
     try:
         today = date.today()
-        min_exp = today + timedelta(days=MIN_DTE)
-        max_exp = today + timedelta(days=MAX_DTE) if MAX_DTE > 0 else None
+        effective_min_dte = MIN_DTE if search_min_dte is None else max(MIN_DTE, int(search_min_dte))
+        effective_max_dte = MAX_DTE if search_max_dte is None else int(search_max_dte)
+        min_exp = today + timedelta(days=effective_min_dte)
+        max_exp = today + timedelta(days=effective_max_dte) if effective_max_dte > 0 else None
         option_type = "call" if signal == "CALL" else "put"
 
         req_kwargs = {
@@ -4753,8 +4796,9 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
             )
 
     dte = _safe_int_num((option or {}).get("dte", 0), 0)
-    if MAX_DTE > 0 and dte > MAX_DTE:
-        return False, f"DTE {dte} > max {MAX_DTE}"
+    effective_entry_max_dte = max(MAX_DTE, FALLBACK_MAX_DTE) if FALLBACK_MAX_DTE > 0 else MAX_DTE
+    if effective_entry_max_dte > 0 and dte > effective_entry_max_dte:
+        return False, f"DTE {dte} > max {effective_entry_max_dte}"
 
     oi = _safe_int_num((option or {}).get("open_interest", 0), 0)
     min_oi = ETF_ENTRY_MIN_OPTION_OI if symbol in ETF_SYMBOLS else STOCK_ENTRY_MIN_OPTION_OI
@@ -6244,6 +6288,11 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "stop_pct":   stop_pct,
         "score":      score,
         "max_pnl_pct": 0.0,
+        "min_pnl_pct": 0.0,
+        "underlying_mfe_pct": 0.0,
+        "underlying_mae_pct": 0.0,
+        "score_deterioration_first_ts": None,
+        "score_deterioration_cycles": 0,
         "runner_profile": bool(runner_profile.get("runner_profile", False)),
         "partial_tp_pct": partial_tp_pct,
         "partial_close_fraction": partial_close_fraction,
@@ -6586,6 +6635,10 @@ def _underlying_thesis_state(trade):
         if bars is None or bars.empty or len(bars) < 30:
             return {"ready": False, "invalid": False, "reason": "NO UNDERLYING BARS", "price": 0.0, "vwap": 0.0, "ema20": 0.0}
 
+        # Keep a raw copy because analyze() computes the same score engine used by
+        # live entries. This lets the exit manager react when the original thesis
+        # score collapses even before a hard VWAP/EMA structure break occurs.
+        raw_bars = bars.copy()
         df = calculate_indicators(bars)
         if df is None or df.empty or len(df) < 8:
             return {"ready": False, "invalid": False, "reason": "INSUFFICIENT INDICATORS", "price": 0.0, "vwap": 0.0, "ema20": 0.0}
@@ -6605,6 +6658,37 @@ def _underlying_thesis_state(trade):
         entry_support = _safe_float_num(trade.get("entry_support_level"), 0.0)
         entry_resistance = _safe_float_num(trade.get("entry_resistance_level"), 0.0)
 
+        current_side_score = None
+        current_opp_score = None
+        score_drop = None
+        score_deteriorated = False
+        if THESIS_SCORE_EXIT_ENABLED:
+            try:
+                _, score_data = analyze(raw_bars, client, symbol)
+                if score_data:
+                    if side == "CALL":
+                        current_side_score = int(score_data.get("bull_score", 0) or 0)
+                        current_opp_score = int(score_data.get("bear_score", 0) or 0)
+                        entry_side_score = int(trade.get("entry_bull_score", trade.get("score", 0)) or 0)
+                    else:
+                        current_side_score = int(score_data.get("bear_score", 0) or 0)
+                        current_opp_score = int(score_data.get("bull_score", 0) or 0)
+                        entry_side_score = int(trade.get("entry_bear_score", trade.get("score", 0)) or 0)
+                    score_drop = entry_side_score - current_side_score
+                    dominance = current_side_score - current_opp_score
+                    score_deteriorated = (
+                        score_drop >= THESIS_SCORE_DROP_POINTS
+                        and (current_side_score < THESIS_SCORE_CURRENT_FLOOR or dominance < THESIS_SCORE_MIN_DOMINANCE)
+                    )
+            except Exception as score_err:
+                log(f"[{symbol}] Thesis score check failed (structure check still active): {score_err}")
+
+        base_state = {
+            "ready": True, "price": price, "vwap": vwap, "ema20": ema20,
+            "current_side_score": current_side_score, "current_opp_score": current_opp_score,
+            "score_drop": score_drop, "score_deteriorated": score_deteriorated,
+        }
+
         if side == "CALL":
             below_structure = price < (min(vwap, ema20) * (1.0 - max(0.0, THESIS_STRUCTURE_TOLERANCE_PCT)))
             higher_low_broken = price < (recent_swing_low * (1.0 - max(0.0, THESIS_SWING_BREAK_TOLERANCE_PCT)))
@@ -6616,12 +6700,12 @@ def _underlying_thesis_state(trade):
             regime_reversal = ema20_slope_pct <= -abs(THESIS_REVERSAL_SLOPE_PCT) and price < ema20
 
             if breakout_fail:
-                return {"ready": True, "invalid": True, "reason": "BREAKOUT/RETEST FAILED", "price": price, "vwap": vwap, "ema20": ema20}
+                return {**base_state, "invalid": True, "reason": "BREAKOUT/RETEST FAILED"}
             if higher_low_broken and below_structure:
-                return {"ready": True, "invalid": True, "reason": "HIGHER-LOW STRUCTURE BROKE", "price": price, "vwap": vwap, "ema20": ema20}
+                return {**base_state, "invalid": True, "reason": "HIGHER-LOW STRUCTURE BROKE"}
             if below_structure and regime_reversal:
-                return {"ready": True, "invalid": True, "reason": "LOST VWAP/EMA20 WITH REVERSAL", "price": price, "vwap": vwap, "ema20": ema20}
-            return {"ready": True, "invalid": False, "reason": "CALL THESIS INTACT", "price": price, "vwap": vwap, "ema20": ema20}
+                return {**base_state, "invalid": True, "reason": "LOST VWAP/EMA20 WITH REVERSAL"}
+            return {**base_state, "invalid": False, "reason": "CALL THESIS INTACT"}
 
         above_structure = price > (max(vwap, ema20) * (1.0 + max(0.0, THESIS_STRUCTURE_TOLERANCE_PCT)))
         lower_high_broken = price > (recent_swing_high * (1.0 + max(0.0, THESIS_SWING_BREAK_TOLERANCE_PCT)))
@@ -6633,12 +6717,12 @@ def _underlying_thesis_state(trade):
         regime_reversal = ema20_slope_pct >= abs(THESIS_REVERSAL_SLOPE_PCT) and price > ema20
 
         if breakdown_fail:
-            return {"ready": True, "invalid": True, "reason": "BREAKDOWN/RETEST FAILED", "price": price, "vwap": vwap, "ema20": ema20}
+            return {**base_state, "invalid": True, "reason": "BREAKDOWN/RETEST FAILED"}
         if lower_high_broken and above_structure:
-            return {"ready": True, "invalid": True, "reason": "LOWER-HIGH STRUCTURE BROKE", "price": price, "vwap": vwap, "ema20": ema20}
+            return {**base_state, "invalid": True, "reason": "LOWER-HIGH STRUCTURE BROKE"}
         if above_structure and regime_reversal:
-            return {"ready": True, "invalid": True, "reason": "RECLAIMED VWAP/EMA20 WITH REVERSAL", "price": price, "vwap": vwap, "ema20": ema20}
-        return {"ready": True, "invalid": False, "reason": "PUT THESIS INTACT", "price": price, "vwap": vwap, "ema20": ema20}
+            return {**base_state, "invalid": True, "reason": "RECLAIMED VWAP/EMA20 WITH REVERSAL"}
+        return {**base_state, "invalid": False, "reason": "PUT THESIS INTACT"}
     except Exception as e:
         return {"ready": False, "invalid": False, "reason": f"THESIS CHECK ERROR: {e}", "price": 0.0, "vwap": 0.0, "ema20": 0.0}
 
@@ -6701,6 +6785,7 @@ def track_open_trades():
         entry   = trade["entry"]
         pnl_pct = (current_price - entry) / entry if entry else 0.0
         trade["max_pnl_pct"] = max(float(trade.get("max_pnl_pct", 0.0)), pnl_pct)
+        trade["min_pnl_pct"] = min(float(trade.get("min_pnl_pct", 0.0)), pnl_pct)
         log(f"[{trade['underlying']}] {contract_sym} | "
             f"entry ${entry:.2f} (Alpaca) | current ${current_price:.2f} (Alpaca) | "
             f"PnL {pnl_pct * 100:+.2f}%")
@@ -6719,9 +6804,46 @@ def track_open_trades():
         thesis_state = _underlying_thesis_state(trade)
         if thesis_state.get("ready"):
             trade["thesis_data_fail_count"] = 0
+            # Track underlying MFE/MAE independently of option premium.
+            underlying_now = _safe_float_num(thesis_state.get("price"), 0.0)
+            underlying_entry = _safe_float_num(trade.get("underlying_entry_price"), 0.0)
+            if underlying_now > 0 and underlying_entry > 0:
+                raw_move = (underlying_now - underlying_entry) / underlying_entry
+                directional_move = raw_move if str(trade.get("side", "")).upper() == "CALL" else -raw_move
+                trade["underlying_mfe_pct"] = max(float(trade.get("underlying_mfe_pct", 0.0)), directional_move)
+                trade["underlying_mae_pct"] = min(float(trade.get("underlying_mae_pct", 0.0)), directional_move)
+
             if thesis_state.get("invalid"):
                 close_trade(trade, current_price, f"THESIS INVALIDATION: {thesis_state.get('reason', 'STRUCTURE FAILED')}", pnl_pct)
                 continue
+
+            # Score deterioration must persist across cycles and time. This is the
+            # missing AAPL-style protection: STRONG -> WATCHLIST/NO TRADE collapse
+            # can exit before the emergency option-premium stop is reached.
+            if THESIS_SCORE_EXIT_ENABLED and thesis_state.get("score_deteriorated"):
+                now_ts = time.time()
+                if not trade.get("score_deterioration_first_ts"):
+                    trade["score_deterioration_first_ts"] = now_ts
+                    trade["score_deterioration_cycles"] = 1
+                else:
+                    trade["score_deterioration_cycles"] = int(trade.get("score_deterioration_cycles", 0)) + 1
+                persisted = now_ts - float(trade.get("score_deterioration_first_ts", now_ts))
+                cycles = int(trade.get("score_deterioration_cycles", 0))
+                log(f"[{trade['underlying']}] THESIS SCORE WARNING: side={thesis_state.get('current_side_score')} "
+                    f"opp={thesis_state.get('current_opp_score')} drop={thesis_state.get('score_drop')} "
+                    f"confirm={cycles}/{THESIS_SCORE_CONFIRM_CYCLES} age={persisted:.1f}s")
+                if cycles >= max(1, THESIS_SCORE_CONFIRM_CYCLES) and persisted >= max(0.0, THESIS_SCORE_CONFIRM_SECONDS):
+                    close_trade(
+                        trade, current_price,
+                        f"THESIS INVALIDATION: SCORE DETERIORATION "
+                        f"(drop={thesis_state.get('score_drop')}, side={thesis_state.get('current_side_score')}, "
+                        f"opp={thesis_state.get('current_opp_score')})",
+                        pnl_pct,
+                    )
+                    continue
+            else:
+                trade["score_deterioration_first_ts"] = None
+                trade["score_deterioration_cycles"] = 0
         else:
             miss_count = int(trade.get("thesis_data_fail_count", 0) or 0) + 1
             trade["thesis_data_fail_count"] = miss_count
@@ -7197,6 +7319,12 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     if not exit_confirmed:
         return
 
+    log(
+        f"[{trade.get('underlying')}] TRADE EXCURSION: option_MFE={float(trade.get('max_pnl_pct', 0.0))*100:+.2f}% "
+        f"option_MAE={float(trade.get('min_pnl_pct', 0.0))*100:+.2f}% "
+        f"underlying_MFE={float(trade.get('underlying_mfe_pct', 0.0))*100:+.2f}% "
+        f"underlying_MAE={float(trade.get('underlying_mae_pct', 0.0))*100:+.2f}%"
+    )
     exit_market_context = _capture_exit_market_context(trade)
     emoji = "\u2705" if pnl_pct > 0 else "\u274c"
     outcome_label = "PROFIT" if pnl_pct > 0 else "LOSS"
