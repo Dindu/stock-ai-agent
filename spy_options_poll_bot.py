@@ -324,6 +324,11 @@ THESIS_REVERSAL_SLOPE_PCT = float(os.getenv("THESIS_REVERSAL_SLOPE_PCT", "0.0005
 EMERGENCY_DATA_FAIL_EXIT_ENABLED = os.getenv("EMERGENCY_DATA_FAIL_EXIT_ENABLED", "1") == "1"
 EMERGENCY_DATA_FAIL_CYCLES = int(os.getenv("EMERGENCY_DATA_FAIL_CYCLES", "3"))
 RUNNER_UNDERLYING_TRAIL_PCT = float(os.getenv("RUNNER_UNDERLYING_TRAIL_PCT", "0.0035"))
+# Second, independent guard alongside the underlying runner trail: protects the
+# option's own P&L peak once a runner has shown strong gains, since delta/gamma/IV
+# decay can erode option profit well before the underlying thesis actually breaks.
+RUNNER_PNL_TRAIL_ACTIVATE = float(os.getenv("RUNNER_PNL_TRAIL_ACTIVATE", "0.15"))
+RUNNER_PNL_MAX_GIVEBACK = float(os.getenv("RUNNER_PNL_MAX_GIVEBACK", "0.08"))
 # High-conviction runner profile (applies only when entry quality is strong).
 RUNNER_EXIT_PROFILE_ENABLED = os.getenv("RUNNER_EXIT_PROFILE_ENABLED", "1") == "1"
 RUNNER_MIN_SCORE = int(os.getenv("RUNNER_MIN_SCORE", "75"))
@@ -6684,6 +6689,16 @@ def track_open_trades():
                     close_trade(trade, current_price, "RUNNER TRAIL HIT (UNDERLYING)", pnl_pct)
                     continue
 
+        # 3b) Independent option-P&L peak-giveback guard for the runner. The underlying
+        # can stay technically intact while delta/gamma/IV decay erodes most of the
+        # option's own peak gain — this protects that peak without replacing the
+        # underlying-based trail above.
+        if partial_taken:
+            runner_peak_pnl = float(trade.get("max_pnl_pct", pnl_pct) or pnl_pct)
+            if runner_peak_pnl >= RUNNER_PNL_TRAIL_ACTIVATE and pnl_pct <= (runner_peak_pnl - RUNNER_PNL_MAX_GIVEBACK):
+                close_trade(trade, current_price, "RUNNER PNL GIVEBACK STOP", pnl_pct)
+                continue
+
         # 4) Emergency option-premium stop as risk backstop only.
         if pnl_pct <= -stop_pct:
             close_trade(trade, current_price, "EMERGENCY STOP LOSS", pnl_pct)
@@ -6878,6 +6893,12 @@ def _trade_exit_explanation(trade, reason, entry_price, exit_price, pnl_pct, mar
         return f"The {side} idea followed through. {structure_text}. {price_move}; the first profit objective was realized."
     if reason_text.startswith("RUNNER TRAIL HIT"):
         return f"The {side} runner gave back enough underlying progress to hit the trail. {structure_text}. {price_move}."
+    if reason_text == "RUNNER PNL GIVEBACK STOP":
+        peak_pct = float(trade.get("max_pnl_pct", pnl_pct) or pnl_pct) * 100
+        return (
+            f"The {side} runner's option profit peaked near +{peak_pct:.1f}% and gave back too much "
+            f"before the underlying thesis broke. {structure_text}. {price_move}."
+        )
     if reason_text == "TRAILING STOP":
         max_seen = float(trade.get("max_pnl_pct", pnl_pct) or pnl_pct) * 100
         return f"The initial {side} move worked, then gave back gains. {structure_text}. Profit retraced from +{max_seen:.2f}% and the trailing stop closed it."
@@ -7185,6 +7206,8 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         short_reason = "EMERGENCY OPTION STOP"
     elif short_reason.startswith("RUNNER TRAIL HIT"):
         short_reason = "RUNNER TRAILING STOP"
+    elif short_reason.startswith("RUNNER PNL GIVEBACK STOP"):
+        short_reason = "RUNNER PROFIT GIVEBACK"
     elif short_reason.startswith("TIME EXIT"):
         short_reason = "TIME EXIT"
     is_partial = (not final_close and close_qty_int < current_qty)
