@@ -5260,6 +5260,7 @@ def _fetch_stocktwits_trending_symbols():
             headers={"Accept": "application/json", "User-Agent": "stock-ai-agent/1.0"},
         )
         if resp.status_code != 200:
+            log(f"[TRENDING] Stocktwits fetch failed: HTTP {resp.status_code} — {resp.text[:150]}")
             return []
         payload = resp.json() or {}
         raw_items = payload.get("symbols") if isinstance(payload, dict) else []
@@ -5272,8 +5273,13 @@ def _fetch_stocktwits_trending_symbols():
                     sym = str(item or "").upper().strip()
                 if sym:
                     out.append(sym)
+        if not out:
+            log(f"[TRENDING] Stocktwits returned HTTP 200 but 0 usable symbols (payload keys: {list(payload.keys()) if isinstance(payload, dict) else type(payload)}).")
+        else:
+            log(f"[TRENDING] Stocktwits returned {len(out)} symbol(s): {', '.join(out[:10])}")
         return out
-    except Exception:
+    except Exception as e:
+        log(f"[TRENDING] Stocktwits fetch exception: {type(e).__name__}: {e}")
         return []
 
 
@@ -5301,6 +5307,12 @@ def get_trending_symbols(client, base_symbols):
     for path, params in screener_sources:
         payload = _alpaca_data_get_json(path, params=params, timeout=8)
         items = _extract_screener_items(payload)
+        if payload is None:
+            log(f"[TRENDING] Alpaca screener {path} returned no payload (request failed or non-200).")
+        elif not items:
+            log(f"[TRENDING] Alpaca screener {path} returned 0 usable items (payload keys: {list(payload.keys()) if isinstance(payload, dict) else type(payload)}).")
+        else:
+            log(f"[TRENDING] Alpaca screener {path} returned {len(items)} raw item(s).")
         for idx, item in enumerate(items):
             sym = str(item.get("symbol") or item.get("ticker") or "").upper().strip()
             if not sym or sym in ETF_SYMBOLS or sym in base_set:
