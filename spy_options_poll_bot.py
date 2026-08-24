@@ -80,6 +80,14 @@ TOP_STOCK_SYMBOLS = {
     "ADBE", "HOOD", "ORCL",
 }
 AGGRESSIVE_STOCK_SYMBOLS = {"TSLA", "AMD", "PLTR", "GOOGL"}
+# Shadow-only liquidity tier classification (see _shadow_tier_liquidity_check) — logging only,
+# does not gate contract selection until validated against real fills/outcomes.
+MEGA_LIQUID_SYMBOLS = {"AAPL", "NVDA", "MSFT", "AMZN", "TSLA", "GOOGL", "AMD"}
+TIER_LIQUIDITY_THRESHOLDS = {
+    "ETF":          {"min_oi": 2000, "min_volume": 200, "max_spread_pct": 0.03},
+    "MEGA_LIQUID":  {"min_oi": 500,  "min_volume": 50,  "max_spread_pct": 0.06},
+    "STANDARD":     {"min_oi": 100,  "min_volume": 10,  "max_spread_pct": 0.10},
+}
 DEFAULT_SYMBOLS = "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,TSLA,AMD,PLTR,GOOGL,AVGO,ADBE,HOOD,ORCL"
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
 ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")
@@ -3724,29 +3732,6 @@ def analyze(df, client, symbol):
         else:
             print(f"[{symbol}]   H-RESISTANCE none", flush=True)
 
-        # Horizontal S/R diagnostics only.
-        if support_level:
-            print(
-                f"[{symbol}]   H-SUPPORT ${support_level['level']:.2f} | "
-                f"touches={support_level['touches']} | "
-                f"strength={support_level['strength']:.0f}/100 | "
-                f"distance={support_level['distance_atr']:.2f} ATR",
-                flush=True,
-            )
-        else:
-            print(f"[{symbol}]   H-SUPPORT none", flush=True)
-
-        if resistance_level:
-            print(
-                f"[{symbol}]   H-RESISTANCE ${resistance_level['level']:.2f} | "
-                f"touches={resistance_level['touches']} | "
-                f"strength={resistance_level['strength']:.0f}/100 | "
-                f"distance={resistance_level['distance_atr']:.2f} ATR",
-                flush=True,
-            )
-        else:
-            print(f"[{symbol}]   H-RESISTANCE none", flush=True)
-
     # Sentiment summary line for the human glance.
     if diff >= 30:
         sentiment = "BULL DOMINANT"
@@ -3842,6 +3827,68 @@ def _option_search_price_bucket(price):
     return round(price / step) if step > 0 else 0
 
 
+def _liquidity_tier(symbol):
+    """Shadow classification only — does not gate anything yet. Lets us log what
+    tier-based thresholds would decide before committing to new hard numbers.
+    """
+    symbol = str(symbol or "").upper()
+    if symbol in ETF_SYMBOLS:
+        return "ETF"
+    if symbol in MEGA_LIQUID_SYMBOLS:
+        return "MEGA_LIQUID"
+    return "STANDARD"
+
+
+def _shadow_tier_liquidity_check(symbol, oi, vol, spread_pct):
+    """Log-only: what a symbol-class-aware liquidity rule would decide, so real
+    thresholds can eventually be set from evidence instead of intuition.
+    """
+    tier = _liquidity_tier(symbol)
+    thresholds = TIER_LIQUIDITY_THRESHOLDS.get(tier, TIER_LIQUIDITY_THRESHOLDS["STANDARD"])
+    would_pass = (
+        spread_pct <= thresholds["max_spread_pct"]
+        and (oi >= thresholds["min_oi"] or vol >= thresholds["min_volume"])
+    )
+    log(
+        f"[{symbol}] [SHADOW TIER={tier}] would_pass={would_pass} "
+        f"(oi={oi}>={thresholds['min_oi']} or vol={vol}>={thresholds['min_volume']}, "
+        f"spread={spread_pct*100:.1f}%<={thresholds['max_spread_pct']*100:.0f}%)"
+    )
+
+
+def _log_contract_data_quality(symbol, candidate):
+    """Measurement only: distinguish live quote/trade data from stale OI metadata
+    so a rejection can be attributed to genuine illiquidity vs. a data-freshness gap.
+    """
+    try:
+        bid = float(candidate.get("bid", 0.0) or 0.0)
+        ask = float(candidate.get("ask", 0.0) or 0.0)
+        bid_size = int(candidate.get("bid_size", 0) or 0)
+        ask_size = int(candidate.get("ask_size", 0) or 0)
+        mid = (bid + ask) / 2 if (bid + ask) > 0 else 0.0
+        spread_pct = float(candidate.get("spread_pct", 0.0) or 0.0)
+        vol = int(candidate.get("volume", 0) or 0)
+        oi = int(candidate.get("open_interest", 0) or 0)
+        oi_date_raw = str(candidate.get("open_interest_date", "") or "")
+        oi_age_days = "unknown"
+        try:
+            if oi_date_raw:
+                oi_age_days = (date.today() - date.fromisoformat(oi_date_raw[:10])).days
+        except Exception:
+            oi_age_days = "unknown"
+        quote_ts = candidate.get("quote_timestamp")
+        trade_ts = candidate.get("trade_timestamp")
+        log(
+            f"[{symbol}] Contract data check: {candidate.get('contract', '')} "
+            f"bid=${bid:.2f}({bid_size}) ask=${ask:.2f}({ask_size}) mid=${mid:.2f} spread={spread_pct*100:.1f}% "
+            f"quote_ts={quote_ts or 'unavailable'} trade_ts={trade_ts or 'unavailable'} "
+            f"day_vol={vol} oi={oi} oi_asof={oi_date_raw or 'unknown'} oi_age_days={oi_age_days}"
+        )
+        _shadow_tier_liquidity_check(symbol, oi, vol, spread_pct)
+    except Exception as e:
+        log(f"[{symbol}] Contract data quality logging failed (non-blocking): {e}")
+
+
 def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_from_vwap=None):
     """Cached wrapper around ``_get_option_contract_uncached``.
 
@@ -3852,7 +3899,12 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
     if not OPTION_SEARCH_CACHE_ENABLED:
         return _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap)
 
-    cache_key = (symbol, signal, _option_search_price_bucket(underlying_price))
+    setup_type = str((data or {}).get("entry_playbook", "") or (data or {}).get("setup_type", "") or "")
+    bar_time = (data or {}).get("bar_time")
+    if setup_type and bar_time is not None:
+        cache_key = (symbol, signal, setup_type, bar_time)
+    else:
+        cache_key = (symbol, signal, _option_search_price_bucket(underlying_price))
     now = datetime.now(central)
     cached = _option_search_cache.get(cache_key)
     if cached and cached["expires_at"] > now:
@@ -3978,6 +4030,8 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
             bid = ask = last = 0.0
             vol = 0
             last_trade_size = 0
+            bid_size = ask_size = 0
+            quote_ts = trade_ts = None
             oi = _safe_int(getattr(candidate, "open_interest", 0), 0)
             oi_date = str(getattr(candidate, "open_interest_date", "") or "")
             if snap:
@@ -3989,9 +4043,13 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
                 if q is not None:
                     bid = _safe_float(getattr(q, "bid_price", 0.0), 0.0)
                     ask = _safe_float(getattr(q, "ask_price", 0.0), 0.0)
+                    bid_size = _safe_int(getattr(q, "bid_size", 0), 0)
+                    ask_size = _safe_int(getattr(q, "ask_size", 0), 0)
+                    quote_ts = getattr(q, "timestamp", None)
                 if t is not None:
                     last = _safe_float(getattr(t, "price", 0.0), 0.0)
                     last_trade_size = _safe_int(getattr(t, "size", 0), 0)
+                    trade_ts = getattr(t, "timestamp", None)
                 # Daily bar volume is today's cumulative flow; last-trade size is a single print.
                 if daily is not None:
                     vol = _safe_int(getattr(daily, "volume", 0), 0)
@@ -4000,6 +4058,12 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
                 delta_val = 0.0
 
             dte = (exp_date - today).days
+
+            # NO_QUOTE is a data-integrity reject, distinct from a genuine thin-liquidity
+            # rejection: there's nothing to trade against at all, live or stale.
+            if bid <= 0.0 and ask <= 0.0:
+                _reject(f"[{symbol}] Contract {contract_sym} rejected — NO_QUOTE (no live bid/ask returned).")
+                continue
 
             if bid < min_bid:
                 _reject(f"[{symbol}] Contract {contract_sym} rejected — bid ${bid:.2f} < ${min_bid:.2f} minimum.")
@@ -4037,11 +4101,15 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
                 "strike":        float(candidate.strike_price),
                 "bid":           bid,
                 "ask":           ask,
+                "bid_size":      bid_size,
+                "ask_size":      ask_size,
                 "last":          last,
                 "volume":        vol,
                 "last_trade_size": last_trade_size,
                 "open_interest": oi,
                 "open_interest_date": oi_date,
+                "quote_timestamp": quote_ts,
+                "trade_timestamp": trade_ts,
                 "delta":         delta_val,
                 "spread_pct":    spread_pct,
                 "slippage_est":  slippage_est,
@@ -4142,6 +4210,7 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
                 f"rank={option_candidate_rank(best):.3f}",
                 flush=True,
             )
+            _log_contract_data_quality(symbol, best)
             return best
 
         if (
@@ -4159,6 +4228,7 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
                 f"reason={best_relaxed.get('_entry_precheck_reason', 'entry precheck failed')}",
                 flush=True,
             )
+            _log_contract_data_quality(symbol, best_relaxed)
             return best_relaxed
 
         if rejection_total > rejection_logged:
