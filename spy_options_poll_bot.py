@@ -150,6 +150,17 @@ BREAKOUT_MIN_SCORE = int(os.getenv("BREAKOUT_MIN_SCORE", str(SCORE_SIGNAL)))
 PULLBACK_MIN_SCORE = int(os.getenv("PULLBACK_MIN_SCORE", str(SCORE_SIGNAL)))
 PLAYBOOK_MIN_DOMINANCE = int(os.getenv("PLAYBOOK_MIN_DOMINANCE", str(SCORE_DOMINANCE)))
 PLAYBOOK_MAX_VWAP_EXTENSION = float(os.getenv("PLAYBOOK_MAX_VWAP_EXTENSION", "0.012"))
+# Optional Pine-compatible signal mode (default ON for live validation).
+PINE_SIGNAL_MODE = os.getenv("PINE_SIGNAL_MODE", "1") == "1"
+PINE_SIGNAL_SOURCE = str(os.getenv("PINE_SIGNAL_SOURCE", "BOTH")).strip().upper()  # BB | STOCH | BOTH
+PINE_DIRECTION = int(os.getenv("PINE_DIRECTION", "0"))  # -1 short only, 0 both, +1 long only
+PINE_BB_LENGTH = max(2, int(os.getenv("PINE_BB_LENGTH", "20")))
+PINE_BB_MULT = float(os.getenv("PINE_BB_MULT", "2.0"))
+PINE_STOCH_LENGTH = max(2, int(os.getenv("PINE_STOCH_LENGTH", "14")))
+PINE_STOCH_OVERBOUGHT = max(1.0, min(100.0, float(os.getenv("PINE_STOCH_OVERBOUGHT", "80"))))
+PINE_STOCH_OVERSOLD = max(0.0, min(99.0, float(os.getenv("PINE_STOCH_OVERSOLD", "20"))))
+PINE_STOCH_SMOOTH_K = max(1, int(os.getenv("PINE_STOCH_SMOOTH_K", "3")))
+PINE_STOCH_SMOOTH_D = max(1, int(os.getenv("PINE_STOCH_SMOOTH_D", "3")))
 # Tiered VWAP extension (replaces the single static cutoff above as the actual gate).
 # NORMAL: <= PLAYBOOK_MAX_VWAP_EXTENSION. EXTENDED: allowed only with strong confirmation.
 # VERY_EXTENDED: always blocked — not overridden by any confirmation (frozen risk guard).
@@ -2019,6 +2030,16 @@ def _score_trend_deltas(data, side):
 
 def classify_entry_playbook(side, data):
     """Classify a valid directional setup as a breakout or pullback continuation."""
+    if bool((data or {}).get("pine_signal_active", False)):
+        pine_type = str((data or {}).get("pine_signal_type", "") or "").upper()
+        if pine_type == "BB":
+            return "PINE_BB"
+        if pine_type == "STOCH":
+            return "PINE_STOCH"
+        if pine_type == "BB+STOCH":
+            return "PINE_BB_STOCH"
+        return "PINE_SIGNAL"
+
     side = str(side or "").upper()
     call_side = side == "CALL"
     fresh_break = bool((data or {}).get("fresh_breakout" if call_side else "fresh_breakdown", False))
@@ -2599,6 +2620,10 @@ def _log_vwap_shadow_telemetry(symbol, side, extension, playbook, one_minute_tri
 def playbook_entry_ok(side, data, symbol=None):
     """Apply the minimum technical conditions for a named entry playbook."""
     side = str(side or "").upper()
+    if bool((data or {}).get("pine_signal_active", False)):
+        playbook = classify_entry_playbook(side, data)
+        return True, playbook, f"pine signal mode ({playbook})"
+
     call_side = side == "CALL"
     score = _safe_float_num((data or {}).get("bull_score" if call_side else "bear_score", 0.0), 0.0)
     opposite = _safe_float_num((data or {}).get("bear_score" if call_side else "bull_score", 0.0), 0.0)
@@ -3407,6 +3432,33 @@ def analyze(df, client, symbol):
     fresh_breakout = prev_close <= recent_high and price > recent_high
     fresh_breakdown = prev_close >= recent_low and price < recent_low
 
+    # Pine-compatible signals (measurement + optional decision override).
+    bb_basis_series = df["close"].rolling(PINE_BB_LENGTH, min_periods=PINE_BB_LENGTH).mean()
+    bb_dev_series = PINE_BB_MULT * df["close"].rolling(PINE_BB_LENGTH, min_periods=PINE_BB_LENGTH).std(ddof=0)
+    bb_upper_series = bb_basis_series + bb_dev_series
+    bb_lower_series = bb_basis_series - bb_dev_series
+    bb_upper_now = _safe_float_num(bb_upper_series.iloc[-1], 0.0)
+    bb_upper_prev = _safe_float_num(bb_upper_series.iloc[-2], 0.0)
+    bb_lower_now = _safe_float_num(bb_lower_series.iloc[-1], 0.0)
+    bb_lower_prev = _safe_float_num(bb_lower_series.iloc[-2], 0.0)
+    bb_long_signal = (prev_close <= bb_lower_prev) and (price > bb_lower_now) if bb_lower_prev > 0 and bb_lower_now > 0 else False
+    bb_short_signal = (prev_close >= bb_upper_prev) and (price < bb_upper_now) if bb_upper_prev > 0 and bb_upper_now > 0 else False
+
+    lowest_n = df["low"].rolling(PINE_STOCH_LENGTH, min_periods=PINE_STOCH_LENGTH).min()
+    highest_n = df["high"].rolling(PINE_STOCH_LENGTH, min_periods=PINE_STOCH_LENGTH).max()
+    denom = (highest_n - lowest_n).replace(0, pd.NA)
+    stoch_raw_k = ((df["close"] - lowest_n) / denom) * 100.0
+    stoch_k = stoch_raw_k.rolling(PINE_STOCH_SMOOTH_K, min_periods=PINE_STOCH_SMOOTH_K).mean()
+    stoch_d = stoch_k.rolling(PINE_STOCH_SMOOTH_D, min_periods=PINE_STOCH_SMOOTH_D).mean()
+    stoch_k_now = _safe_float_num(stoch_k.iloc[-1], float("nan"))
+    stoch_d_now = _safe_float_num(stoch_d.iloc[-1], float("nan"))
+    stoch_k_prev = _safe_float_num(stoch_k.iloc[-2], float("nan"))
+    stoch_d_prev = _safe_float_num(stoch_d.iloc[-2], float("nan"))
+    stoch_co = pd.notna(stoch_k_prev) and pd.notna(stoch_d_prev) and pd.notna(stoch_k_now) and pd.notna(stoch_d_now) and (stoch_k_prev <= stoch_d_prev) and (stoch_k_now > stoch_d_now)
+    stoch_cu = pd.notna(stoch_k_prev) and pd.notna(stoch_d_prev) and pd.notna(stoch_k_now) and pd.notna(stoch_d_now) and (stoch_k_prev >= stoch_d_prev) and (stoch_k_now < stoch_d_now)
+    stoch_long_signal = bool(stoch_co and stoch_k_now < PINE_STOCH_OVERSOLD)
+    stoch_short_signal = bool(stoch_cu and stoch_k_now > PINE_STOCH_OVERBOUGHT)
+
     micro_window = df.iloc[-4:-1]
     micro_high = float(micro_window["high"].max()) if len(micro_window) else recent_high
     micro_low = float(micro_window["low"].min()) if len(micro_window) else recent_low
@@ -3788,6 +3840,34 @@ def analyze(df, client, symbol):
     else:
         side, score, tier, signal = "NO TRADE", max(bull_score, bear_score), "NONE", "NO TRADE"
 
+    pine_signal_active = False
+    pine_signal_type = ""
+    pine_long_signal = False
+    pine_short_signal = False
+    if PINE_SIGNAL_MODE:
+        source_mode = PINE_SIGNAL_SOURCE if PINE_SIGNAL_SOURCE in {"BB", "STOCH", "BOTH"} else "BB"
+        use_bb = source_mode in {"BB", "BOTH"}
+        use_stoch = source_mode in {"STOCH", "BOTH"}
+        pine_long_signal = (use_bb and bb_long_signal) or (use_stoch and stoch_long_signal)
+        pine_short_signal = (use_bb and bb_short_signal) or (use_stoch and stoch_short_signal)
+        allow_long = PINE_DIRECTION >= 0
+        allow_short = PINE_DIRECTION <= 0
+        if pine_long_signal and not pine_short_signal and allow_long:
+            side, score, tier, signal = "CALL", max(SCORE_SIGNAL, bull_score), "SIGNAL", "PINE_CALL"
+            pine_signal_active = True
+        elif pine_short_signal and not pine_long_signal and allow_short:
+            side, score, tier, signal = "PUT", max(SCORE_SIGNAL, bear_score), "SIGNAL", "PINE_PUT"
+            pine_signal_active = True
+        if pine_signal_active:
+            if use_bb and use_stoch:
+                pine_signal_type = "BB+STOCH"
+            elif use_stoch:
+                pine_signal_type = "STOCH"
+            else:
+                pine_signal_type = "BB"
+            context_valid = True
+            context_reason = f"pine signal override ({pine_signal_type})"
+
     # ---------------- Trend ----------------
     history = score_history.setdefault(symbol, deque(maxlen=_SCORE_HISTORY_CAP))
     history.append((datetime.now(central), bull_score, bear_score))
@@ -3944,6 +4024,18 @@ def analyze(df, client, symbol):
         "sentiment": sentiment,
         "context_valid": context_valid,
         "context_reason": context_reason,
+        "pine_signal_active": pine_signal_active,
+        "pine_signal_type": pine_signal_type,
+        "pine_long_signal": pine_long_signal,
+        "pine_short_signal": pine_short_signal,
+        "pine_bb_long_signal": bb_long_signal,
+        "pine_bb_short_signal": bb_short_signal,
+        "pine_stoch_long_signal": stoch_long_signal,
+        "pine_stoch_short_signal": stoch_short_signal,
+        "pine_stoch_k": stoch_k_now if pd.notna(stoch_k_now) else None,
+        "pine_stoch_d": stoch_d_now if pd.notna(stoch_d_now) else None,
+        "pine_bb_upper": bb_upper_now,
+        "pine_bb_lower": bb_lower_now,
     }
 
     return side, data
@@ -8102,6 +8194,9 @@ def run_symbol(client, symbol, prefetched_bars=None):
         and (not (V2_ENTRY_QUALITY_ENABLED and TWO_PLAYBOOK_ENTRY_MODE))
         and ((not NO_GATING_MODE) or HARD_SCORE_GATE_IN_NO_GATING_MODE)
     )
+    if data.get("pine_signal_active", False):
+        enforce_hard_gate = False
+        log(f"[{symbol}] Pine signal mode: bypassing hard score gate for this setup.")
     if HARD_SCORE_GATE_ENABLED and V2_ENTRY_QUALITY_ENABLED and TWO_PLAYBOOK_ENTRY_MODE:
         side_score = data["bull_score"] if side == "CALL" else data["bear_score"]
         min_required_score = min(BREAKOUT_MIN_SCORE, PULLBACK_MIN_SCORE)
@@ -8549,7 +8644,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         _alerted_today["keys"].add(alert_key)
 
-    if not NO_GATING_MODE:
+    if not NO_GATING_MODE and not data.get("pine_signal_active", False):
         fresh_ok, fresh_reason = fresh_setup_confirmed(symbol, side, data)
         if not fresh_ok:
             if ALERT_ONLY_COOLDOWN_MINUTES > 0:
@@ -8591,7 +8686,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
         log(f"[{symbol}] Entry quality checklist blocked {side} — {entry_reason}.")
         return
 
-    if V2_ENTRY_QUALITY_ENABLED and not NO_GATING_MODE:
+    if V2_ENTRY_QUALITY_ENABLED and not NO_GATING_MODE and not data.get("pine_signal_active", False):
         quality_ok, quality_score, quality_detail = unified_entry_quality_v2(symbol, side, data, option)
         data["entry_quality_v2_score"] = quality_score
         legacy_ok, legacy_detail = _legacy_shadow_verdict(symbol, side, data, option)
@@ -8603,7 +8698,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
             log(f"[{symbol}] Entry quality V2 gate: {side} blocked — {quality_detail}.")
             return
         log(f"[{symbol}] Entry quality V2: {side} CONFIRMED — {quality_score:.1f}/100 ({quality_detail}).")
-    elif ENTRY_CONFLUENCE_ENABLED and not NO_GATING_MODE:
+    elif ENTRY_CONFLUENCE_ENABLED and not NO_GATING_MODE and not data.get("pine_signal_active", False):
         confluence_ok, confluence_points, confluence_detail = classify_entry_confluence(symbol, side, data, option)
         data["entry_confluence_points"] = confluence_points
         if not confluence_ok:
