@@ -94,7 +94,8 @@ ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.ma
 ALPACA_TRADING_BASE_URL = os.getenv("ALPACA_TRADING_BASE_URL", "https://paper-api.alpaca.markets")
 ENABLE_TRENDING_STOCKS = os.getenv("ENABLE_TRENDING_STOCKS", "1") == "1"
 TRENDING_STOCK_COUNT = int(os.getenv("TRENDING_STOCK_COUNT", "10"))
-TRENDING_REFRESH_SECONDS = int(os.getenv("TRENDING_REFRESH_SECONDS", "300"))
+TRENDING_REFRESH_SECONDS = int(os.getenv("TRENDING_REFRESH_SECONDS", "1800"))
+TRENDING_CACHE_CHECK_SECONDS = int(os.getenv("TRENDING_CACHE_CHECK_SECONDS", "300"))
 TRENDING_NEWS_HEADLINES = int(os.getenv("TRENDING_NEWS_HEADLINES", "2"))
 ENABLE_STOCKTWITS_TRENDING = os.getenv("ENABLE_STOCKTWITS_TRENDING", "1") == "1"
 STOCKTWITS_TRENDING_URL = os.getenv("STOCKTWITS_TRENDING_URL", "https://api.stocktwits.com/api/2/trending/symbols.json")
@@ -580,6 +581,7 @@ _breakout_hold_pending: "dict[tuple, dict]" = {}
 _breakout_continuations: "dict[tuple, dict]" = {}
 # Cached trending stocks and reasons from Alpaca screener/news.
 _trending_cache: "dict" = {"updated_at": None, "symbols": [], "reasons": {}}
+_trending_cache_checked_at: "datetime | None" = None
 # Cached tradability/profile checks for trending candidates.
 _trending_asset_cache: "dict" = {}
 # Cached symbol news context used by entry alerts.
@@ -5453,10 +5455,17 @@ def _fetch_stocktwits_trending_symbols():
 
 def get_trending_symbols(client, base_symbols):
     """Return the first Stocktwits trending symbols for the scan universe."""
+    global _trending_cache_checked_at
     if not ENABLE_TRENDING_STOCKS or TRENDING_STOCK_COUNT <= 0:
         return [], {}
 
     now = datetime.now(timezone.utc)
+    if (
+        _trending_cache_checked_at is not None
+        and (now - _trending_cache_checked_at).total_seconds() < max(30, TRENDING_CACHE_CHECK_SECONDS)
+    ):
+        return list(_trending_cache.get("symbols", [])), dict(_trending_cache.get("reasons", {}))
+    _trending_cache_checked_at = now
     updated_at = _trending_cache.get("updated_at")
     if updated_at and (now - updated_at).total_seconds() < max(30, TRENDING_REFRESH_SECONDS):
         return list(_trending_cache.get("symbols", [])), dict(_trending_cache.get("reasons", {}))
