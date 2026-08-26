@@ -2316,6 +2316,42 @@ def unified_entry_quality_v2(symbol, side, data, option):
     return True, weighted_total, detail
 
 
+def _strategy_source_from_data(data):
+    """Return normalized source label for attribution and post-trade diagnostics."""
+    if bool((data or {}).get("pine_signal_active", False)):
+        return "PINE"
+    return "LEGACY"
+
+
+def _one_minute_confirmation_status(data):
+    """Return PASS/WAIT/NONE for 1m confirmation telemetry."""
+    trigger = str((data or {}).get("one_minute_trigger", "") or "").upper()
+    confirmed = bool((data or {}).get("one_minute_entry_confirmed", False))
+    if trigger == "DISABLED" or not ONE_MINUTE_ENTRY_ENABLED:
+        return "NONE"
+    if confirmed and trigger:
+        return "PASS"
+    return "WAIT"
+
+
+def _entry_directional_disagreement(side, data):
+    """Return (bool, reason) when side disagrees with directional context evidence."""
+    side = str(side or "").upper()
+    bull = _safe_float_num((data or {}).get("bull_score", 0.0), 0.0)
+    bear = _safe_float_num((data or {}).get("bear_score", 0.0), 0.0)
+    macro_penalty = _safe_int_num((data or {}).get("macro_penalty", 0), 0)
+    reasons = []
+    if side == "CALL" and bear > bull:
+        reasons.append(f"bear>{bull:.0f}/{bear:.0f}")
+    elif side == "PUT" and bull > bear:
+        reasons.append(f"bull>{bull:.0f}/{bear:.0f}")
+    if macro_penalty > 0:
+        reasons.append(f"macro_penalty={macro_penalty}")
+    if reasons:
+        return True, "|".join(reasons)
+    return False, ""
+
+
 def _legacy_shadow_verdict(symbol, side, data, option):
     """Shadow-only: would the pre-V2 pipeline (hard score + confirmed sniper + confluence)
     have taken this same candidate? Never blocks anything — used solely for attribution.
@@ -2355,12 +2391,16 @@ def _log_entry_attribution(symbol, side, data, v2_ok, v2_score, legacy_ok, legac
             "symbol": symbol,
             "side": side,
             "bucket": bucket,
+            "strategy_source": _strategy_source_from_data(data),
             "v2_pass": v2_ok,
             "v2_score": round(float(v2_score), 1),
             "legacy_pass": legacy_ok,
             "legacy_detail": legacy_detail,
             "setup_type": str((data or {}).get("entry_playbook", "") or ""),
             "one_minute_trigger": str((data or {}).get("one_minute_trigger", "") or ""),
+            "one_minute_confirmation_status": _one_minute_confirmation_status(data),
+            "entry_directional_disagreement": bool((data or {}).get("entry_directional_disagreement", False)),
+            "entry_directional_disagreement_reason": str((data or {}).get("entry_directional_disagreement_reason", "") or ""),
         }
         pd.DataFrame([row]).to_csv(
             V2_ATTRIBUTION_LOG_FILE,
@@ -6274,6 +6314,10 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
     setup_type = str((data or {}).get("entry_playbook") or (data or {}).get("setup_type") or entry_timing or "UNKNOWN")
     ignition_delta = _safe_int_num((data or {}).get("ignition_delta", 0), 0)
     option_oi = _safe_int_num((option or {}).get("open_interest", 0), 0)
+    directional_disagreement, directional_disagreement_reason = _entry_directional_disagreement(side, data or {})
+    strategy_source = _strategy_source_from_data(data or {})
+    trigger_status = _one_minute_confirmation_status(data or {})
+    stop_dollar_risk = float(entry_price) * 100.0 * int(max(1, qty)) * float(stop_pct)
     return {
         "underlying": symbol,
         "signal":     signal,
@@ -6315,7 +6359,15 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "entry_rsi": _safe_float_num((data or {}).get("rsi", 50.0), 50.0),
         "entry_timing": entry_timing,
         "one_minute_trigger": str((data or {}).get("one_minute_trigger", "") or ""),
+        "one_minute_confirmation_status": trigger_status,
         "setup_type": setup_type,
+        "strategy_source": strategy_source,
+        "entry_directional_disagreement": directional_disagreement,
+        "entry_directional_disagreement_reason": directional_disagreement_reason,
+        "entry_macro_penalty": _safe_int_num((data or {}).get("macro_penalty", 0), 0),
+        "entry_contract_spread_pct": _safe_float_num((option or {}).get("spread_pct", 0.0), 0.0),
+        "entry_contract_delta": _safe_float_num((option or {}).get("delta", 0.0), 0.0),
+        "entry_est_max_risk_dollar": stop_dollar_risk,
         "entry_ignition_delta": ignition_delta,
         "entry_option_oi": option_oi,
         "entry_atr14": _safe_float_num((data or {}).get("atr14", 0.0), 0.0),
@@ -6507,7 +6559,15 @@ def sync_open_trades_from_alpaca():
             "entry_delta_10m": prev.get("entry_delta_10m") if prev else None,
             "entry_rsi": prev.get("entry_rsi", 50.0) if prev else 50.0,
             "entry_timing": prev.get("entry_timing", "UNKNOWN") if prev else "UNKNOWN",
+            "one_minute_confirmation_status": prev.get("one_minute_confirmation_status", "") if prev else "",
             "setup_type": prev.get("setup_type", "UNKNOWN") if prev else "UNKNOWN",
+            "strategy_source": prev.get("strategy_source", "LEGACY") if prev else "LEGACY",
+            "entry_directional_disagreement": bool(prev.get("entry_directional_disagreement", False)) if prev else False,
+            "entry_directional_disagreement_reason": prev.get("entry_directional_disagreement_reason", "") if prev else "",
+            "entry_macro_penalty": prev.get("entry_macro_penalty", 0) if prev else 0,
+            "entry_contract_spread_pct": prev.get("entry_contract_spread_pct", 0.0) if prev else 0.0,
+            "entry_contract_delta": prev.get("entry_contract_delta", 0.0) if prev else 0.0,
+            "entry_est_max_risk_dollar": prev.get("entry_est_max_risk_dollar", 0.0) if prev else 0.0,
             "entry_ignition_delta": prev.get("entry_ignition_delta", 0) if prev else 0,
             "entry_option_oi": prev.get("entry_option_oi", 0) if prev else 0,
             "opened_at": prev.get("opened_at", datetime.now(central)) if prev else datetime.now(central),
@@ -6895,6 +6955,8 @@ def track_open_trades():
 
         # 4) Emergency option-premium stop as risk backstop only.
         if pnl_pct <= -stop_pct:
+            trade["premium_stop_with_thesis_intact"] = bool(thesis_state.get("ready") and (not thesis_state.get("invalid")))
+            trade["premium_stop_thesis_reason"] = str(thesis_state.get("reason", "") or "")
             close_trade(trade, current_price, "EMERGENCY STOP LOSS", pnl_pct)
             continue
 
@@ -7101,7 +7163,7 @@ def _trade_exit_explanation(trade, reason, entry_price, exit_price, pnl_pct, mar
     return f"{price_move}; {structure_text}; exit triggered by {reason}."
 
 
-def _sheets_exit_reason(reason, pnl_pct, pnl_dollar, market_context):
+def _sheets_exit_reason(reason, pnl_pct, pnl_dollar, market_context, diagnostics=None):
     """Keep the concrete exit trigger and observed underlying structure in Sheets."""
     context = market_context or {}
     price = _safe_float_num(context.get("price"), 0.0)
@@ -7116,6 +7178,8 @@ def _sheets_exit_reason(reason, pnl_pct, pnl_dollar, market_context):
             f" | exit underlying ${price:.2f} vs VWAP ${vwap:.2f}/EMA20 ${ema20:.2f}"
             f"; 2-bar {move_2bar:+.2f}%, 5-bar {move_5bar:+.2f}%"
         )
+    if diagnostics:
+        summary += f" | diag: {diagnostics}"
     return summary
 
 
@@ -7327,6 +7391,26 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         f"underlying_MAE={float(trade.get('underlying_mae_pct', 0.0))*100:+.2f}%"
     )
     exit_market_context = _capture_exit_market_context(trade)
+    side = str(trade.get("side", trade.get("signal", "")) or "").upper()
+    source = str(trade.get("strategy_source", "LEGACY") or "LEGACY").upper()
+    one_min_status = str(trade.get("one_minute_confirmation_status", "") or "")
+    entry_disagreement = bool(trade.get("entry_directional_disagreement", False))
+    entry_disagreement_reason = str(trade.get("entry_directional_disagreement_reason", "") or "")
+    premium_stop_thesis_intact = False
+    if str(reason or "").upper().startswith("EMERGENCY STOP LOSS"):
+        premium_stop_thesis_intact = bool(trade.get("premium_stop_with_thesis_intact", False))
+
+    exit_underlying = _safe_float_num((exit_market_context or {}).get("price", 0.0), 0.0)
+    entry_underlying = _safe_float_num(trade.get("underlying_entry_price", 0.0), 0.0)
+    underlying_directional_move_pct = None
+    contract_responsiveness = None
+    if exit_underlying > 0 and entry_underlying > 0 and side in ("CALL", "PUT"):
+        raw_underlying_move = (exit_underlying - entry_underlying) / entry_underlying
+        directional_move = raw_underlying_move if side == "CALL" else -raw_underlying_move
+        underlying_directional_move_pct = directional_move * 100.0
+        if abs(directional_move) >= 0.0001:
+            contract_responsiveness = pnl_pct / directional_move
+
     emoji = "\u2705" if pnl_pct > 0 else "\u274c"
     outcome_label = "PROFIT" if pnl_pct > 0 else "LOSS"
     closed_at = datetime.now(central)
@@ -7463,13 +7547,23 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
                 log(f"[{trade['underlying']}] Exit candle chart was not sent to Discord.")
 
     if final_close and _prev_partial_qty > 0 and _combined_cost > 0:
+        diag_text = (
+            f"src={source};1m={one_min_status or 'N/A'};dir_disagree={entry_disagreement}"
+            f"({entry_disagreement_reason or 'none'});resp={'n/a' if contract_responsiveness is None else f'{contract_responsiveness:.2f}x'}"
+            f";premium_stop_thesis_intact={premium_stop_thesis_intact}"
+        )
         sheets_reason = _sheets_exit_reason(
-            reason, combined_pnl_pct, _combined_dollar, exit_market_context
+            reason, combined_pnl_pct, _combined_dollar, exit_market_context, diagnostics=diag_text
         )
     else:
         _leg_dollar = (exit_px - entry_px) * close_qty_int * 100.0
+        diag_text = (
+            f"src={source};1m={one_min_status or 'N/A'};dir_disagree={entry_disagreement}"
+            f"({entry_disagreement_reason or 'none'});resp={'n/a' if contract_responsiveness is None else f'{contract_responsiveness:.2f}x'}"
+            f";premium_stop_thesis_intact={premium_stop_thesis_intact}"
+        )
         sheets_reason = _sheets_exit_reason(
-            reason, pnl_pct, _leg_dollar, exit_market_context
+            reason, pnl_pct, _leg_dollar, exit_market_context, diagnostics=diag_text
         )
     row = {
         "opened_at": trade["opened_at"],
@@ -7483,6 +7577,13 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         "pnl_pct":    pnl_pct * 100,
         "reason":     sheets_reason,
         "score":      trade["score"],
+        "strategy_source": source,
+        "one_minute_confirmation_status": one_min_status,
+        "entry_directional_disagreement": entry_disagreement,
+        "entry_directional_disagreement_reason": entry_disagreement_reason,
+        "premium_stop_with_thesis_intact": premium_stop_thesis_intact,
+        "underlying_directional_move_pct": underlying_directional_move_pct,
+        "contract_responsiveness": contract_responsiveness,
     }
     try:
         pd.DataFrame([row]).to_csv(
@@ -8035,6 +8136,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
 
     side, data = analyze(bars, client, symbol)
     if data:
+        data["strategy_source"] = _strategy_source_from_data(data)
         news_context = _get_symbol_news_context(symbol)
         data["latest_news"] = news_context.get("latest_news", "No recent Alpaca news")
         data["trending_news"] = news_context.get("trending_news", "")
@@ -8059,6 +8161,10 @@ def run_symbol(client, symbol, prefetched_bars=None):
 
     if side == "NO TRADE":
         return
+
+    directional_disagreement, directional_disagreement_reason = _entry_directional_disagreement(side, data)
+    data["entry_directional_disagreement"] = directional_disagreement
+    data["entry_directional_disagreement_reason"] = directional_disagreement_reason
 
     closing_block_minutes = closing_no_trade_minutes_remaining()
     if closing_block_minutes > 0:
@@ -8451,6 +8557,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
             trigger, trigger_reason = one_minute_entry_timing(symbol, side, bars_1m, data)
             data["one_minute_trigger"] = trigger or ""
             data["one_minute_entry_confirmed"] = bool(trigger)
+            data["one_minute_confirmation_reason"] = str(trigger_reason or "")
             if trigger:
                 log(f"[{symbol}] 1m SNIPER PASS: {trigger} — {trigger_reason}")
             else:
@@ -8458,10 +8565,13 @@ def run_symbol(client, symbol, prefetched_bars=None):
         except Exception as e:
             data["one_minute_trigger"] = ""
             data["one_minute_entry_confirmed"] = False
+            data["one_minute_confirmation_reason"] = f"eval error: {type(e).__name__}: {e}"
             log(f"[{symbol}] 1m sniper evaluation failed: {type(e).__name__}: {e}")
     else:
         data["one_minute_trigger"] = "DISABLED" if not ONE_MINUTE_ENTRY_ENABLED else ""
         data["one_minute_entry_confirmed"] = not ONE_MINUTE_ENTRY_ENABLED
+        data["one_minute_confirmation_reason"] = "sniper disabled" if not ONE_MINUTE_ENTRY_ENABLED else "not required for current mode"
+    data["one_minute_confirmation_status"] = _one_minute_confirmation_status(data)
 
     if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE:
         playbook_ok, playbook, playbook_reason = playbook_entry_ok(side, data, symbol)
