@@ -154,6 +154,7 @@ PLAYBOOK_MAX_VWAP_EXTENSION = float(os.getenv("PLAYBOOK_MAX_VWAP_EXTENSION", "0.
 PINE_SIGNAL_MODE = os.getenv("PINE_SIGNAL_MODE", "1") == "1"
 PINE_SIGNAL_SOURCE = str(os.getenv("PINE_SIGNAL_SOURCE", "BOTH")).strip().upper()  # BB | STOCH | BOTH
 PINE_DIRECTION = int(os.getenv("PINE_DIRECTION", "0"))  # -1 short only, 0 both, +1 long only
+PINE_TREND_FILTER = os.getenv("PINE_TREND_FILTER", "1") == "1"  # Require VWAP/Score alignment for Pine signals
 PINE_BB_LENGTH = max(2, int(os.getenv("PINE_BB_LENGTH", "20")))
 PINE_BB_MULT = float(os.getenv("PINE_BB_MULT", "2.0"))
 PINE_STOCH_LENGTH = max(2, int(os.getenv("PINE_STOCH_LENGTH", "14")))
@@ -454,7 +455,7 @@ ETF_MIN_OPTION_BID = float(os.getenv("ETF_MIN_OPTION_BID", "0.15"))
 ETF_MAX_OPTION_SPREAD_PCT = float(os.getenv("ETF_MAX_OPTION_SPREAD_PCT", "0.05"))
 ETF_MAX_OPTION_BID = float(os.getenv("ETF_MAX_OPTION_BID", "8.00"))
 STOCK_MIN_OPTION_BID = float(os.getenv("STOCK_MIN_OPTION_BID", "0.20"))
-STOCK_MAX_OPTION_SPREAD_PCT = float(os.getenv("STOCK_MAX_OPTION_SPREAD_PCT", "0.05"))
+STOCK_MAX_OPTION_SPREAD_PCT = float(os.getenv("STOCK_MAX_OPTION_SPREAD_PCT", "0.08"))
 STOCK_MAX_OPTION_BID = float(os.getenv("STOCK_MAX_OPTION_BID", "8.00"))
 STOCK_MIN_OPTION_VOLUME = int(os.getenv("STOCK_MIN_OPTION_VOLUME", "10"))
 STOCK_MIN_OPTION_OPEN_INTEREST = int(os.getenv("STOCK_MIN_OPTION_OPEN_INTEREST", "50"))
@@ -3850,8 +3851,8 @@ def analyze(df, client, symbol):
         use_stoch = source_mode in {"STOCH", "BOTH"}
         pine_long_signal = (use_bb and bb_long_signal) or (use_stoch and stoch_long_signal)
         pine_short_signal = (use_bb and bb_short_signal) or (use_stoch and stoch_short_signal)
-        allow_long = PINE_DIRECTION >= 0
-        allow_short = PINE_DIRECTION <= 0
+        allow_long = (PINE_DIRECTION >= 0) and (not PINE_TREND_FILTER or (price >= vwap or bull_score >= bear_score))
+        allow_short = (PINE_DIRECTION <= 0) and (not PINE_TREND_FILTER or (price <= vwap or bear_score >= bull_score))
         if pine_long_signal and not pine_short_signal and allow_long:
             side, score, tier, signal = "CALL", max(SCORE_SIGNAL, bull_score), "SIGNAL", "PINE_CALL"
             pine_signal_active = True
@@ -4173,7 +4174,7 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
         print(f"[{symbol}] Option/trading client not initialised — cannot fetch contracts.", flush=True)
         return None
     try:
-        today = date.today()
+        today = datetime.now(central).date()
         effective_min_dte = MIN_DTE if search_min_dte is None else max(MIN_DTE, int(search_min_dte))
         effective_max_dte = MAX_DTE if search_max_dte is None else int(search_max_dte)
         min_exp = today + timedelta(days=effective_min_dte)
@@ -4607,13 +4608,14 @@ def one_minute_entry_timing(symbol, side, bars_1m, five_min_data):
     """
     if not ONE_MINUTE_ENTRY_ENABLED:
         return "DISABLED", "1m sniper engine disabled"
-    if bars_1m is None or len(bars_1m) < 25:
-        return None, f"insufficient 1m history ({0 if bars_1m is None else len(bars_1m)}/25)"
+    min_1m_bars = int(os.getenv("ONE_MINUTE_MIN_BARS", "10"))
+    if bars_1m is None or len(bars_1m) < min_1m_bars:
+        return None, f"insufficient 1m history ({0 if bars_1m is None else len(bars_1m)}/{min_1m_bars})"
 
     df = bars_1m.copy()
     df["EMA9"] = df["close"].ewm(span=9, adjust=False).mean()
     df["EMA20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["VOL_AVG20"] = df["volume"].rolling(20).mean()
+    df["VOL_AVG20"] = df["volume"].rolling(min(20, max(1, len(df))), min_periods=1).mean()
 
     typical = (df["high"] + df["low"] + df["close"]) / 3.0
     idx = df.index
