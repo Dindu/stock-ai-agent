@@ -76,7 +76,7 @@ ETF_SYMBOLS = {"SPY", "QQQ", "IWM"}
 TOP_STOCK_SYMBOLS = {
     "AAPL", "NVDA", "MSFT", "AMZN",
     "TSLA", "AMD", "PLTR", "GOOGL",
-    "AVGO", "INTC", "SPCX",
+    "INTC", "SPCX", "NFLX", "COIN",
     "ADBE", "HOOD", "ORCL",
 }
 AGGRESSIVE_STOCK_SYMBOLS = {"TSLA", "AMD", "PLTR", "GOOGL"}
@@ -88,7 +88,7 @@ TIER_LIQUIDITY_THRESHOLDS = {
     "MEGA_LIQUID":  {"min_oi": 500,  "min_volume": 50,  "max_spread_pct": 0.06},
     "STANDARD":     {"min_oi": 100,  "min_volume": 10,  "max_spread_pct": 0.10},
 }
-DEFAULT_SYMBOLS = "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,TSLA,AMD,PLTR,GOOGL,AVGO,ADBE,HOOD,ORCL"
+DEFAULT_SYMBOLS = "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,TSLA,AMD,NFLX,COIN,PLTR,GOOGL,ADBE,HOOD,ORCL"
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
 ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")
 ALPACA_TRADING_BASE_URL = os.getenv("ALPACA_TRADING_BASE_URL", "https://paper-api.alpaca.markets")
@@ -5452,10 +5452,7 @@ def _fetch_stocktwits_trending_symbols():
 
 
 def get_trending_symbols(client, base_symbols):
-    """Get trending stock symbols from Alpaca screener, with Alpaca-bars fallback.
-
-    Returns (symbols, reasons) where reasons explains why each symbol is trending.
-    """
+    """Return the first Stocktwits trending symbols for the scan universe."""
     if not ENABLE_TRENDING_STOCKS or TRENDING_STOCK_COUNT <= 0:
         return [], {}
 
@@ -5464,133 +5461,20 @@ def get_trending_symbols(client, base_symbols):
     if updated_at and (now - updated_at).total_seconds() < max(30, TRENDING_REFRESH_SECONDS):
         return list(_trending_cache.get("symbols", [])), dict(_trending_cache.get("reasons", {}))
 
-    base_set = {s.upper() for s in base_symbols}
-
-    alpaca_ranked = {}
-    stocktwits_ranked = {}
-    screener_sources = [
-        ("/v1beta1/screener/stocks/movers", {"top": max(10, TRENDING_STOCK_COUNT * 4)}),
-        ("/v1beta1/screener/stocks/most-actives", {"top": max(10, TRENDING_STOCK_COUNT * 4)}),
-    ]
-
-    for path, params in screener_sources:
-        payload = _alpaca_data_get_json(path, params=params, timeout=8)
-        items = _extract_screener_items(payload)
-        if payload is None:
-            log(f"[TRENDING] Alpaca screener {path} returned no payload (request failed or non-200).")
-        elif not items:
-            log(f"[TRENDING] Alpaca screener {path} returned 0 usable items (payload keys: {list(payload.keys()) if isinstance(payload, dict) else type(payload)}).")
-        else:
-            log(f"[TRENDING] Alpaca screener {path} returned {len(items)} raw item(s).")
-        for idx, item in enumerate(items):
-            sym = str(item.get("symbol") or item.get("ticker") or "").upper().strip()
-            if not sym or sym in ETF_SYMBOLS or sym in base_set:
-                continue
-            if not _is_valid_trending_symbol(sym):
-                continue
-            if not _is_stock_like_trending_candidate(sym):
-                continue
-
-            # Validate real-time tradability characteristics via recent bars.
-            try:
-                bars = fetch_bars(client, sym)
-                if len(bars) < TRENDING_MIN_BAR_COUNT:
-                    continue
-                last_close = float(bars["close"].iloc[-1])
-                last_volume = int(float(bars["volume"].iloc[-1]))
-                if last_close < TRENDING_MIN_PRICE or last_volume < TRENDING_MIN_LAST_VOLUME:
-                    continue
-            except Exception:
-                continue
-
-            pct = _safe_float_num(
-                item.get("percent_change", item.get("change_percent", item.get("change", 0.0))),
-                0.0,
-            )
-            vol = _safe_float_num(item.get("volume", 0.0), 0.0)
-            rank_bonus = max(0.0, 40.0 - (idx * 2.0))
-            score = (abs(pct) * 6.0) + min(vol / 1_000_000.0, 20.0) + rank_bonus
-            reason = f"screener pct={pct:+.2f}% vol={int(vol)}"
-
-            prev = alpaca_ranked.get(sym)
-            if (prev is None) or (score > prev[0]):
-                alpaca_ranked[sym] = (score, reason)
-
-    # Blend in social momentum from Stocktwits trending feed.
     stocktwits_syms = _fetch_stocktwits_trending_symbols()
-    for idx, sym in enumerate(stocktwits_syms):
-        if not sym or sym in ETF_SYMBOLS or sym in base_set:
-            continue
-        if not _is_valid_trending_symbol(sym):
-            continue
-        if not _is_stock_like_trending_candidate(sym):
-            continue
-
-        try:
-            bars = fetch_bars(client, sym)
-            if len(bars) < TRENDING_MIN_BAR_COUNT:
-                continue
-            last_close = float(bars["close"].iloc[-1])
-            last_volume = int(float(bars["volume"].iloc[-1]))
-            if last_close < TRENDING_MIN_PRICE or last_volume < TRENDING_MIN_LAST_VOLUME:
-                continue
-        except Exception:
-            continue
-
-        rank_bonus = max(0.0, 26.0 - (idx * 1.5))
-        score = 30.0 + rank_bonus
-        reason = "stocktwits trending"
-
-        prev = stocktwits_ranked.get(sym)
-        if (prev is None) or (score > prev[0]):
-            stocktwits_ranked[sym] = (score, reason)
-
-    # Fallback: derive trend candidates from Alpaca bars for top liquid stocks.
-    if not alpaca_ranked and not stocktwits_ranked:
-        for sym in sorted(TOP_STOCK_SYMBOLS):
-            if sym in ETF_SYMBOLS or sym in base_set:
-                continue
-            try:
-                bars = fetch_bars(client, sym)
-                if len(bars) < 25:
-                    continue
-                c0 = float(bars["close"].iloc[-1])
-                c5 = float(bars["close"].iloc[-6]) if len(bars) >= 6 else c0
-                v0 = float(bars["volume"].iloc[-1])
-                vavg = float(bars["volume"].tail(20).mean())
-                ret5 = ((c0 / c5) - 1.0) * 100.0 if c5 > 0 else 0.0
-                vr = (v0 / vavg) if vavg > 0 else 1.0
-                score = abs(ret5) * 5.0 + min(max(vr - 1.0, 0.0), 4.0) * 10.0
-                alpaca_ranked[sym] = (score, f"bars 5m={ret5:+.2f}% volx={vr:.2f}")
-            except Exception:
-                continue
-
-    # Keep source-specific slots so a strong Alpaca mover cannot crowd out the
-    # separate Stocktwits signal before both sources reach the scan universe.
-    alpaca_ordered = sorted(alpaca_ranked.items(), key=lambda kv: kv[1][0], reverse=True)
-    stocktwits_ordered = sorted(stocktwits_ranked.items(), key=lambda kv: kv[1][0], reverse=True)
-    selected = []
-    for sym, _ in alpaca_ordered[:TRENDING_STOCK_COUNT]:
-        if sym not in selected:
-            selected.append(sym)
-    for sym, _ in stocktwits_ordered[:TRENDING_STOCK_COUNT]:
-        if sym not in selected:
-            selected.append(sym)
+    selected = stocktwits_syms[:TRENDING_STOCK_COUNT]
 
     reasons = {}
     for sym in selected:
-        base_reason = (
-            alpaca_ranked.get(sym) or stocktwits_ranked.get(sym) or (0.0, "")
-        )[1]
         news_reason = _fetch_trending_news_reason(sym)
-        reasons[sym] = f"{base_reason}; news: {news_reason}" if news_reason else base_reason
+        reasons[sym] = f"stocktwits trending; news: {news_reason}" if news_reason else "stocktwits trending"
 
     _trending_cache["updated_at"] = now
     _trending_cache["symbols"] = selected
     _trending_cache["reasons"] = reasons
 
     if selected:
-        log(f"Trending stocks from Alpaca/Stocktwits: {', '.join(selected)}")
+        log(f"Trending stocks from Stocktwits (unfiltered top {len(selected)}): {', '.join(selected)}")
         for sym in selected:
             why = reasons.get(sym, "")
             if why:
