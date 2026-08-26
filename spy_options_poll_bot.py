@@ -5466,7 +5466,8 @@ def get_trending_symbols(client, base_symbols):
 
     base_set = {s.upper() for s in base_symbols}
 
-    ranked = {}
+    alpaca_ranked = {}
+    stocktwits_ranked = {}
     screener_sources = [
         ("/v1beta1/screener/stocks/movers", {"top": max(10, TRENDING_STOCK_COUNT * 4)}),
         ("/v1beta1/screener/stocks/most-actives", {"top": max(10, TRENDING_STOCK_COUNT * 4)}),
@@ -5511,9 +5512,9 @@ def get_trending_symbols(client, base_symbols):
             score = (abs(pct) * 6.0) + min(vol / 1_000_000.0, 20.0) + rank_bonus
             reason = f"screener pct={pct:+.2f}% vol={int(vol)}"
 
-            prev = ranked.get(sym)
+            prev = alpaca_ranked.get(sym)
             if (prev is None) or (score > prev[0]):
-                ranked[sym] = (score, reason)
+                alpaca_ranked[sym] = (score, reason)
 
     # Blend in social momentum from Stocktwits trending feed.
     stocktwits_syms = _fetch_stocktwits_trending_symbols()
@@ -5540,12 +5541,12 @@ def get_trending_symbols(client, base_symbols):
         score = 30.0 + rank_bonus
         reason = "stocktwits trending"
 
-        prev = ranked.get(sym)
+        prev = stocktwits_ranked.get(sym)
         if (prev is None) or (score > prev[0]):
-            ranked[sym] = (score, reason)
+            stocktwits_ranked[sym] = (score, reason)
 
     # Fallback: derive trend candidates from Alpaca bars for top liquid stocks.
-    if not ranked:
+    if not alpaca_ranked and not stocktwits_ranked:
         for sym in sorted(TOP_STOCK_SYMBOLS):
             if sym in ETF_SYMBOLS or sym in base_set:
                 continue
@@ -5560,16 +5561,27 @@ def get_trending_symbols(client, base_symbols):
                 ret5 = ((c0 / c5) - 1.0) * 100.0 if c5 > 0 else 0.0
                 vr = (v0 / vavg) if vavg > 0 else 1.0
                 score = abs(ret5) * 5.0 + min(max(vr - 1.0, 0.0), 4.0) * 10.0
-                ranked[sym] = (score, f"bars 5m={ret5:+.2f}% volx={vr:.2f}")
+                alpaca_ranked[sym] = (score, f"bars 5m={ret5:+.2f}% volx={vr:.2f}")
             except Exception:
                 continue
 
-    ordered = sorted(ranked.items(), key=lambda kv: kv[1][0], reverse=True)
-    selected = [sym for sym, _ in ordered[:TRENDING_STOCK_COUNT]]
+    # Keep source-specific slots so a strong Alpaca mover cannot crowd out the
+    # separate Stocktwits signal before both sources reach the scan universe.
+    alpaca_ordered = sorted(alpaca_ranked.items(), key=lambda kv: kv[1][0], reverse=True)
+    stocktwits_ordered = sorted(stocktwits_ranked.items(), key=lambda kv: kv[1][0], reverse=True)
+    selected = []
+    for sym, _ in alpaca_ordered[:TRENDING_STOCK_COUNT]:
+        if sym not in selected:
+            selected.append(sym)
+    for sym, _ in stocktwits_ordered[:TRENDING_STOCK_COUNT]:
+        if sym not in selected:
+            selected.append(sym)
 
     reasons = {}
     for sym in selected:
-        base_reason = ranked.get(sym, (0.0, ""))[1]
+        base_reason = (
+            alpaca_ranked.get(sym) or stocktwits_ranked.get(sym) or (0.0, "")
+        )[1]
         news_reason = _fetch_trending_news_reason(sym)
         reasons[sym] = f"{base_reason}; news: {news_reason}" if news_reason else base_reason
 
