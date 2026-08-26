@@ -3851,8 +3851,10 @@ def analyze(df, client, symbol):
         use_stoch = source_mode in {"STOCH", "BOTH"}
         pine_long_signal = (use_bb and bb_long_signal) or (use_stoch and stoch_long_signal)
         pine_short_signal = (use_bb and bb_short_signal) or (use_stoch and stoch_short_signal)
-        allow_long = (PINE_DIRECTION >= 0) and (not PINE_TREND_FILTER or (price >= vwap or bull_score >= bear_score))
-        allow_short = (PINE_DIRECTION <= 0) and (not PINE_TREND_FILTER or (price <= vwap or bear_score >= bull_score))
+        pine_long_trend_aligned = price >= vwap and bull_score >= bear_score
+        pine_short_trend_aligned = price <= vwap and bear_score >= bull_score
+        allow_long = (PINE_DIRECTION >= 0) and (not PINE_TREND_FILTER or pine_long_trend_aligned)
+        allow_short = (PINE_DIRECTION <= 0) and (not PINE_TREND_FILTER or pine_short_trend_aligned)
         if pine_long_signal and not pine_short_signal and allow_long:
             side, score, tier, signal = "CALL", max(SCORE_SIGNAL, bull_score), "SIGNAL", "PINE_CALL"
             pine_signal_active = True
