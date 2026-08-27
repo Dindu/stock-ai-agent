@@ -327,6 +327,11 @@ ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
 ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "1"
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))  # take-profit at +20%
 STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.25"))  # emergency option-premium stop; thesis invalidation exits earlier
+# A brief confirmation window prevents a transient option quote/spread move from
+# closing a technically intact trade. Thesis invalidations still exit immediately.
+EMERGENCY_STOP_THESIS_GRACE_ENABLED = os.getenv("EMERGENCY_STOP_THESIS_GRACE_ENABLED", "1") == "1"
+EMERGENCY_STOP_THESIS_GRACE_SECONDS = float(os.getenv("EMERGENCY_STOP_THESIS_GRACE_SECONDS", "30"))
+EMERGENCY_STOP_MAX_EXTRA_LOSS_PCT = float(os.getenv("EMERGENCY_STOP_MAX_EXTRA_LOSS_PCT", "0.05"))
 # Adaptive exit profile (expectancy-focused, not trade-count suppression).
 PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "0.12"))
 PARTIAL_CLOSE_FRACTION = float(os.getenv("PARTIAL_CLOSE_FRACTION", "0.70"))
@@ -1983,8 +1988,12 @@ def runner_exit_profile_for_trade(signal, score, data, base_target_pct):
     }
 
 
-def option_candidate_rank(candidate):
-    """Rank option candidates by spread, liquidity and delta alignment."""
+def option_candidate_rank(candidate, entry_quality_low=False):
+    """Rank option candidates by spread, liquidity and delta alignment.
+    
+    When entry_quality_low=True (e.g., 1m WAIT or macro disagreement), prioritize
+    tight spreads and liquidity over strike distance.
+    """
     spread_pct = _safe_float_num(candidate.get("spread_pct", 1.0), 1.0)
     volume = max(0.0, _safe_float_num(candidate.get("volume", 0), 0.0))
     oi = max(0.0, _safe_float_num(candidate.get("open_interest", 0), 0.0))
@@ -2011,11 +2020,20 @@ def option_candidate_rank(candidate):
         1.0 - min(1.0, strike_distance_pct / max(0.0001, OPTION_MAX_STRIKE_DISTANCE_PCT)),
     )
 
+    if entry_quality_low:
+        spread_weight = max(0.60, OPTION_RANK_SPREAD_WEIGHT + 0.15)
+        liq_weight = max(0.30, OPTION_RANK_LIQUIDITY_WEIGHT)
+        strike_weight = min(0.10, OPTION_RANK_STRIKE_DISTANCE_WEIGHT)
+    else:
+        spread_weight = OPTION_RANK_SPREAD_WEIGHT
+        liq_weight = OPTION_RANK_LIQUIDITY_WEIGHT
+        strike_weight = OPTION_RANK_STRIKE_DISTANCE_WEIGHT
+
     score = (
-        spread_score * OPTION_RANK_SPREAD_WEIGHT
-        + liq_raw * OPTION_RANK_LIQUIDITY_WEIGHT
+        spread_score * spread_weight
+        + liq_raw * liq_weight
         + delta_score * OPTION_RANK_DELTA_WEIGHT
-        + strike_distance_score * OPTION_RANK_STRIKE_DISTANCE_WEIGHT
+        + strike_distance_score * strike_weight
     )
     return score
 
@@ -3150,26 +3168,44 @@ def _maybe_send_transition_alert(symbol, data):
     _last_transition_alert_at[symbol] = now_ct
 
 
-def position_qty_from_score(score, dominance=0):
-    """Return position size based on entry score grade.
+def position_qty_from_score(score, dominance=0, one_min_status="", entry_disagreement=False):
+    """Return position size based on entry score grade with quality adjustments.
 
     Grade A (score >= GRADE_SCORE_A) -> GRADE_QTY_A  (e.g. 6 contracts)
     Grade B (score >= GRADE_SCORE_B) -> GRADE_QTY_B  (e.g. 4 contracts)
     Grade C (score >= GRADE_SCORE_C) -> GRADE_QTY_C  (e.g. 3 contracts)
     Grade D (below C threshold)      -> GRADE_QTY_D  (e.g. 2 contracts)
+    
+    Reduces position size when entry quality is lower:
+    - 1m WAIT: unconfirmed at 1-min level (reduce ~50%)
+    - directional disagreement with macro: reduce ~30%
     """
     if GRADE_BASED_QTY:
         score_int = int(score)
         if score_int >= GRADE_SCORE_A:
-            grade, qty = "A", GRADE_QTY_A
+            grade, base_qty = "A", GRADE_QTY_A
         elif score_int >= GRADE_SCORE_B:
-            grade, qty = "B", GRADE_QTY_B
+            grade, base_qty = "B", GRADE_QTY_B
         elif score_int >= GRADE_SCORE_C:
-            grade, qty = "C", GRADE_QTY_C
+            grade, base_qty = "C", GRADE_QTY_C
         else:
-            grade, qty = "D", GRADE_QTY_D
-        log(f"[SIZING] score={score_int} → Grade {grade} → {qty} contracts")
-        return qty
+            grade, base_qty = "D", GRADE_QTY_D
+        
+        adjusted_qty = base_qty
+        quality_factor = 1.0
+        reasons = []
+        
+        if str(one_min_status or "").upper() == "WAIT":
+            quality_factor *= 0.50
+            reasons.append("1m_wait")
+        if entry_disagreement:
+            quality_factor *= 0.70
+            reasons.append("dir_disagree")
+        
+        adjusted_qty = max(1, int(base_qty * quality_factor))
+        reason_str = f" [{','.join(reasons)}]" if reasons else ""
+        log(f"[SIZING] score={score_int} → Grade {grade} → base {base_qty} → adjusted {adjusted_qty}{reason_str}")
+        return adjusted_qty
 
     # Legacy: confidence-boost sizing off score delta.
     base_qty = max(MIN_POSITION_QTY, min(MAX_POSITION_QTY, BASE_POSITION_QTY))
@@ -3180,7 +3216,14 @@ def position_qty_from_score(score, dominance=0):
     score_boost = max(0, (int(score) - SCORE_STRONG) // step)
     confidence_boost = max(0, (int(dominance) - SCORE_DOMINANCE) // max(10, step * 2))
     extra_steps = score_boost + confidence_boost
-    return max(base_qty, min(MAX_POSITION_QTY, base_qty + extra_steps))
+    
+    adjusted_qty = max(base_qty, min(MAX_POSITION_QTY, base_qty + extra_steps))
+    if str(one_min_status or "").upper() == "WAIT":
+        adjusted_qty = max(1, int(adjusted_qty * 0.50))
+    if entry_disagreement:
+        adjusted_qty = max(1, int(adjusted_qty * 0.70))
+    
+    return adjusted_qty
 
 
 def get_previous_day_levels(client, symbol):
@@ -4540,15 +4583,20 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
             if directional_near_spot:
                 pool = directional_near_spot
 
-            ranked = sorted(pool, key=option_candidate_rank, reverse=True)
+            entry_quality_low = bool(
+                str((data or {}).get("one_minute_confirmation_status", "") or "").upper() == "WAIT"
+                or (data or {}).get("entry_directional_disagreement", False)
+            )
+            ranked = sorted(pool, key=lambda c: option_candidate_rank(c, entry_quality_low=entry_quality_low), reverse=True)
             best = ranked[0]
+            best_rank = option_candidate_rank(best, entry_quality_low=entry_quality_low)
             print(
                 f"[{symbol}] Selected contract: {best['contract']} strike={best['strike']} "
                 f"expiry={best['expiry']} bid={best['bid']:.2f} ask={best['ask']:.2f} "
                 f"day_vol={best['volume']} oi={best['open_interest']} "
                 f"oi_asof={best.get('open_interest_date') or 'unknown'} delta={best['delta']:.2f} "
                 f"dist={_safe_float(best.get('strike_distance_pct', 0.0), 0.0)*100:.2f}% "
-                f"rank={option_candidate_rank(best):.3f}",
+                f"rank={best_rank:.3f}",
                 flush=True,
             )
             _log_contract_data_quality(symbol, best)
@@ -4560,7 +4608,11 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
             and max_ext_from_vwap is not None
             and relaxed_fallback_candidates
         ):
-            ranked_relaxed = sorted(relaxed_fallback_candidates, key=option_candidate_rank, reverse=True)
+            entry_quality_low = bool(
+                str((data or {}).get("one_minute_confirmation_status", "") or "").upper() == "WAIT"
+                or (data or {}).get("entry_directional_disagreement", False)
+            )
+            ranked_relaxed = sorted(relaxed_fallback_candidates, key=lambda c: option_candidate_rank(c, entry_quality_low=entry_quality_low), reverse=True)
             best_relaxed = dict(ranked_relaxed[0])
             best_relaxed["_selection_mode"] = "RELAXED_FALLBACK"
             print(
@@ -6955,10 +7007,43 @@ def track_open_trades():
 
         # 4) Emergency option-premium stop as risk backstop only.
         if pnl_pct <= -stop_pct:
-            trade["premium_stop_with_thesis_intact"] = bool(thesis_state.get("ready") and (not thesis_state.get("invalid")))
+            thesis_intact = bool(thesis_state.get("ready") and (not thesis_state.get("invalid")))
+            trade["premium_stop_with_thesis_intact"] = thesis_intact
             trade["premium_stop_thesis_reason"] = str(thesis_state.get("reason", "") or "")
+            hard_stop_pct = stop_pct + max(0.0, EMERGENCY_STOP_MAX_EXTRA_LOSS_PCT)
+            now_ts = time.time()
+            first_breach_ts = trade.get("emergency_stop_first_breach_ts")
+            grace_elapsed = (
+                now_ts - float(first_breach_ts)
+                if first_breach_ts is not None
+                else 0.0
+            )
+            grace_active = (
+                EMERGENCY_STOP_THESIS_GRACE_ENABLED
+                and thesis_intact
+                and pnl_pct > -hard_stop_pct
+            )
+            if grace_active and first_breach_ts is None:
+                trade["emergency_stop_first_breach_ts"] = now_ts
+                log(
+                    f"[{trade['underlying']}] EMERGENCY STOP WARNING: option PnL {pnl_pct * 100:+.2f}% "
+                    f"<= -{stop_pct * 100:.2f}% but thesis intact ({trade['premium_stop_thesis_reason']}); "
+                    f"confirming for {EMERGENCY_STOP_THESIS_GRACE_SECONDS:.0f}s, "
+                    f"hard exit at -{hard_stop_pct * 100:.2f}%."
+                )
+                continue
+            if grace_active and grace_elapsed < max(0.0, EMERGENCY_STOP_THESIS_GRACE_SECONDS):
+                log(
+                    f"[{trade['underlying']}] EMERGENCY STOP WARNING: confirming "
+                    f"{grace_elapsed:.0f}/{EMERGENCY_STOP_THESIS_GRACE_SECONDS:.0f}s; "
+                    f"PnL {pnl_pct * 100:+.2f}%, thesis intact."
+                )
+                continue
+            trade["emergency_stop_grace_elapsed_seconds"] = round(grace_elapsed, 1)
+            trade["emergency_stop_hard_exit"] = bool(pnl_pct <= -hard_stop_pct)
             close_trade(trade, current_price, "EMERGENCY STOP LOSS", pnl_pct)
             continue
+        trade["emergency_stop_first_breach_ts"] = None
 
         # 5) Time stop: if the trade has sat too long, exit to avoid prolonged theta decay.
         if MAX_TRADE_HOLD_MINUTES > 0 and held_minutes >= MAX_TRADE_HOLD_MINUTES:
@@ -7724,7 +7809,9 @@ def try_open_paper_trade(symbol, side, option, data):
     raw_score = int(data.get("raw_entry_score", score))
     macro_penalty = int(data.get("macro_penalty", 0))
     dominance = abs(int(data.get("bull_score", 0)) - int(data.get("bear_score", 0)))
-    qty = position_qty_from_score(score, dominance)
+    one_min_status = str((data or {}).get("one_minute_confirmation_status", "") or "").upper()
+    entry_disagreement = bool((data or {}).get("entry_directional_disagreement", False))
+    qty = position_qty_from_score(score, dominance, one_min_status=one_min_status, entry_disagreement=entry_disagreement)
     signal_label = f"STRONG {side}"
 
     # Broker-side buying power guard to reduce avoidable rejected option orders.
