@@ -2335,6 +2335,24 @@ def unified_entry_quality_v2(symbol, side, data, option):
     spread_score = 100.0 if spread_pct <= 0.04 else 75.0 if spread_pct <= 0.08 else 45.0 if spread_pct <= 0.12 else 20.0
     liquidity_score = 100.0 if (vol >= 500 and oi >= 5000) else 75.0 if (vol >= 250 and oi >= 2500) else 45.0 if (vol >= 100 and oi >= 1000) else 20.0
     contract_score = max(0.0, min(100.0, 0.45 * delta_score + 0.30 * spread_score + 0.25 * liquidity_score))
+    data["entry_quality_v2_components"] = {
+        "trend": round(trend_score, 2),
+        "location": round(location_score, 2),
+        "setup": round(setup_score, 2),
+        "trigger": round(trigger_score, 2),
+        "context_rs": round(context_rs_score, 2),
+        "contract": round(contract_score, 2),
+    }
+    data["entry_contract_quality"] = {
+        "score": round(contract_score, 2),
+        "delta_score": round(delta_score, 2),
+        "spread_score": round(spread_score, 2),
+        "liquidity_score": round(liquidity_score, 2),
+        "delta": round(delta_abs, 4),
+        "spread_pct": round(spread_pct, 6),
+        "volume": int(vol),
+        "open_interest": int(oi),
+    }
 
     weight_sum = max(
         1.0,
@@ -2353,6 +2371,7 @@ def unified_entry_quality_v2(symbol, side, data, option):
         + context_rs_score * V2_ENTRY_WEIGHT_CONTEXT_RS
         + contract_score * V2_ENTRY_WEIGHT_CONTRACT
     ) / weight_sum
+    data["entry_quality_v2_score"] = round(weighted_total, 2)
 
     detail = (
         f"trend={trend_score:.0f}, location={location_score:.0f}, setup={setup_score:.0f}, "
@@ -6492,6 +6511,16 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
     directional_disagreement, directional_disagreement_reason = _entry_directional_disagreement(side, data or {})
     strategy_source = _strategy_source_from_data(data or {})
     trigger_status = _one_minute_confirmation_status(data or {})
+    entry_contract_quality = dict((data or {}).get("entry_contract_quality", {}) or {})
+    entry_quality_components = dict((data or {}).get("entry_quality_v2_components", {}) or {})
+    quote_age_seconds = None
+    quote_timestamp = option.get("quote_timestamp")
+    if quote_timestamp is not None:
+        try:
+            quote_ts = quote_timestamp if quote_timestamp.tzinfo else quote_timestamp.replace(tzinfo=timezone.utc)
+            quote_age_seconds = max(0.0, (datetime.now(timezone.utc) - quote_ts).total_seconds())
+        except Exception:
+            quote_age_seconds = None
     stop_dollar_risk = float(entry_price) * 100.0 * int(max(1, qty)) * float(stop_pct)
     return {
         "underlying": symbol,
@@ -6543,12 +6572,22 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "one_minute_confirmation_status": trigger_status,
         "setup_type": setup_type,
         "strategy_source": strategy_source,
+        "entry_playbook": str((data or {}).get("entry_playbook", "") or setup_type),
+        "entry_quality_v2_score": _safe_float_num((data or {}).get("entry_quality_v2_score"), 0.0),
+        "entry_quality_v2_components": entry_quality_components,
+        "entry_contract_quality": entry_contract_quality,
         "entry_market_map": (data or {}).get("market_map", {}),
         "entry_directional_disagreement": directional_disagreement,
         "entry_directional_disagreement_reason": directional_disagreement_reason,
         "entry_macro_penalty": _safe_int_num((data or {}).get("macro_penalty", 0), 0),
         "entry_contract_spread_pct": _safe_float_num((option or {}).get("spread_pct", 0.0), 0.0),
         "entry_contract_delta": _safe_float_num((option or {}).get("delta", 0.0), 0.0),
+        "entry_contract_volume": _safe_int_num((option or {}).get("volume", 0), 0),
+        "entry_contract_bid": _safe_float_num((option or {}).get("bid", 0.0), 0.0),
+        "entry_contract_ask": _safe_float_num((option or {}).get("ask", 0.0), 0.0),
+        "entry_contract_slippage_est": _safe_float_num((option or {}).get("slippage_est", 0.0), 0.0),
+        "entry_contract_dte": _safe_int_num((option or {}).get("dte", 0), 0),
+        "entry_contract_quote_age_seconds": round(quote_age_seconds, 2) if quote_age_seconds is not None else None,
         "entry_est_max_risk_dollar": stop_dollar_risk,
         "entry_ignition_delta": ignition_delta,
         "entry_option_oi": option_oi,
@@ -6755,6 +6794,16 @@ def sync_open_trades_from_alpaca():
             "one_minute_confirmation_status": prev.get("one_minute_confirmation_status", "") if prev else "",
             "setup_type": prev.get("setup_type", "UNKNOWN") if prev else "UNKNOWN",
             "strategy_source": prev.get("strategy_source", "LEGACY") if prev else "LEGACY",
+            "entry_playbook": prev.get("entry_playbook", "UNKNOWN") if prev else "UNKNOWN",
+            "entry_quality_v2_score": prev.get("entry_quality_v2_score", 0.0) if prev else 0.0,
+            "entry_quality_v2_components": dict(prev.get("entry_quality_v2_components", {}) or {}) if prev else {},
+            "entry_contract_quality": dict(prev.get("entry_contract_quality", {}) or {}) if prev else {},
+            "entry_contract_volume": prev.get("entry_contract_volume", 0) if prev else 0,
+            "entry_contract_bid": prev.get("entry_contract_bid", 0.0) if prev else 0.0,
+            "entry_contract_ask": prev.get("entry_contract_ask", 0.0) if prev else 0.0,
+            "entry_contract_slippage_est": prev.get("entry_contract_slippage_est", 0.0) if prev else 0.0,
+            "entry_contract_dte": prev.get("entry_contract_dte", 0) if prev else 0,
+            "entry_contract_quote_age_seconds": prev.get("entry_contract_quote_age_seconds") if prev else None,
             "entry_market_map": prev.get("entry_market_map", {}) if prev else {},
             "entry_directional_disagreement": bool(prev.get("entry_directional_disagreement", False)) if prev else False,
             "entry_directional_disagreement_reason": prev.get("entry_directional_disagreement_reason", "") if prev else "",
@@ -7910,6 +7959,14 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         "underlying_directional_move_pct": underlying_directional_move_pct,
         "contract_responsiveness": contract_responsiveness,
         "entry_market_map": json.dumps(trade.get("entry_market_map", {}), sort_keys=True, default=str),
+        "entry_playbook": trade.get("entry_playbook", trade.get("setup_type", "UNKNOWN")),
+        "entry_quality_v2_score": trade.get("entry_quality_v2_score", 0.0),
+        "entry_quality_v2_components": json.dumps(trade.get("entry_quality_v2_components", {}), sort_keys=True, default=str),
+        "entry_contract_quality": json.dumps(trade.get("entry_contract_quality", {}), sort_keys=True, default=str),
+        "entry_contract_volume": trade.get("entry_contract_volume", 0),
+        "entry_contract_dte": trade.get("entry_contract_dte", 0),
+        "entry_contract_quote_age_seconds": trade.get("entry_contract_quote_age_seconds"),
+        "entry_contract_slippage_est": trade.get("entry_contract_slippage_est", 0.0),
     }
     try:
         pd.DataFrame([row]).to_csv(
