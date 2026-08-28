@@ -3441,6 +3441,98 @@ def detect_horizontal_levels(df, price, atr14, lookback=60):
         "resistance": resistance,
     }
 
+
+def build_market_map(df, price, vwap, atr14, pdh=None, pdl=None):
+    """Build explicit session and 15m reference levels for shadow telemetry."""
+    result = {
+        "premarket_high": None,
+        "premarket_low": None,
+        "opening_range_high": None,
+        "opening_range_low": None,
+        "fifteen_minute_high": None,
+        "fifteen_minute_low": None,
+        "fifteen_minute_median": None,
+        "levels": [],
+        "nearest_support": None,
+        "nearest_resistance": None,
+        "room_atr_call": None,
+        "room_atr_put": None,
+        "level_confluence": 0,
+    }
+    try:
+        if df is None or df.empty or price <= 0:
+            return result
+        frame = df.copy()
+        index = pd.to_datetime(frame.index)
+        if index.tz is None:
+            index = index.tz_localize("UTC")
+        eastern = index.tz_convert("America/New_York")
+        frame.index = eastern
+        session_date = eastern[-1].date()
+        today = frame[eastern.date == session_date]
+        if today.empty:
+            return result
+
+        premarket = today.between_time("04:00", "09:29")
+        regular = today.between_time("09:30", "16:00")
+        opening_minutes = max(5, int(os.getenv("MARKET_MAP_OPENING_RANGE_MINUTES", "15")))
+        opening_range = regular.between_time("09:30", "09:30")
+        if not regular.empty:
+            opening_range = regular[regular.index <= regular.index[0] + timedelta(minutes=opening_minutes)]
+
+        if not premarket.empty:
+            result["premarket_high"] = round(float(premarket["high"].max()), 4)
+            result["premarket_low"] = round(float(premarket["low"].min()), 4)
+        if not opening_range.empty:
+            result["opening_range_high"] = round(float(opening_range["high"].max()), 4)
+            result["opening_range_low"] = round(float(opening_range["low"].min()), 4)
+
+        completed = today.resample("15min", origin="start_day", offset="30min", label="right", closed="right").agg(
+            {"high": "max", "low": "min", "close": "last"}
+        ).dropna()
+        completed = completed.iloc[:-1] if len(completed) > 1 else completed.iloc[0:0]
+        if not completed.empty:
+            recent_15m = completed.tail(12)
+            result["fifteen_minute_high"] = round(float(recent_15m["high"].max()), 4)
+            result["fifteen_minute_low"] = round(float(recent_15m["low"].min()), 4)
+            result["fifteen_minute_median"] = round(
+                float((recent_15m["high"].max() + recent_15m["low"].min()) / 2.0), 4
+            )
+
+        candidates = [
+            ("PDH", pdh), ("PDL", pdl),
+            ("PREMARKET_HIGH", result["premarket_high"]),
+            ("PREMARKET_LOW", result["premarket_low"]),
+            ("OPENING_RANGE_HIGH", result["opening_range_high"]),
+            ("OPENING_RANGE_LOW", result["opening_range_low"]),
+            ("15M_HIGH", result["fifteen_minute_high"]),
+            ("15M_LOW", result["fifteen_minute_low"]),
+            ("15M_MEDIAN", result["fifteen_minute_median"]),
+            ("VWAP", vwap),
+        ]
+        levels = [(name, float(level)) for name, level in candidates if level and float(level) > 0]
+        result["levels"] = [{"name": name, "level": round(level, 4)} for name, level in levels]
+        supports = [(name, level) for name, level in levels if level < price]
+        resistances = [(name, level) for name, level in levels if level > price]
+        if supports:
+            result["nearest_support"] = {"name": max(supports, key=lambda item: item[1])[0], "level": round(max(supports, key=lambda item: item[1])[1], 4)}
+        if resistances:
+            result["nearest_resistance"] = {"name": min(resistances, key=lambda item: item[1])[0], "level": round(min(resistances, key=lambda item: item[1])[1], 4)}
+        if atr14 and atr14 > 0:
+            if resistances:
+                result["room_atr_call"] = round((min(level for _, level in resistances) - price) / atr14, 2)
+            if supports:
+                result["room_atr_put"] = round((price - max(level for _, level in supports)) / atr14, 2)
+            confluence_tolerance = max(atr14 * 0.15, price * 0.0005)
+            result["level_confluence"] = max(
+                (sum(abs(level - anchor) <= confluence_tolerance for _, level in levels) for _, anchor in levels),
+                default=0,
+            )
+        return result
+    except Exception as e:
+        log(f"Market map construction failed: {e}")
+        return result
+
 def analyze(df, client, symbol):
     """Compute weighted Bull/Bear scores (0-100) from independent factor groups.
 
@@ -3514,6 +3606,7 @@ def analyze(df, client, symbol):
 
     support_level = horizontal_levels.get("support")
     resistance_level = horizontal_levels.get("resistance")
+    market_map = build_market_map(df, price, vwap, atr14, pdh, pdl)
 
     fresh_breakout = prev_close <= recent_high and price > recent_high
     fresh_breakdown = prev_close >= recent_low and price < recent_low
@@ -4066,6 +4159,7 @@ def analyze(df, client, symbol):
         "recent_low": recent_low,
         "support_level": support_level,
         "resistance_level": resistance_level,
+        "market_map": market_map,
         "micro_high": micro_high,
         "micro_low": micro_low,
         "prior_bar_high": prior_bar_high,
@@ -6414,6 +6508,7 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "one_minute_confirmation_status": trigger_status,
         "setup_type": setup_type,
         "strategy_source": strategy_source,
+        "entry_market_map": (data or {}).get("market_map", {}),
         "entry_directional_disagreement": directional_disagreement,
         "entry_directional_disagreement_reason": directional_disagreement_reason,
         "entry_macro_penalty": _safe_int_num((data or {}).get("macro_penalty", 0), 0),
@@ -7669,6 +7764,7 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         "premium_stop_with_thesis_intact": premium_stop_thesis_intact,
         "underlying_directional_move_pct": underlying_directional_move_pct,
         "contract_responsiveness": contract_responsiveness,
+        "entry_market_map": json.dumps(trade.get("entry_market_map", {}), sort_keys=True, default=str),
     }
     try:
         pd.DataFrame([row]).to_csv(
