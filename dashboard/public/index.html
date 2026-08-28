@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Elite Trading Bot · Command Center</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+            mono: ['JetBrains Mono', 'ui-monospace', 'monospace']
+          },
+          colors: {
+            ink: {
+              950: '#070912',
+              900: '#0c0f1d',
+              800: '#11172b',
+              700: '#1a2240',
+              600: '#242d52',
+              500: '#3a4574'
+            },
+            accent: {
+              green: '#22e5a4',
+              red: '#ff5d7e',
+              blue: '#4f8cff',
+              amber: '#ffb547',
+              purple: '#b56dff',
+              cyan: '#4dd6ff'
+            }
+          },
+          boxShadow: {
+            glow: '0 0 0 1px rgba(255,255,255,0.06), 0 12px 40px -16px rgba(79,140,255,0.25)',
+            'glow-lg': '0 0 0 1px rgba(255,255,255,0.08), 0 28px 60px -24px rgba(79,140,255,0.35)'
+          }
+        }
+      }
+    };
+  </script>
+  <style>
+    :root {
+      --bg: radial-gradient(1200px 800px at 10% -10%, rgba(79,140,255,0.18), transparent 60%),
+            radial-gradient(900px 700px at 110% 10%, rgba(181,109,255,0.14), transparent 55%),
+            radial-gradient(700px 500px at 50% 110%, rgba(34,229,164,0.10), transparent 50%),
+            #070912;
+    }
+    [data-theme="light"] {
+      --bg: radial-gradient(1200px 800px at 10% -10%, rgba(79,140,255,0.22), transparent 60%),
+            radial-gradient(900px 700px at 110% 10%, rgba(181,109,255,0.18), transparent 55%),
+            #f4f6fc;
+    }
+    body {
+      background: var(--bg);
+      background-attachment: fixed;
+      min-height: 100vh;
+      font-family: 'Inter', system-ui, sans-serif;
+      color: #e6e9f7;
+    }
+    [data-theme="light"] body { color: #1c2340; }
+
+    .glass {
+      background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.015));
+      border: 1px solid rgba(255,255,255,0.07);
+      backdrop-filter: blur(20px) saturate(150%);
+      -webkit-backdrop-filter: blur(20px) saturate(150%);
+    }
+    [data-theme="light"] .glass {
+      background: linear-gradient(180deg, rgba(255,255,255,0.85), rgba(255,255,255,0.65));
+      border: 1px solid rgba(28,35,64,0.08);
+    }
+
+    .glass-strong {
+      background: linear-gradient(180deg, rgba(255,255,255,0.07), rgba(255,255,255,0.02));
+      border: 1px solid rgba(255,255,255,0.09);
+      backdrop-filter: blur(24px) saturate(160%);
+    }
+    [data-theme="light"] .glass-strong {
+      background: rgba(255,255,255,0.92);
+      border: 1px solid rgba(28,35,64,0.1);
+    }
+
+    .kpi-card {
+      position: relative;
+      overflow: hidden;
+      border-radius: 20px;
+      transition: transform .25s ease, box-shadow .25s ease;
+    }
+    .kpi-card::before {
+      content: '';
+      position: absolute;
+      inset: -1px;
+      border-radius: 20px;
+      padding: 1px;
+      background: linear-gradient(135deg, rgba(79,140,255,0.5), rgba(181,109,255,0.3) 40%, rgba(255,255,255,0.05) 70%);
+      -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+      -webkit-mask-composite: xor;
+              mask-composite: exclude;
+      opacity: 0;
+      transition: opacity .3s ease;
+      pointer-events: none;
+    }
+    .kpi-card:hover { transform: translateY(-2px); box-shadow: 0 24px 60px -28px rgba(79,140,255,0.45); }
+    .kpi-card:hover::before { opacity: 1; }
+
+    .kpi-card .spark {
+      position: absolute;
+      right: -8px;
+      bottom: -10px;
+      width: 60%;
+      height: 70%;
+      opacity: 0.4;
+      pointer-events: none;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    .pill-green { background: rgba(34,229,164,0.12); color: #22e5a4; border: 1px solid rgba(34,229,164,0.3); }
+    .pill-red   { background: rgba(255,93,126,0.12); color: #ff5d7e; border: 1px solid rgba(255,93,126,0.3); }
+    .pill-amber { background: rgba(255,181,71,0.12); color: #ffb547; border: 1px solid rgba(255,181,71,0.3); }
+    .pill-blue  { background: rgba(79,140,255,0.12); color: #4f8cff; border: 1px solid rgba(79,140,255,0.3); }
+    .pill-gray  { background: rgba(255,255,255,0.06); color: #aab1d1; border: 1px solid rgba(255,255,255,0.1); }
+
+    .dot-live {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #22e5a4;
+      box-shadow: 0 0 0 0 rgba(34,229,164,0.6);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%   { box-shadow: 0 0 0 0   rgba(34,229,164,0.7); }
+      70%  { box-shadow: 0 0 0 10px rgba(34,229,164,0); }
+      100% { box-shadow: 0 0 0 0   rgba(34,229,164,0); }
+    }
+
+    .scroller { max-height: 380px; overflow-y: auto; }
+    .scroller::-webkit-scrollbar { width: 8px; }
+    .scroller::-webkit-scrollbar-track { background: transparent; }
+    .scroller::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 4px; }
+    .scroller::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.18); }
+
+    .tile-row {
+      display: grid;
+      grid-template-columns: minmax(0,1.4fr) auto auto auto;
+      gap: 12px;
+      align-items: center;
+      padding: 10px 12px;
+      border-radius: 12px;
+      transition: background .15s ease;
+    }
+    .tile-row:hover { background: rgba(255,255,255,0.03); }
+
+    .num-mono { font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; }
+
+    .market-tile {
+      position: relative;
+      padding: 14px;
+      border-radius: 14px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.01));
+      border: 1px solid rgba(255,255,255,0.06);
+      transition: transform .2s ease, border-color .2s ease;
+    }
+    .market-tile:hover { transform: translateY(-1px); border-color: rgba(255,255,255,0.12); }
+
+    .fade-in { animation: fadeIn .35s ease both; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+
+    .heading { letter-spacing: -0.01em; }
+    .muted { color: #aab1d1; }
+    [data-theme="light"] .muted { color: #5b6486; }
+
+    .badge {
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+    }
+
+    /* skeleton loader */
+    .skel {
+      background: linear-gradient(90deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.12) 50%, rgba(255,255,255,0.04) 100%);
+      background-size: 200% 100%;
+      animation: shimmer 1.6s linear infinite;
+      border-radius: 6px;
+    }
+    @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
+    .chart-wrap { position: relative; height: 240px; }
+
+    [data-theme="light"] .scroller::-webkit-scrollbar-thumb { background: rgba(28,35,64,0.15); }
+    [data-theme="light"] .tile-row:hover { background: rgba(28,35,64,0.03); }
+    [data-theme="light"] .market-tile { background: rgba(255,255,255,0.7); border-color: rgba(28,35,64,0.08); }
+
+    /* Trade table */
+    .trade-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .trade-table thead th { padding: 9px 14px; text-align: left; font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #aab1d1; border-bottom: 1px solid rgba(255,255,255,0.07); white-space: nowrap; position: sticky; top: 0; background: var(--bg, #0d1117); z-index: 1; }
+    .trade-table thead th.r { text-align: right; }
+    .trade-table tbody tr { border-bottom: 1px solid rgba(255,255,255,0.04); transition: background .15s; }
+    .trade-table tbody tr:last-child { border-bottom: none; }
+    .trade-table tbody tr:hover { background: rgba(255,255,255,0.03); }
+    .trade-table td { padding: 9px 14px; vertical-align: middle; }
+    .trade-table td.r { text-align: right; }
+    [data-theme="light"] .trade-table thead th { color: #5b6486; border-bottom-color: rgba(28,35,64,0.08); background: #f5f6fa; }
+    [data-theme="light"] .trade-table tbody tr { border-bottom-color: rgba(28,35,64,0.05); }
+    [data-theme="light"] .trade-table tbody tr:hover { background: rgba(28,35,64,0.025); }
+
+    /* Responsive command-center views */
+    [data-active-view] [data-view-panel] { display: none; }
+    [data-active-view="overview"] [data-view-panel~="overview"],
+    [data-active-view="trades"] [data-view-panel~="trades"],
+    [data-active-view="analytics"] [data-view-panel~="analytics"],
+    [data-active-view="alerts"] [data-view-panel~="alerts"],
+    [data-active-view="integrations"] [data-view-panel~="integrations"] { display: block; }
+    [data-active-view="overview"] [data-view-panel~="overview"].grid,
+    [data-active-view="trades"] [data-view-panel~="trades"].grid,
+    [data-active-view="analytics"] [data-view-panel~="analytics"].grid,
+    [data-active-view="alerts"] [data-view-panel~="alerts"].grid,
+    [data-active-view="integrations"] [data-view-panel~="integrations"].grid { display: grid; }
+    [data-active-view="overview"] [data-view-panel~="overview"].flex,
+    [data-active-view="trades"] [data-view-panel~="trades"].flex,
+    [data-active-view="analytics"] [data-view-panel~="analytics"].flex,
+    [data-active-view="alerts"] [data-view-panel~="alerts"].flex,
+    [data-active-view="integrations"] [data-view-panel~="integrations"].flex { display: flex; }
+    .mobile-nav {
+      position: fixed; z-index: 60; left: 50%; bottom: 18px; transform: translateX(-50%);
+      display: flex; gap: 4px; padding: 7px; border-radius: 18px;
+      background: rgba(12,15,29,.92); border: 1px solid rgba(255,255,255,.12);
+      box-shadow: 0 12px 35px rgba(0,0,0,.38); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+    }
+    .mobile-nav button { border: 0; background: transparent; color: #8f98bd; padding: 7px 12px; border-radius: 12px; font: inherit; }
+    .mobile-nav button[aria-current="page"] { color: #fff; background: rgba(79,140,255,.2); }
+    .mobile-nav .nav-icon { display: inline-block; margin-right: 5px; font-size: 16px; line-height: 16px; }
+    .mobile-nav .nav-label { font-size: 10px; font-weight: 700; letter-spacing: .04em; }
+    [data-theme="light"] .mobile-nav { background: rgba(255,255,255,.94); border-color: rgba(28,35,64,.12); }
+    .view-kicker { display: flex; align-items: center; justify-content: space-between; margin: 2px 2px 12px; }
+    .view-kicker h1 { font-size: 21px; line-height: 1.1; }
+    .view-kicker span { font-size: 10px; color: #22e5a4; letter-spacing: .08em; text-transform: uppercase; }
+    .analytics-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .metric-card { padding: 14px; border-radius: 12px; background: linear-gradient(135deg, rgba(79,140,255,.13), rgba(255,255,255,.035)); border: 1px solid rgba(255,255,255,.08); }
+    .metric-card span { display: block; color: #aab1d1; font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
+    .metric-card strong { display: block; margin-top: 7px; font: 700 20px/1.1 'JetBrains Mono', monospace; }
+    .data-status-banner { display: none; align-items: center; gap: 8px; margin: 0 2px 12px; padding: 8px 10px; border-radius: 9px; font-size: 11px; }
+    .data-status-banner.show { display: flex; background: rgba(255,181,71,.10); border: 1px solid rgba(255,181,71,.28); color: #ffb547; }
+
+    @media (max-width: 767px) {
+      body { padding-bottom: 76px; }
+      header .max-w-\[1600px\] { padding: 10px 14px; }
+      header .w-10 { width: 34px; height: 34px; }
+      header .text-base { font-size: 14px; }
+      header .ml-3 { margin-left: 0; }
+      header #topPnL { font-size: 14px; }
+      header #themeToggle { display: none; }
+      main.max-w-\[1600px\] { padding: 14px 12px 20px; }
+      main.space-y-6 > * + * { margin-top: 14px; }
+      .kpi-card { border-radius: 14px; padding: 14px !important; }
+      .kpi-card .num-mono.text-4xl { font-size: 28px; }
+      .kpi-strip { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; gap: 7px; }
+      .kpi-strip .kpi-card { min-width: 0; min-height: 76px; padding: 8px 9px !important; border-radius: 11px; }
+      .kpi-strip .kpi-card .text-xs { font-size: 7px; letter-spacing: .01em; white-space: nowrap; }
+      .kpi-strip .kpi-card .num-mono.text-4xl { font-size: 18px; }
+      .kpi-strip .kpi-card .mt-3 { margin-top: 4px; }
+      .kpi-strip .kpi-card .mt-2 { margin-top: 3px; }
+      .kpi-strip .kpi-card .mb-1 { margin-bottom: 0; }
+      .kpi-strip .kpi-card > .flex:first-child { gap: 4px; }
+      .kpi-strip .kpi-card > .flex:first-child > .text-xs { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+      .kpi-strip .kpi-card .pill { flex-shrink: 0; padding: 3px 5px; font-size: 8px; gap: 2px; }
+      .kpi-strip .kpi-card > .flex:last-child { gap: 3px; }
+      .kpi-strip .kpi-card > .flex:last-child > * { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .kpi-strip .kpi-card > .flex:last-child .num-mono { font-size: 7px; }
+      .kpi-strip .kpi-card .spark { right: 0; bottom: 0; width: 48%; height: 48%; opacity: .22; }
+      .kpi-strip .kpi-card:nth-child(3) { order: 2; }
+      .kpi-strip .kpi-card:nth-child(2) { order: 3; }
+      .glass.rounded-2xl { border-radius: 14px; }
+      .glass.p-5 { padding: 14px; }
+      .chart-wrap { height: 190px; }
+      .service-health-panel { padding: 11px !important; }
+      .service-health-panel > .flex { align-items: flex-start; gap: 8px; }
+      .service-health-panel > .flex h2 { max-width: 56px; line-height: 1.15; }
+      .service-health-panel > .flex > .text-\[11px\] { display: none; }
+      .service-health-panel #healthOverall { max-width: 82px; padding: 4px 7px; font-size: 9px; white-space: normal; text-align: center; line-height: 1.1; }
+      .service-health-panel #servicesGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+      .service-health-panel #servicesGrid .market-tile { min-width: 0; padding: 8px; border-radius: 10px; }
+      .service-health-panel #servicesGrid .market-tile .text-\[11px\] { font-size: 9px; }
+      .service-health-panel #servicesGrid .market-tile .text-\[10px\] { font-size: 8px; }
+      .analytics-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+      .metric-card { padding: 10px; }
+      .metric-card span { font-size: 8px; }
+      .metric-card strong { font-size: 16px; margin-top: 5px; }
+      .trade-table { min-width: 680px; }
+      .trade-dashboard-panel { overflow: hidden; }
+      .trade-dashboard-panel > div:first-child { display: block; }
+      .trade-dashboard-panel > div:first-child > div:last-child { justify-content: flex-start; margin-top: 10px; }
+      .trade-dashboard-panel .period-filter { width: 100%; }
+      .trade-dashboard-panel .trade-table { min-width: 0 !important; width: 100% !important; table-layout: fixed; }
+      .trade-dashboard-panel .trade-table th,
+      .trade-dashboard-panel .trade-table td { padding: 8px 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .trade-dashboard-panel .trade-table th:nth-child(2),
+      .trade-dashboard-panel .trade-table td:nth-child(2),
+      .trade-dashboard-panel .trade-table th:nth-child(3),
+      .trade-dashboard-panel .trade-table td:nth-child(3),
+      .trade-dashboard-panel .trade-table th:nth-child(6),
+      .trade-dashboard-panel .trade-table td:nth-child(6),
+      .trade-dashboard-panel .trade-table th:nth-child(9),
+      .trade-dashboard-panel .trade-table td:nth-child(9) { display: none; }
+      .trade-dashboard-panel .trade-table th:nth-child(1),
+      .trade-dashboard-panel .trade-table td:nth-child(1) { width: 8%; }
+      .alerts-header { align-items: flex-start; }
+      .alerts-controls { width: 100%; justify-content: space-between; }
+      .alerts-controls .scan-filter { min-width: 120px; }
+      .trade-dashboard-panel .trade-table th:nth-child(4),
+      .trade-dashboard-panel .trade-table td:nth-child(4) { width: 27%; }
+      .trade-dashboard-panel .trade-table th:nth-child(5),
+      .trade-dashboard-panel .trade-table td:nth-child(5) { width: 21%; }
+      .trade-dashboard-panel .trade-table th:nth-child(7),
+      .trade-dashboard-panel .trade-table td:nth-child(7),
+      .trade-dashboard-panel .trade-table th:nth-child(8),
+      .trade-dashboard-panel .trade-table td:nth-child(8),
+      .trade-dashboard-panel .trade-table th:nth-child(10),
+      .trade-dashboard-panel .trade-table td:nth-child(10) { width: 15%; }
+      .mobile-nav { left: 10px; right: 10px; bottom: 10px; transform: none; display: grid; grid-template-columns: repeat(5, 1fr); }
+      .mobile-nav button { min-width: 0; padding: 7px 2px 6px; }
+      .mobile-nav .nav-icon { display: block; margin-right: 0; font-size: 18px; line-height: 18px; }
+      .mobile-nav .nav-label { display: block; margin-top: 4px; font-size: 9px; }
+      [data-theme="light"] .mobile-nav { background: rgba(255,255,255,.94); border-color: rgba(28,35,64,.12); }
+    }
+
+    /* Date picker inputs */
+    .date-input { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 4px 10px; font-size: 11px; color: inherit; outline: none; cursor: pointer; }
+    .date-input:focus { border-color: rgba(79,140,255,0.45); }
+    [data-theme="light"] .date-input { background: rgba(28,35,64,0.05); border-color: rgba(28,35,64,0.12); color: #1c2340; }
+  </style>
+</head>
+<body class="antialiased" data-active-view="overview">
+
+  <!-- Sticky top bar -->
+  <header class="sticky top-0 z-40 glass-strong border-b border-white/5">
+    <div class="max-w-[1600px] mx-auto px-6 py-3 flex items-center gap-4">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-accent-blue to-accent-purple flex items-center justify-center font-bold text-white shadow-glow">⚡</div>
+        <div>
+          <div class="text-base font-bold heading">Elite Trading Bot</div>
+          <div class="text-[11px] muted -mt-0.5">Command Center</div>
+        </div>
+      </div>
+
+      <div class="hidden md:flex items-center gap-2 ml-6">
+        <span id="marketBadge" class="pill pill-gray">Market: —</span>
+        <span id="botBadge" class="pill pill-gray">Bot: —</span>
+        <span id="dataBadge" class="pill pill-gray"><span class="dot-live"></span>Live</span>
+      </div>
+
+      <div class="flex-1"></div>
+
+      <div class="hidden lg:flex flex-col items-end mr-2">
+        <div class="text-[11px] muted leading-none">Account equity</div>
+        <div id="topEquity" class="num-mono text-lg font-bold leading-tight">—</div>
+      </div>
+
+      <div class="flex flex-col items-end">
+        <div class="text-[11px] muted leading-none">Today P&amp;L</div>
+        <div id="topPnL" class="num-mono text-lg font-bold leading-tight">—</div>
+      </div>
+
+      <div class="ml-3 flex items-center gap-2">
+        <div id="clock" class="hidden md:block text-xs muted num-mono"></div>
+        <button id="themeToggle" class="w-9 h-9 rounded-lg glass hover:bg-white/5 flex items-center justify-center transition" title="Toggle theme">🌙</button>
+        <button id="refreshBtn" class="w-9 h-9 rounded-lg glass hover:bg-white/5 flex items-center justify-center transition" title="Refresh now">↻</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-[1600px] mx-auto px-6 py-6 space-y-6">
+
+    <div class="view-kicker"><h1 class="heading">Overview</h1><span>Paper account · live monitor</span></div>
+    <div id="dataStatusBanner" class="data-status-banner" role="status"></div>
+
+    <!-- HERO KPI STRIP -->
+    <section class="kpi-strip grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4" data-view-panel="overview">
+
+      <!-- Today P&L -->
+      <div class="kpi-card glass p-5">
+        <div class="flex items-center justify-between">
+          <div class="text-xs muted uppercase tracking-wider">Today P&amp;L</div>
+          <span id="kpiPnLPill" class="pill pill-gray">—</span>
+        </div>
+        <div id="kpiPnL" class="num-mono text-4xl font-extrabold mt-3">—</div>
+        <div class="flex items-center justify-between mt-2">
+          <div id="kpiPnLSub" class="text-xs muted">—</div>
+          <div id="kpiPnLTrend" class="text-xs num-mono muted">—</div>
+        </div>
+        <canvas class="spark" id="sparkPnL"></canvas>
+      </div>
+
+      <!-- Plays taken + W/L -->
+      <div class="kpi-card glass p-5">
+        <div class="flex items-center justify-between">
+          <div class="text-xs muted uppercase tracking-wider">Plays taken</div>
+          <span id="kpiTradesPill" class="pill pill-gray">—</span>
+        </div>
+        <div class="flex items-end gap-3 mt-3">
+          <div id="kpiTrades" class="num-mono text-4xl font-extrabold">—</div>
+          <div class="text-xs muted mb-1">plays</div>
+        </div>
+        <div class="flex items-center justify-between mt-2">
+          <div class="flex items-center gap-2 text-xs">
+            <span id="kpiWins" class="num-mono font-bold" style="color:#22e5a4">—W</span>
+            <span class="muted">/</span>
+            <span id="kpiLosses" class="num-mono font-bold" style="color:#ff5d7e">—L</span>
+            <span id="kpiWinRate" class="muted num-mono"></span>
+          </div>
+          <div id="kpiWLBar" class="flex gap-1 items-center"></div>
+        </div>
+      </div>
+
+      <!-- Active Positions -->
+      <div class="kpi-card glass p-5">
+        <div class="flex items-center justify-between">
+          <div class="text-xs muted uppercase tracking-wider">Open positions</div>
+          <span id="kpiPosPill" class="pill pill-gray">—</span>
+        </div>
+        <div class="flex items-end gap-3 mt-3">
+          <div id="kpiPos" class="num-mono text-4xl font-extrabold">—</div>
+          <div class="text-xs muted mb-1">contracts</div>
+        </div>
+        <div class="flex items-center justify-between mt-2">
+          <div id="kpiPosValue" class="text-xs muted">Market value —</div>
+          <div id="kpiPosPnL" class="text-xs num-mono muted">—</div>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- SERVICE HEALTH STRIP -->
+    <section class="glass rounded-2xl p-4 service-health-panel" data-view-panel="integrations">
+      <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center gap-2">
+          <h2 class="text-sm font-bold heading">Service health</h2>
+          <span id="healthOverall" class="pill pill-gray">—</span>
+        </div>
+        <div class="text-[11px] muted">Auto-checked every 30s</div>
+      </div>
+      <div id="servicesGrid" class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2">
+        <div class="skel h-12"></div>
+        <div class="skel h-12"></div>
+        <div class="skel h-12"></div>
+        <div class="skel h-12"></div>
+        <div class="skel h-12"></div>
+        <div class="skel h-12"></div>
+        <div class="skel h-12"></div>
+        <div class="skel h-12"></div>
+      </div>
+    </section>
+
+    <!-- MAIN 2-COLUMN GRID -->
+    <section class="grid grid-cols-1 lg:grid-cols-3 gap-6" data-view-panel="overview">
+
+      <!-- LEFT COLUMN (2/3) -->
+      <div class="lg:col-span-2 space-y-6">
+
+        <!-- Live Positions -->
+        <div class="glass rounded-2xl p-5">
+          <div class="flex items-center justify-between mb-3">
+            <div>
+              <h2 class="text-base font-bold heading">Open positions</h2>
+              <div class="text-xs muted">Live from Alpaca</div>
+            </div>
+            <span id="posCount" class="pill pill-gray">0</span>
+          </div>
+          <div id="positionsList" class="space-y-1">
+            <div class="skel h-12 mb-2"></div>
+            <div class="skel h-12 mb-2"></div>
+          </div>
+        </div>
+
+        <!-- Equity curve -->
+        <div class="glass rounded-2xl p-5">
+          <div class="flex items-center justify-between mb-3">
+            <div>
+              <h2 class="text-base font-bold heading">Equity Curve</h2>
+              <div class="text-xs muted">Cumulative P&amp;L over time</div>
+            </div>
+            <div class="flex items-center gap-2">
+              <button class="curve-range pill pill-gray" data-days="7">7d</button>
+              <button class="curve-range pill pill-blue" data-days="14">14d</button>
+              <button class="curve-range pill pill-gray" data-days="30">30d</button>
+              <button class="curve-range pill pill-gray" data-days="90">90d</button>
+            </div>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="equityChart"></canvas>
+          </div>
+        </div>
+
+
+
+      </div>
+
+      <!-- RIGHT COLUMN (1/3) -->
+      <div class="space-y-6">
+
+        <!-- Market Pulse -->
+        <div class="glass rounded-2xl p-5">
+          <div class="flex items-center justify-between mb-3">
+            <div>
+              <h2 class="text-base font-bold heading">Market pulse</h2>
+              <div class="text-xs muted">Major ETFs · Live</div>
+            </div>
+            <span class="pill pill-blue"><span class="dot-live"></span>Live</span>
+          </div>
+          <div id="marketPulse" class="grid grid-cols-2 gap-2">
+            <div class="skel h-20"></div>
+            <div class="skel h-20"></div>
+            <div class="skel h-20"></div>
+            <div class="skel h-20"></div>
+          </div>
+        </div>
+
+        <!-- Activity Feed -->
+        <div class="glass rounded-2xl p-5">
+          <div class="flex items-center justify-between mb-3">
+            <div>
+              <h2 class="text-base font-bold heading">Activity feed</h2>
+              <div class="text-xs muted">Discord + Bot events</div>
+            </div>
+            <div class="flex gap-1">
+              <button class="feed-filter pill pill-blue" data-filter="all">All</button>
+              <button class="feed-filter pill pill-gray" data-filter="discord">Discord</button>
+              <button class="feed-filter pill pill-gray" data-filter="bot">Bot</button>
+            </div>
+          </div>
+          <div id="activityFeed" class="scroller space-y-2">
+            <div class="skel h-12 mb-2"></div>
+            <div class="skel h-12 mb-2"></div>
+            <div class="skel h-12 mb-2"></div>
+          </div>
+        </div>
+
+        <!-- Bot Controls -->
+        <div class="glass rounded-2xl p-5 controls-panel">
+          <div class="flex items-center justify-between mb-3">
+            <div>
+              <h2 class="text-base font-bold heading">Bot controls</h2>
+              <div class="text-xs muted">⚠ Destructive actions confirm</div>
+            </div>
+            <span id="ctrlStatus" class="pill pill-gray">Ready</span>
+          </div>
+          <div class="grid grid-cols-1 gap-2">
+            <button id="btnCloseAll" class="w-full glass hover:bg-red-500/10 rounded-xl p-3 transition flex items-center justify-between border border-red-500/30">
+              <div class="text-left">
+                <div class="font-semibold text-sm" style="color:#ff5d7e">Close all positions</div>
+                <div class="text-[11px] muted">Market exit every open contract</div>
+              </div>
+              <div class="text-lg">🚨</div>
+            </button>
+            <button id="btnCancelOrders" class="w-full glass hover:bg-amber-500/10 rounded-xl p-3 transition flex items-center justify-between border border-amber-500/30">
+              <div class="text-left">
+                <div class="font-semibold text-sm" style="color:#ffb547">Cancel open orders</div>
+                <div class="text-[11px] muted">Cancel every pending order</div>
+              </div>
+              <div class="text-lg">🛑</div>
+            </button>
+          </div>
+        </div>
+
+        <!-- Quick Links -->
+        <div class="glass rounded-2xl p-5">
+          <div class="flex items-center justify-between mb-3">
+            <h2 class="text-base font-bold heading">Quick actions</h2>
+          </div>
+          <div class="grid grid-cols-2 gap-2">
+            <a href="https://app.alpaca.markets/paper/dashboard/overview" target="_blank" rel="noopener" class="glass hover:bg-white/5 rounded-xl p-3 transition text-center">
+              <div class="text-xs muted">Alpaca</div>
+              <div class="text-sm font-semibold mt-1">Dashboard ↗</div>
+            </a>
+            <a href="https://dashboard.render.com/" target="_blank" rel="noopener" class="glass hover:bg-white/5 rounded-xl p-3 transition text-center">
+              <div class="text-xs muted">Render</div>
+              <div class="text-sm font-semibold mt-1">Bot logs ↗</div>
+            </a>
+            <a href="https://discord.com/" target="_blank" rel="noopener" class="glass hover:bg-white/5 rounded-xl p-3 transition text-center">
+              <div class="text-xs muted">Discord</div>
+              <div class="text-sm font-semibold mt-1">Channel ↗</div>
+            </a>
+            <a href="https://docs.google.com/spreadsheets/" target="_blank" rel="noopener" class="glass hover:bg-white/5 rounded-xl p-3 transition text-center">
+              <div class="text-xs muted">Sheets</div>
+              <div class="text-sm font-semibold mt-1">Trade log ↗</div>
+            </a>
+          </div>
+        </div>
+
+      </div>
+
+    </section>
+
+    <!-- Trade Dashboard — full width -->
+    <section class="glass rounded-2xl p-5 trade-dashboard-panel" data-view-panel="trades">
+      <!-- Header row: title left, all controls right -->
+      <div class="flex items-start justify-between mb-4 flex-wrap gap-3">
+        <!-- Left: title + stats -->
+        <div>
+          <h2 class="text-base font-bold heading">Trade Dashboard</h2>
+          <div class="text-xs muted flex items-center gap-2 flex-wrap mt-1">
+            <span><span id="fillsCount" class="num-mono font-semibold">0</span> orders</span>
+            <span>·</span>
+            <span><span id="fillsPlaysCount" class="num-mono font-semibold">0</span> plays</span>
+            <span>·</span>
+            <span id="fillsWins" class="num-mono font-semibold" style="color:#22e5a4">0W</span>
+            <span>/</span>
+            <span id="fillsLosses" class="num-mono font-semibold" style="color:#ff5d7e">0L</span>
+          </div>
+        </div>
+        <!-- Single period filter -->
+        <div class="flex items-center gap-2 flex-wrap justify-end">
+          <label class="sr-only" for="tradePeriodFilter">Trade period</label>
+          <select id="tradePeriodFilter" class="date-input period-filter" aria-label="Trade period">
+            <option value="today">Today</option>
+            <option value="yesterday">Yesterday</option>
+            <option value="7d">Last 7 days</option>
+            <option value="30d">Last 30 days</option>
+            <option value="all">All time</option>
+          </select>
+        </div>
+      </div>
+      <!-- Scrollable table -->
+      <div style="overflow-x:auto;max-height:520px;overflow-y:auto">
+        <table class="trade-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Date</th>
+              <th>Time</th>
+              <th>Symbol</th>
+              <th>Type</th>
+              <th class="r">Qty</th>
+              <th class="r">Entry</th>
+              <th class="r">Exit</th>
+              <th class="r">Notional</th>
+              <th class="r">P&amp;L</th>
+            </tr>
+          </thead>
+          <tbody id="fillsTableBody">
+            <tr><td colspan="10"><div class="skel h-9 my-1"></div></td></tr>
+            <tr><td colspan="10"><div class="skel h-9 my-1"></div></td></tr>
+            <tr><td colspan="10"><div class="skel h-9 my-1"></div></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 🧠 BOT BRAIN — Scan stream + Setup success rates -->
+    <section class="grid grid-cols-1 lg:grid-cols-3 gap-6" data-view-panel="alerts">
+
+      <!-- Live scan decisions stream -->
+      <div class="lg:col-span-2 glass rounded-2xl p-5">
+        <div class="alerts-header flex items-center justify-between mb-3">
+          <div>
+            <h2 class="text-base font-bold heading">🧠 Scan decisions</h2>
+            <div class="text-xs muted">Live bot brain — every symbol it looked at</div>
+          </div>
+          <div class="alerts-controls flex items-center gap-2">
+            <span id="scanStats" class="pill pill-gray">—</span>
+            <label class="sr-only" for="scanFilter">Decision filter</label>
+            <select id="scanFilter" class="date-input scan-filter" aria-label="Decision filter">
+              <option value="all">All decisions</option>
+              <option value="ACCEPTED">Accepted</option>
+              <option value="REJECTED">Rejected</option>
+            </select>
+          </div>
+        </div>
+        <div id="scanList" class="scroller space-y-1" style="max-height:420px">
+          <div class="skel h-10 mb-2"></div>
+          <div class="skel h-10 mb-2"></div>
+          <div class="skel h-10 mb-2"></div>
+        </div>
+      </div>
+
+      <!-- Setup success rates -->
+      <div class="glass rounded-2xl p-5">
+        <div class="flex items-center justify-between mb-3">
+          <div>
+            <h2 class="text-base font-bold heading">Strategy stats</h2>
+            <div class="text-xs muted">Accept rate by engine</div>
+          </div>
+        </div>
+        <div id="engineStats" class="space-y-2 mb-4">
+          <div class="skel h-12 mb-1"></div>
+          <div class="skel h-12 mb-1"></div>
+          <div class="skel h-12 mb-1"></div>
+        </div>
+        <div>
+          <div class="text-xs muted mb-2">Top reject reasons</div>
+          <div id="rejectReasons" class="space-y-1">
+            <div class="skel h-6 mb-1"></div>
+            <div class="skel h-6 mb-1"></div>
+            <div class="skel h-6 mb-1"></div>
+          </div>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- BOTTOM ANALYTICS ROW -->
+    <section class="analytics-summary" data-view-panel="analytics">
+      <div class="metric-card"><span>Realized P&amp;L</span><strong id="analyticsRealizedPnl">—</strong></div>
+      <div class="metric-card"><span>Win rate</span><strong id="analyticsWinRate">—</strong></div>
+      <div class="metric-card"><span>Profit factor</span><strong id="analyticsProfitFactor">—</strong></div>
+      <div class="metric-card"><span>Expectancy</span><strong id="analyticsExpectancy">—</strong></div>
+    </section>
+    <section class="grid grid-cols-1 lg:grid-cols-3 gap-6" data-view-panel="analytics">
+
+      <!-- Daily P&L bars -->
+      <div class="glass rounded-2xl p-5">
+        <div class="flex items-center justify-between mb-3">
+          <div>
+            <h2 class="text-base font-bold heading">Daily P&amp;L</h2>
+            <div class="text-xs muted">Last 14 days</div>
+          </div>
+        </div>
+        <div class="chart-wrap" style="height:200px">
+          <canvas id="dailyPnlChart"></canvas>
+        </div>
+      </div>
+
+      <!-- Trades per day -->
+      <div class="glass rounded-2xl p-5">
+        <div class="flex items-center justify-between mb-3">
+          <div>
+            <h2 class="text-base font-bold heading">Trade frequency</h2>
+            <div class="text-xs muted">Volume per day</div>
+          </div>
+        </div>
+        <div class="chart-wrap" style="height:200px">
+          <canvas id="tradesChart"></canvas>
+        </div>
+      </div>
+
+      <!-- Win rate over time -->
+      <div class="glass rounded-2xl p-5">
+        <div class="flex items-center justify-between mb-3">
+          <div>
+            <h2 class="text-base font-bold heading">Win rate</h2>
+            <div class="text-xs muted">Daily winning %</div>
+          </div>
+        </div>
+        <div class="chart-wrap" style="height:200px">
+          <canvas id="winRateChart"></canvas>
+        </div>
+      </div>
+
+    </section>
+
+    <footer class="text-center text-xs muted py-6">
+      Elite Trading Bot · Updated <span id="lastUpdate" class="num-mono">—</span> · Auto-refresh 30s
+    </footer>
+
+  </main>
+
+  <nav class="mobile-nav" aria-label="Primary navigation">
+    <button type="button" data-nav-view="overview" aria-current="page"><span class="nav-icon">⌂</span><span class="nav-label">Overview</span></button>
+    <button type="button" data-nav-view="trades"><span class="nav-icon">▤</span><span class="nav-label">Trades</span></button>
+    <button type="button" data-nav-view="analytics"><span class="nav-icon">⌁</span><span class="nav-label">Analytics</span></button>
+    <button type="button" data-nav-view="alerts"><span class="nav-icon">◉</span><span class="nav-label">Alerts</span></button>
+    <button type="button" data-nav-view="integrations"><span class="nav-icon">⚙</span><span class="nav-label">Systems</span></button>
+  </nav>
+
+  <script src="dashboard.js?v=19"></script>
+</body>
+</html>

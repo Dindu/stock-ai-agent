@@ -1,0 +1,47 @@
+{
+  "name": "elite-trading-dashboard",
+  "version": "1.0.0",
+  "description": "Elite Trading Dashboard - Web Interface",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node verify_deployment.js",
+    "verify-alpaca": "node verify_alpaca_render.js",
+    "trade": "node ai_alerts.js",
+    "force": "node ai_alerts.js --force",
+    "hybrid": "node run_hybrid.js",
+    "scan": "node run_hybrid.js --scan",
+    "premarket": "node run_hybrid.js --premarket",
+    "legacy": "node run_hybrid.js --legacy",
+    "force-scan": "node run_hybrid.js --scan --force"
+  },
+  "dependencies": {
+    "@alpacahq/alpaca-trade-api": "^1.4.2",
+    "@anthropic-ai/sdk": "^0.68.0",
+    "axios": "^1.6.2",
+    "discord.js": "^14.25.1",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "google-auth-library": "^9.14.1",
+    "google-spreadsheet": "^4.1.3",
+    "googleapis": "^129.0.0",
+    "groq-sdk": "^0.5.0",
+    "node-fetch": "^3.3.2",
+    "ollama": "^0.5.6",
+    "openai": "^4.57.0",
+    "ws": "^8.18.3",
+    "yahoo-finance2": "2.11.3"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=8.0.0"
+  },
+  "keywords": [
+    "trading",
+    "dashboard",
+    "web",
+    "express"
+  ],
+  "author": "Elite Trading Bot",
+  "license": "MIT"
+}
