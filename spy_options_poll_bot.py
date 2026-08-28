@@ -666,6 +666,16 @@ _EXIT_REVIEWS_HEADERS = [
     "P&L at Exit %", "Option Move After Exit %", "Underlying at Exit", "Underlying at Review",
     "VWAP at Review", "EMA20 at Review", "2-Bar Move %", "5-Bar Move %", "Assessment", "Notes", "Discord Message ID",
 ]
+_EXIT_TELEMETRY_HEADERS = [
+    "Trade ID", "Symbol", "Contract", "Side", "Setup Type", "Strategy Source",
+    "Entry Time CT", "Actual Exit Time CT", "Actual Exit Reason", "Actual Exit P&L %",
+    "Technical Candidate", "Technical Exit Reason", "Technical Exit Time CT", "Technical P&L %",
+    "Entry Underlying", "Exit Underlying", "Underlying Directional Move %",
+    "Underlying MFE %", "Underlying MAE %", "Option MFE %", "Option MAE %",
+    "Premium Stop Trigger Time CT", "Premium Stop P&L %", "Thesis Intact At Premium Stop",
+    "Current VWAP", "Current EMA20", "Current Side Score", "Current Opp Score", "Score Drop",
+    "Market Map", "Comparison Notes",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -787,6 +797,25 @@ def init_google_sheets():
                 log("Ensured 'Exit Reviews' header row in Google Sheets.")
         except Exception as header_err:
             log(f"Warning: Could not verify/set Exit Reviews headers: {header_err}")
+
+        try:
+            exit_telemetry_ws = _gsheet.worksheet("Exit Telemetry")
+        except gspread.exceptions.WorksheetNotFound:
+            exit_telemetry_ws = _gsheet.add_worksheet(
+                title="Exit Telemetry", rows=2000, cols=len(_EXIT_TELEMETRY_HEADERS)
+            )
+            log("Created 'Exit Telemetry' tab in Google Sheets.")
+        try:
+            existing_telemetry_headers = exit_telemetry_ws.row_values(1)
+            if existing_telemetry_headers != _EXIT_TELEMETRY_HEADERS:
+                exit_telemetry_ws.update(
+                    range_name="A1",
+                    values=[_EXIT_TELEMETRY_HEADERS],
+                    value_input_option="USER_ENTERED",
+                )
+                log("Ensured 'Exit Telemetry' header row in Google Sheets.")
+        except Exception as header_err:
+            log(f"Warning: Could not verify/set Exit Telemetry headers: {header_err}")
         
         # Protect header row (row 1) so it cannot be edited.
         try:
@@ -6484,6 +6513,7 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "underlying_mae_pct": 0.0,
         "score_deterioration_first_ts": None,
         "score_deterioration_cycles": 0,
+        "exit_telemetry": {},
         "emergency_stop_first_breach_ts": None,
         "emergency_stop_grace_elapsed_seconds": 0.0,
         "emergency_stop_hard_exit": False,
@@ -6696,6 +6726,7 @@ def sync_open_trades_from_alpaca():
             "underlying_mae_pct": prev.get("underlying_mae_pct", 0.0) if prev else 0.0,
             "score_deterioration_first_ts": prev.get("score_deterioration_first_ts") if prev else None,
             "score_deterioration_cycles": int(prev.get("score_deterioration_cycles", 0) or 0) if prev else 0,
+            "exit_telemetry": dict(prev.get("exit_telemetry", {}) or {}) if prev else {},
             "emergency_stop_first_breach_ts": prev.get("emergency_stop_first_breach_ts") if prev else None,
             "emergency_stop_grace_elapsed_seconds": float(prev.get("emergency_stop_grace_elapsed_seconds", 0.0) or 0.0) if prev else 0.0,
             "emergency_stop_hard_exit": bool(prev.get("emergency_stop_hard_exit", False)) if prev else False,
@@ -6951,6 +6982,103 @@ def _underlying_thesis_state(trade):
         return {"ready": False, "invalid": False, "reason": f"THESIS CHECK ERROR: {e}", "price": 0.0, "vwap": 0.0, "ema20": 0.0}
 
 
+def _record_exit_telemetry(trade, thesis_state, pnl_pct):
+    """Record technical state and hypothetical normal-exit candidates."""
+    telemetry = trade.setdefault("exit_telemetry", {})
+    if not thesis_state.get("ready"):
+        telemetry["data_ready"] = False
+        return
+    telemetry["data_ready"] = True
+    telemetry["last_vwap"] = _safe_float_num(thesis_state.get("vwap"), 0.0)
+    telemetry["last_ema20"] = _safe_float_num(thesis_state.get("ema20"), 0.0)
+    telemetry["last_side_score"] = thesis_state.get("current_side_score")
+    telemetry["last_opp_score"] = thesis_state.get("current_opp_score")
+    telemetry["last_score_drop"] = thesis_state.get("score_drop")
+    telemetry["last_reason"] = str(thesis_state.get("reason", "") or "")
+    if pnl_pct <= -float(trade.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT):
+        if telemetry.get("premium_stop_trigger_time") is None:
+            telemetry["premium_stop_trigger_time"] = datetime.now(central)
+            telemetry["premium_stop_pnl_pct"] = float(pnl_pct)
+            telemetry["premium_stop_thesis_intact"] = bool(not thesis_state.get("invalid"))
+    candidate_reason = ""
+    if thesis_state.get("invalid"):
+        candidate_reason = str(thesis_state.get("reason", "TECHNICAL INVALIDATION") or "TECHNICAL INVALIDATION")
+    elif thesis_state.get("score_deteriorated"):
+        candidate_reason = "SCORE DETERIORATION"
+    if candidate_reason and not telemetry.get("technical_candidate"):
+        telemetry["technical_candidate"] = True
+        telemetry["technical_reason"] = candidate_reason
+        telemetry["technical_time"] = datetime.now(central)
+        telemetry["technical_pnl_pct"] = float(pnl_pct)
+
+
+def _log_exit_telemetry(trade, reason, pnl_pct, closed_at, exit_market_context):
+    """Append one technical-versus-actual observation after a final exit."""
+    telemetry = trade.get("exit_telemetry")
+    if not telemetry:
+        return
+    if _gsheet is None and not ensure_google_sheets_ready():
+        return
+    try:
+        def pct(value):
+            return round(float(value) * 100.0, 2) if value is not None else ""
+
+        entry_underlying = _safe_float_num(trade.get("underlying_entry_price"), 0.0)
+        exit_underlying = _safe_float_num((exit_market_context or {}).get("price"), 0.0)
+        directional_move = None
+        side = str(trade.get("side", "") or "").upper()
+        if entry_underlying > 0 and exit_underlying > 0 and side in ("CALL", "PUT"):
+            raw_move = (exit_underlying - entry_underlying) / entry_underlying
+            directional_move = raw_move if side == "CALL" else -raw_move
+        actual_upper = str(reason or "").upper()
+        if telemetry.get("technical_candidate"):
+            if "EMERGENCY STOP" in actual_upper:
+                comparison = "TECHNICAL EXIT BEFORE PREMIUM STOP"
+            else:
+                comparison = "TECHNICAL SIGNAL PRESENT"
+        elif "EMERGENCY STOP" in actual_upper:
+            comparison = "PREMIUM STOP WITHOUT TECHNICAL CANDIDATE"
+        else:
+            comparison = "NO TECHNICAL CANDIDATE"
+        opened_at = trade.get("opened_at")
+        row = [
+            trade.get("trade_id", trade.get("contract", "")),
+            trade.get("underlying", ""),
+            trade.get("contract", ""),
+            side,
+            trade.get("setup_type", ""),
+            trade.get("strategy_source", ""),
+            opened_at.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened_at, datetime) else "",
+            closed_at.strftime("%Y-%m-%d %H:%M:%S"),
+            reason,
+            pct(pnl_pct),
+            "YES" if telemetry.get("technical_candidate") else "NO",
+            telemetry.get("technical_reason", ""),
+            telemetry.get("technical_time").strftime("%Y-%m-%d %H:%M:%S") if isinstance(telemetry.get("technical_time"), datetime) else "",
+            pct(telemetry.get("technical_pnl_pct")),
+            entry_underlying or "",
+            exit_underlying or "",
+            pct(directional_move),
+            pct(trade.get("underlying_mfe_pct")),
+            pct(trade.get("underlying_mae_pct")),
+            pct(trade.get("max_pnl_pct")),
+            pct(trade.get("min_pnl_pct")),
+            telemetry.get("premium_stop_trigger_time").strftime("%Y-%m-%d %H:%M:%S") if isinstance(telemetry.get("premium_stop_trigger_time"), datetime) else "",
+            pct(telemetry.get("premium_stop_pnl_pct")),
+            "YES" if telemetry.get("premium_stop_thesis_intact") else "NO",
+            telemetry.get("last_vwap", ""),
+            telemetry.get("last_ema20", ""),
+            telemetry.get("last_side_score", ""),
+            telemetry.get("last_opp_score", ""),
+            telemetry.get("last_score_drop", ""),
+            json.dumps(trade.get("entry_market_map", {}), sort_keys=True, default=str),
+            comparison,
+        ]
+        _gsheet.worksheet("Exit Telemetry").append_row(row, value_input_option="USER_ENTERED")
+    except Exception as e:
+        log(f"[{trade.get('underlying', '?')}] Exit telemetry logging failed: {e}")
+
+
 def track_open_trades():
     """Walk every open paper trade, mark current PnL, and exit on target/stop.
 
@@ -7026,6 +7154,7 @@ def track_open_trades():
 
         # 1) Primary exit: underlying thesis invalidation (not option PnL).
         thesis_state = _underlying_thesis_state(trade)
+        _record_exit_telemetry(trade, thesis_state, pnl_pct)
         if thesis_state.get("ready"):
             trade["thesis_data_fail_count"] = 0
             # Track underlying MFE/MAE independently of option premium.
@@ -7801,6 +7930,7 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
             combined_row["_combined_pnl_dollar"] = round(_combined_dollar, 2)
         update_alert_close_to_sheets(combined_row, trade)
         log_trade_to_sheets(combined_row, trade, final_close=True)
+        _log_exit_telemetry(trade, reason, combined_pnl_pct, closed_at, exit_market_context)
         schedule_exit_review(
             trade, reason, entry_px, exit_px, combined_pnl_pct, closed_at, exit_market_context
         )
