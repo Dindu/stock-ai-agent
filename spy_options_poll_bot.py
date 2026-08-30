@@ -5051,6 +5051,98 @@ def countertrend_proving_entry_ok(symbol, side, data, bars_1m):
     return False, f"countertrend {side} proof failed; waiting for a fresh reversal trigger"
 
 
+def strategy_entry_proving_ok(symbol, side, data, bars_1m):
+    """Strategy-specific proving: keep countertrend proving, add support for pullback/breakout/pine proof."""
+    alignment = str((data or {}).get("entry_alignment", "")).upper()
+    if alignment == "COUNTERTREND":
+        return countertrend_proving_entry_ok(symbol, side, data, bars_1m)
+
+    playbook = str((data or {}).get("entry_playbook") or (data or {}).get("setup_type") or "").upper()
+    if bars_1m is None or len(bars_1m) < 5:
+        return False, "insufficient 1m history for strategy proof"
+
+    side = str(side or "").upper()
+    if side not in {"CALL", "PUT"}:
+        return False, "invalid strategy proof side"
+
+    df = bars_1m.copy()
+    df["EMA9"] = df["close"].ewm(span=9, adjust=False).mean()
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    price = float(latest["close"])
+    ema9 = float(latest["EMA9"])
+    ema9_prior = float(df["EMA9"].iloc[-4])
+    trigger_level = _safe_float_num((data or {}).get("trigger_level") or (data or {}).get("invalidation_level"), 0.0)
+    if trigger_level <= 0:
+        trigger_level = float(prev["high"]) if side == "CALL" else float(prev["low"])
+
+    if "PULLBACK" in playbook or "FIRST_PULLBACK" in playbook or "VWAP_RECLAIM" in playbook:
+        if side == "CALL":
+            ok = (price > float(prev["high"]) and price > ema9 and ema9 >= ema9_prior)
+            return (True, "pullback proving passed") if ok else (False, "pullback proving failed; reclaim did not hold")
+        ok = (price < float(prev["low"]) and price < ema9 and ema9 <= ema9_prior)
+        return (True, "pullback proving passed") if ok else (False, "pullback proving failed; breakdown did not hold")
+
+    if "BREAKOUT" in playbook or "RETEST" in playbook or "MOMENTUM" in playbook:
+        if side == "CALL":
+            level = max(_safe_float_num((data or {}).get("entry_resistance_level"), 0.0), float(prev["high"]))
+            ok = (price > level and price > ema9 and ema9 >= ema9_prior and float(latest["close"]) > float(latest["open"]))
+            return (True, "breakout proving passed") if ok else (False, "breakout proving failed; level not defended")
+        level = min(_safe_float_num((data or {}).get("entry_support_level"), 0.0), float(prev["low"]))
+        ok = (price < level and price < ema9 and ema9 <= ema9_prior and float(latest["close"]) < float(latest["open"]))
+        return (True, "breakout proving passed") if ok else (False, "breakout proving failed; level not defended")
+
+    if "PINE" in playbook or "REVERSAL" in playbook:
+        if side == "CALL":
+            ok = (price > float(prev["high"]) and price > ema9 and ema9 >= ema9_prior and price > trigger_level)
+            return (True, "pine proving passed") if ok else (False, "pine proving failed; reversal did not follow through")
+        ok = (price < float(prev["low"]) and price < ema9 and ema9 <= ema9_prior and price < trigger_level)
+        return (True, "pine proving passed") if ok else (False, "pine proving failed; reversal did not follow through")
+
+    return True, "strategy proving not required"
+
+
+def _post_entry_proving_state(trade):
+    """Assess whether a freshly entered trade has actually started behaving as expected."""
+    try:
+        symbol = str(trade.get("underlying", "") or "").upper()
+        side = str(trade.get("side", "") or "").upper()
+        if not symbol or side not in {"CALL", "PUT"}:
+            return {"status": "CONFIRMED", "failed": False, "reason": "missing trade context"}
+
+        trade_state = str(trade.get("trade_state", "CONFIRMED") or "CONFIRMED").upper()
+        if trade_state == "CONFIRMED":
+            return {"status": "CONFIRMED", "failed": False, "reason": "already confirmed"}
+
+        client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        bars_1m = fetch_1m_bars(client, symbol)
+        if bars_1m is None or len(bars_1m) < 5:
+            return {"status": "PROVING", "failed": False, "reason": "insufficient 1m bars"}
+
+        proof_data = {
+            "entry_alignment": trade.get("entry_alignment", "UNKNOWN"),
+            "entry_playbook": trade.get("entry_playbook", trade.get("setup_type", "")),
+            "setup_type": trade.get("setup_type", trade.get("entry_playbook", "")),
+            "trigger_level": trade.get("entry_trigger_level", 0.0),
+            "invalidation_level": trade.get("entry_invalidation_level", 0.0),
+            "entry_support_level": {"level": trade.get("entry_support_level")} if trade.get("entry_support_level") else None,
+            "entry_resistance_level": {"level": trade.get("entry_resistance_level")} if trade.get("entry_resistance_level") else None,
+            "vwap": trade.get("entry_vwap", 0.0),
+            "ema20": trade.get("entry_ema20", 0.0),
+            "entry_freshness": trade.get("entry_freshness", "UNKNOWN"),
+            "entry_extension_atr": trade.get("entry_extension_atr", 0.0),
+        }
+        proof_ok, proof_reason = strategy_entry_proving_ok(symbol, side, proof_data, bars_1m)
+        if proof_ok:
+            trade["trade_state"] = "CONFIRMED"
+            trade["proving_success"] = True
+            trade["confirmed_at"] = datetime.now(central)
+            return {"status": "CONFIRMED", "failed": False, "reason": proof_reason}
+        return {"status": "PROVING", "failed": True, "reason": proof_reason}
+    except Exception as e:
+        return {"status": "PROVING", "failed": False, "reason": f"proof eval error: {type(e).__name__}: {e}"}
+
+
 def prefetch_bars_parallel(client, symbols):
     """Fetch bars for multiple symbols concurrently to reduce scan latency."""
     ordered_symbols = list(dict.fromkeys(symbols or []))
@@ -6701,6 +6793,17 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "entry_resistance_touches": ((data or {}).get("resistance_level") or {}).get("touches") if isinstance((data or {}).get("resistance_level"), dict) else None,
         "entry_resistance_strength": ((data or {}).get("resistance_level") or {}).get("strength") if isinstance((data or {}).get("resistance_level"), dict) else None,
         "entry_resistance_distance_atr": ((data or {}).get("resistance_level") or {}).get("distance_atr") if isinstance((data or {}).get("resistance_level"), dict) else None,
+        "entry_trigger_level": _safe_float_num((data or {}).get("trigger_level"), underlying_entry_price),
+        "entry_invalidation_level": _safe_float_num((data or {}).get("invalidation_level"), 0.0),
+        "entry_reference_low": _safe_float_num((data or {}).get("reference_low"), 0.0),
+        "entry_reference_high": _safe_float_num((data or {}).get("reference_high"), 0.0),
+        "entry_vwap": _safe_float_num((data or {}).get("vwap"), 0.0),
+        "entry_ema20": _safe_float_num((data or {}).get("ema20"), 0.0),
+        "trade_state": "PROVING",
+        "proving_started_at": datetime.now(central),
+        "proving_success": False,
+        "proving_failure_count": 0,
+        "confirmed_at": None,
         "opened_at":  datetime.now(central),
         "status":     "OPEN",
         "entry_message_id": None,
@@ -7060,13 +7163,30 @@ def _underlying_thesis_state(trade):
         if price <= 0 or vwap <= 0 or ema20 <= 0:
             return {"ready": False, "invalid": False, "reason": "INVALID INDICATOR VALUES", "price": price, "vwap": vwap, "ema20": ema20}
 
+        frozen_trigger = _safe_float_num(trade.get("entry_trigger_level"), 0.0)
+        frozen_invalidation = _safe_float_num(trade.get("entry_invalidation_level"), 0.0)
+        frozen_reference_low = _safe_float_num(trade.get("entry_reference_low"), 0.0)
+        frozen_reference_high = _safe_float_num(trade.get("entry_reference_high"), 0.0)
+        frozen_vwap = _safe_float_num(trade.get("entry_vwap"), 0.0)
+        frozen_ema20 = _safe_float_num(trade.get("entry_ema20"), 0.0)
+
+        if frozen_vwap > 0:
+            vwap = frozen_vwap
+        if frozen_ema20 > 0:
+            ema20 = frozen_ema20
+
         ema20_back = _safe_float_num(df["EMA20"].iloc[-4], ema20)
         ema20_slope_pct = ((ema20 - ema20_back) / ema20_back) if ema20_back else 0.0
-        recent_swing_low = _safe_float_num(df["low"].iloc[-6:-1].min(), price)
-        recent_swing_high = _safe_float_num(df["high"].iloc[-6:-1].max(), price)
+        recent_swing_low = frozen_reference_low if frozen_reference_low > 0 else _safe_float_num(df["low"].iloc[-6:-1].min(), price)
+        recent_swing_high = frozen_reference_high if frozen_reference_high > 0 else _safe_float_num(df["high"].iloc[-6:-1].max(), price)
         setup = str(trade.get("setup_type", trade.get("entry_timing", "")) or "").upper()
         entry_support = _safe_float_num(trade.get("entry_support_level"), 0.0)
         entry_resistance = _safe_float_num(trade.get("entry_resistance_level"), 0.0)
+        if frozen_invalidation > 0:
+            if str(trade.get("side", "")).upper() == "CALL":
+                entry_resistance = frozen_invalidation
+            else:
+                entry_support = frozen_invalidation
 
         current_side_score = None
         current_opp_score = None
@@ -7298,6 +7418,24 @@ def track_open_trades():
             f"PnL {pnl_pct * 100:+.2f}%")
 
         maybe_send_trade_progress_alert(trade, current_price, pnl_pct)
+
+        if str(trade.get("trade_state", "CONFIRMED") or "CONFIRMED").upper() == "PROVING":
+            proving_state = _post_entry_proving_state(trade)
+            trade["proving_failure_count"] = int(trade.get("proving_failure_count", 0) or 0)
+            if proving_state.get("failed"):
+                trade["proving_failure_count"] = int(trade.get("proving_failure_count", 0) or 0) + 1
+                if trade["proving_failure_count"] >= 1:
+                    close_trade(
+                        trade,
+                        current_price,
+                        f"PROVING_FAILURE: {proving_state.get('reason', 'EXPECTED MOVE DID NOT START')}",
+                        pnl_pct,
+                    )
+                    continue
+            else:
+                trade["trade_state"] = "CONFIRMED"
+                trade["proving_success"] = True
+                trade["confirmed_at"] = datetime.now(central)
 
         target_pct = float(trade.get("target_pct", PROFIT_TARGET_PCT) or PROFIT_TARGET_PCT)
         stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT)
@@ -9066,15 +9204,15 @@ def run_symbol(client, symbol, prefetched_bars=None):
             data["one_minute_confirmation_reason"] = f"eval error: {type(e).__name__}: {e}"
             log(f"[{symbol}] 1m sniper evaluation failed: {type(e).__name__}: {e}")
 
-    if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and COUNTERTREND_PROVING_ENABLED:
-        proof_ok, proof_reason = countertrend_proving_entry_ok(symbol, side, data, bars_1m)
+    if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and (COUNTERTREND_PROVING_ENABLED or True):
+        proof_ok, proof_reason = strategy_entry_proving_ok(symbol, side, data, bars_1m)
         data["countertrend_proving_status"] = "PASS" if proof_ok else "WAIT"
         data["countertrend_proving_reason"] = proof_reason
         if not proof_ok:
-            log(f"[{symbol}] Countertrend proving gate: {side} WAIT — {proof_reason}.")
+            log(f"[{symbol}] Strategy proving gate: {side} WAIT — {proof_reason}.")
             return
         if str(data.get("entry_alignment", "")).upper() == "COUNTERTREND":
-            log(f"[{symbol}] Countertrend proving gate: {side} PASS — {proof_reason}.")
+            log(f"[{symbol}] Strategy proving gate: {side} PASS — {proof_reason}.")
     else:
         data["one_minute_trigger"] = "DISABLED" if not ONE_MINUTE_ENTRY_ENABLED else ""
         data["one_minute_entry_confirmed"] = not ONE_MINUTE_ENTRY_ENABLED
