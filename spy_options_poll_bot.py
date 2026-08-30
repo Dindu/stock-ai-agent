@@ -519,6 +519,9 @@ ONE_MINUTE_RECLAIM_WINDOW_BARS = int(os.getenv("ONE_MINUTE_RECLAIM_WINDOW_BARS",
 ONE_MINUTE_REQUIRE_CLOSED_BAR = os.getenv("ONE_MINUTE_REQUIRE_CLOSED_BAR", "1") == "1"
 ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD = os.getenv("ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD", "1") == "1"
 SNIPER_WATCH_ALERT_COOLDOWN_MINUTES = int(os.getenv("SNIPER_WATCH_ALERT_COOLDOWN_MINUTES", "30"))
+# Countertrend reversals must prove themselves on the next closed 1m candle before execution.
+COUNTERTREND_PROVING_ENABLED = os.getenv("COUNTERTREND_PROVING_ENABLED", "1") == "1"
+COUNTERTREND_PROVING_MAX_WAIT_BARS = max(1, int(os.getenv("COUNTERTREND_PROVING_MAX_WAIT_BARS", "2")))
 
 # Stricter confirmation for recovery-style CALL entries to reduce weak bounce losses.
 RECOVERY_CALL_STRICT_ENABLED = os.getenv("RECOVERY_CALL_STRICT_ENABLED", "1") == "1"
@@ -584,6 +587,8 @@ _ignition_pending: "dict[tuple, dict]" = {}
 # Initial breakout levels awaiting the next completed five-minute bar to hold.
 _breakout_hold_pending: "dict[tuple, dict]" = {}
 _breakout_continuations: "dict[tuple, dict]" = {}
+# Countertrend 1m reversals that need a separate proving candle before execution.
+_countertrend_proving_pending: "dict[tuple, dict]" = {}
 # Cached trending stocks and reasons from Alpaca screener/news.
 _trending_cache: "dict" = {"updated_at": None, "symbols": [], "reasons": {}}
 _trending_cache_checked_at: "datetime | None" = None
@@ -3581,6 +3586,38 @@ def build_market_map(df, price, vwap, atr14, pdh=None, pdl=None):
         log(f"Market map construction failed: {e}")
         return result
 
+
+def classify_entry_alignment_freshness(side, price, vwap, ema20, ema20_rising, ema20_falling,
+                                        vwap_dist_atr, ema20_dist_atr, trend_age_bars):
+    """Shadow-only classification: is this entry WITH or AGAINST the 5m trend, and
+    how extended is price already? Never gates or blocks a trade.
+    """
+    side = str(side or "").upper()
+    if side == "CALL":
+        aligned = bool(price > vwap and price > ema20 and ema20_rising)
+    elif side == "PUT":
+        aligned = bool(price < vwap and price < ema20 and ema20_falling)
+    else:
+        aligned = False
+    alignment = "TREND_ALIGNED" if aligned else "COUNTERTREND"
+
+    ext_atr = max(
+        _safe_float_num(vwap_dist_atr, 0.0) if pd.notna(vwap_dist_atr) else 0.0,
+        _safe_float_num(ema20_dist_atr, 0.0) if pd.notna(ema20_dist_atr) else 0.0,
+    )
+    age = _safe_int_num(trend_age_bars, 0)
+    if ext_atr >= 2.5 or age >= 16:
+        freshness = "EXHAUSTED"
+    elif ext_atr >= 1.5 or age >= 10:
+        freshness = "EXTENDED"
+    elif ext_atr >= 0.6 or age >= 4:
+        freshness = "DEVELOPING"
+    else:
+        freshness = "FRESH"
+
+    return {"alignment": alignment, "freshness": freshness, "extension_atr": round(ext_atr, 2), "trend_age_bars": age}
+
+
 def analyze(df, client, symbol):
     """Compute weighted Bull/Bear scores (0-100) from independent factor groups.
 
@@ -4191,6 +4228,12 @@ def analyze(df, client, symbol):
     else:
         sentiment = "Bear lean"
 
+    entry_alignment_freshness = classify_entry_alignment_freshness(
+        side, price, vwap, ema20, ema20_rising, ema20_falling,
+        vwap_dist_atr, ema20_dist_atr,
+        bull_trend_age_bars if side == "CALL" else bear_trend_age_bars,
+    )
+
     data = {
         "bar_time": latest.name,
         "price": price,
@@ -4208,6 +4251,9 @@ def analyze(df, client, symbol):
         "support_level": support_level,
         "resistance_level": resistance_level,
         "market_map": market_map,
+        "entry_alignment": entry_alignment_freshness["alignment"],
+        "entry_freshness": entry_alignment_freshness["freshness"],
+        "entry_extension_atr": entry_alignment_freshness["extension_atr"],
         "micro_high": micro_high,
         "micro_low": micro_low,
         "prior_bar_high": prior_bar_high,
@@ -4953,6 +4999,59 @@ def one_minute_entry_timing(symbol, side, bars_1m, five_min_data):
         f"waiting 1m PUT trigger; price={price:.2f}, EMA9={ema9:.2f}, VWAP1m={one_vwap:.2f}, "
         f"volx={vol_ratio:.2f}, ema9_slope={ema9_slope:+.4f}"
     )
+
+
+def countertrend_proving_entry_ok(symbol, side, data, bars_1m):
+    """Require a countertrend reversal to hold for one additional closed 1m bar."""
+    if not COUNTERTREND_PROVING_ENABLED or str((data or {}).get("entry_alignment", "")).upper() != "COUNTERTREND":
+        return True, "not required"
+    if bars_1m is None or len(bars_1m) < 5:
+        return False, "insufficient 1m history for countertrend proof"
+
+    side = str(side or "").upper()
+    if side not in {"CALL", "PUT"}:
+        return False, "invalid countertrend side"
+
+    df = bars_1m.copy()
+    df["EMA9"] = df["close"].ewm(span=9, adjust=False).mean()
+    latest = df.iloc[-1]
+    previous = df.iloc[-2]
+    bar_id = str(df.index[-1])
+    price = float(latest["close"])
+    ema9 = float(latest["EMA9"])
+    ema9_prior = float(df["EMA9"].iloc[-4])
+    bullish = price > float(latest["open"])
+    bearish = price < float(latest["open"])
+    trigger_ok = (
+        bullish and price > float(previous["high"]) and price > ema9 and ema9 > ema9_prior
+    ) if side == "CALL" else (
+        bearish and price < float(previous["low"]) and price < ema9 and ema9 < ema9_prior
+    )
+
+    key = (str(symbol or "").upper(), side)
+    pending = _countertrend_proving_pending.get(key)
+    if pending is None:
+        if not trigger_ok:
+            return False, f"waiting 1m countertrend {side} reversal trigger"
+        _countertrend_proving_pending[key] = {"bar_id": bar_id, "trigger_close": price, "waited_bars": 0}
+        return False, f"countertrend {side} armed at {price:.2f}; awaiting proving candle"
+
+    if pending.get("bar_id") == bar_id:
+        return False, f"countertrend {side} armed; awaiting next closed 1m candle"
+
+    pending["waited_bars"] = int(pending.get("waited_bars", 0)) + 1
+    trigger_close = _safe_float_num(pending.get("trigger_close", 0.0), 0.0)
+    proving_ok = (
+        bullish and price > trigger_close and price > ema9 and ema9 > ema9_prior
+    ) if side == "CALL" else (
+        bearish and price < trigger_close and price < ema9 and ema9 < ema9_prior
+    )
+    _countertrend_proving_pending.pop(key, None)
+    if proving_ok:
+        return True, f"countertrend {side} 1m proof passed; held beyond {trigger_close:.2f}"
+    if pending["waited_bars"] >= COUNTERTREND_PROVING_MAX_WAIT_BARS:
+        return False, f"countertrend {side} proof failed within {COUNTERTREND_PROVING_MAX_WAIT_BARS} bar(s)"
+    return False, f"countertrend {side} proof failed; waiting for a fresh reversal trigger"
 
 
 def prefetch_bars_parallel(client, symbols):
@@ -6573,6 +6672,11 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "setup_type": setup_type,
         "strategy_source": strategy_source,
         "entry_playbook": str((data or {}).get("entry_playbook", "") or setup_type),
+        "entry_alignment": str((data or {}).get("entry_alignment", "") or "UNKNOWN"),
+        "entry_freshness": str((data or {}).get("entry_freshness", "") or "UNKNOWN"),
+        "entry_extension_atr": _safe_float_num((data or {}).get("entry_extension_atr"), 0.0),
+        "countertrend_proving_status": str((data or {}).get("countertrend_proving_status", "") or "NOT_REQUIRED"),
+        "countertrend_proving_reason": str((data or {}).get("countertrend_proving_reason", "") or ""),
         "entry_quality_v2_score": _safe_float_num((data or {}).get("entry_quality_v2_score"), 0.0),
         "entry_quality_v2_components": entry_quality_components,
         "entry_contract_quality": entry_contract_quality,
@@ -6795,6 +6899,11 @@ def sync_open_trades_from_alpaca():
             "setup_type": prev.get("setup_type", "UNKNOWN") if prev else "UNKNOWN",
             "strategy_source": prev.get("strategy_source", "LEGACY") if prev else "LEGACY",
             "entry_playbook": prev.get("entry_playbook", "UNKNOWN") if prev else "UNKNOWN",
+            "entry_alignment": prev.get("entry_alignment", "UNKNOWN") if prev else "UNKNOWN",
+            "entry_freshness": prev.get("entry_freshness", "UNKNOWN") if prev else "UNKNOWN",
+            "entry_extension_atr": prev.get("entry_extension_atr", 0.0) if prev else 0.0,
+            "countertrend_proving_status": prev.get("countertrend_proving_status", "NOT_REQUIRED") if prev else "NOT_REQUIRED",
+            "countertrend_proving_reason": prev.get("countertrend_proving_reason", "") if prev else "",
             "entry_quality_v2_score": prev.get("entry_quality_v2_score", 0.0) if prev else 0.0,
             "entry_quality_v2_components": dict(prev.get("entry_quality_v2_components", {}) or {}) if prev else {},
             "entry_contract_quality": dict(prev.get("entry_contract_quality", {}) or {}) if prev else {},
@@ -7960,6 +8069,11 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         "contract_responsiveness": contract_responsiveness,
         "entry_market_map": json.dumps(trade.get("entry_market_map", {}), sort_keys=True, default=str),
         "entry_playbook": trade.get("entry_playbook", trade.get("setup_type", "UNKNOWN")),
+        "entry_alignment": trade.get("entry_alignment", "UNKNOWN"),
+        "entry_freshness": trade.get("entry_freshness", "UNKNOWN"),
+        "entry_extension_atr": trade.get("entry_extension_atr", 0.0),
+        "countertrend_proving_status": trade.get("countertrend_proving_status", "NOT_REQUIRED"),
+        "countertrend_proving_reason": trade.get("countertrend_proving_reason", ""),
         "entry_quality_v2_score": trade.get("entry_quality_v2_score", 0.0),
         "entry_quality_v2_components": json.dumps(trade.get("entry_quality_v2_components", {}), sort_keys=True, default=str),
         "entry_contract_quality": json.dumps(trade.get("entry_contract_quality", {}), sort_keys=True, default=str),
@@ -8937,6 +9051,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     data["effective_score"] = effective_score
 
     # Real lower-timeframe timing: only after the 5m setup passes the hard score gate.
+    bars_1m = None
     if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and ONE_MINUTE_ENTRY_ENABLED:
         try:
             bars_1m = fetch_1m_bars(client, symbol)
@@ -8953,6 +9068,16 @@ def run_symbol(client, symbol, prefetched_bars=None):
             data["one_minute_entry_confirmed"] = False
             data["one_minute_confirmation_reason"] = f"eval error: {type(e).__name__}: {e}"
             log(f"[{symbol}] 1m sniper evaluation failed: {type(e).__name__}: {e}")
+
+    if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and COUNTERTREND_PROVING_ENABLED:
+        proof_ok, proof_reason = countertrend_proving_entry_ok(symbol, side, data, bars_1m)
+        data["countertrend_proving_status"] = "PASS" if proof_ok else "WAIT"
+        data["countertrend_proving_reason"] = proof_reason
+        if not proof_ok:
+            log(f"[{symbol}] Countertrend proving gate: {side} WAIT — {proof_reason}.")
+            return
+        if str(data.get("entry_alignment", "")).upper() == "COUNTERTREND":
+            log(f"[{symbol}] Countertrend proving gate: {side} PASS — {proof_reason}.")
     else:
         data["one_minute_trigger"] = "DISABLED" if not ONE_MINUTE_ENTRY_ENABLED else ""
         data["one_minute_entry_confirmed"] = not ONE_MINUTE_ENTRY_ENABLED
