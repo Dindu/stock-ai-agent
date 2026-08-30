@@ -511,6 +511,10 @@ FIRST_PULLBACK_MIN_SCORE_DELTA = int(os.getenv("FIRST_PULLBACK_MIN_SCORE_DELTA",
 # Minimum 1m trigger-candle follow-through as a fraction of price.
 ONE_MINUTE_MIN_TRIGGER_MOVE_PCT = float(os.getenv("ONE_MINUTE_MIN_TRIGGER_MOVE_PCT", "0.0005"))
 ONE_MINUTE_COMPRESSION_PCT = float(os.getenv("ONE_MINUTE_COMPRESSION_PCT", "0.0035"))
+# Retired pending evidence: DEV 64 signals PF 2.16 vs HOLD 54 signals PF 0.66,
+# holdout CI crosses zero. Logic retained so it can be re-enabled if a larger
+# sample ever justifies it.
+MOMENTUM_COMPRESSION_ENABLED = os.getenv("MOMENTUM_COMPRESSION_ENABLED", "0") == "1"
 ONE_MINUTE_MAX_TRIGGER_AGE_BARS = int(os.getenv("ONE_MINUTE_MAX_TRIGGER_AGE_BARS", "6"))
 # Reclaim confirmation window: look for a bullish/bearish reclaim across the last N closed
 # 1m bars instead of requiring the single latest bar to beat the immediately prior bar's
@@ -4971,7 +4975,7 @@ def one_minute_entry_timing(symbol, side, bars_1m, five_min_data):
             return "FIRST_PULLBACK", f"1m EMA9 pullback/reclaim confirmed; volx={vol_ratio:.2f}"
         if five_aligned and level_retest and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO:
             return "BREAKOUT_RETEST", f"1m breakout retest confirmed; volx={vol_ratio:.2f}"
-        if five_aligned and momentum_break:
+        if MOMENTUM_COMPRESSION_ENABLED and five_aligned and momentum_break:
             return "MOMENTUM_COMPRESSION", f"1m compression expansion confirmed; volx={vol_ratio:.2f}"
 
         return None, (
@@ -5002,7 +5006,7 @@ def one_minute_entry_timing(symbol, side, bars_1m, five_min_data):
         return "FIRST_PULLBACK", f"1m EMA9 pullback/reclaim confirmed; volx={vol_ratio:.2f}"
     if five_aligned and level_retest and vol_ratio >= ONE_MINUTE_MIN_VOLUME_RATIO:
         return "BREAKOUT_RETEST", f"1m breakdown retest confirmed; volx={vol_ratio:.2f}"
-    if five_aligned and momentum_break:
+    if MOMENTUM_COMPRESSION_ENABLED and five_aligned and momentum_break:
         return "MOMENTUM_COMPRESSION", f"1m compression expansion confirmed; volx={vol_ratio:.2f}"
 
     return None, (
