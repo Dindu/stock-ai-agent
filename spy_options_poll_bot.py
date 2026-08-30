@@ -2792,7 +2792,18 @@ def playbook_entry_ok(side, data, symbol=None):
     distance_to_extreme = (
         ((extreme_level - price) / price) if call_side else ((price - extreme_level) / price)
     ) if price > 0 else 0.0
-    if playbook not in ("BREAKOUT", "BREAKOUT_CONTINUATION") and distance_to_extreme <= PLAYBOOK_EXTREME_PROXIMITY_PCT:
+    # A FIRST_PULLBACK trigger IS the pullback's own lower-timeframe confirmation,
+    # so demanding breakout-hold confirmation from it can never be satisfied.
+    confirmed_pullback = (
+        playbook == "PULLBACK_CONTINUATION"
+        and one_minute_enabled
+        and one_minute_trigger == "FIRST_PULLBACK"
+    )
+    if (
+        playbook not in ("BREAKOUT", "BREAKOUT_CONTINUATION")
+        and not confirmed_pullback
+        and distance_to_extreme <= PLAYBOOK_EXTREME_PROXIMITY_PCT
+    ):
         direction = "high/resistance" if call_side else "low/support"
         return False, playbook, (
             f"{side} is within {distance_to_extreme * 100:+.2f}% of {direction} "
