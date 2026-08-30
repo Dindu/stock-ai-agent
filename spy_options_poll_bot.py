@@ -521,6 +521,7 @@ ONE_MINUTE_MAX_TRIGGER_AGE_BARS = int(os.getenv("ONE_MINUTE_MAX_TRIGGER_AGE_BARS
 # high/low (audit showed that single-bar rule was the dominant 1m-sniper blocker).
 ONE_MINUTE_RECLAIM_WINDOW_BARS = int(os.getenv("ONE_MINUTE_RECLAIM_WINDOW_BARS", "3"))
 ONE_MINUTE_REQUIRE_CLOSED_BAR = os.getenv("ONE_MINUTE_REQUIRE_CLOSED_BAR", "1") == "1"
+PINE_ONE_MINUTE_PROOF_ENABLED = os.getenv("PINE_ONE_MINUTE_PROOF_ENABLED", "1") == "1"
 ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD = os.getenv("ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD", "1") == "1"
 SNIPER_WATCH_ALERT_COOLDOWN_MINUTES = int(os.getenv("SNIPER_WATCH_ALERT_COOLDOWN_MINUTES", "30"))
 # Countertrend reversals must prove themselves on the next closed 1m candle before execution.
@@ -9220,7 +9221,12 @@ def run_symbol(client, symbol, prefetched_bars=None):
             log(f"[{symbol}] 1m sniper evaluation failed: {type(e).__name__}: {e}")
 
     if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and (COUNTERTREND_PROVING_ENABLED or True):
-        proof_ok, proof_reason = strategy_entry_proving_ok(symbol, side, data, bars_1m)
+        proof_data = data
+        if data.get("pine_signal_active", False) and PINE_ONE_MINUTE_PROOF_ENABLED:
+            proof_data = dict(data)
+            proof_data["entry_alignment"] = "TREND_ALIGNED"
+            proof_data["entry_playbook"] = classify_entry_playbook(side, data)
+        proof_ok, proof_reason = strategy_entry_proving_ok(symbol, side, proof_data, bars_1m)
         data["countertrend_proving_status"] = "PASS" if proof_ok else "WAIT"
         data["countertrend_proving_reason"] = proof_reason
         if not proof_ok:
