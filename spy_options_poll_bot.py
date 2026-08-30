@@ -693,6 +693,12 @@ _PREMIUM_STRESS_HEADERS = [
     "Underlying Price", "Underlying P&L %", "Underlying MFE %", "Underlying MAE %", "VWAP", "EMA9", "EMA20", "EMA50",
     "Thesis State", "Structure State", "Side Score", "Opp Score", "Frozen Invalidation Level", "Entry Market Map",
 ]
+_CONTRACT_EXECUTION_HEADERS = [
+    "Trade ID", "Status", "Opened CT", "Closed CT", "Symbol", "Contract", "Side", "Setup Type", "1m Trigger", "Strike", "Expiration", "DTE",
+    "Quantity", "Option Entry Bid", "Option Entry Ask", "Option Entry Mid", "Requested Entry Price", "Actual Entry Fill", "Entry Fill Slippage $", "Entry Fill Slippage %", "Entry Spread $", "Entry Spread %", "Selection Delta", "Selection Volume", "Selection OI", "Selection Quality",
+    "Underlying Signal Price", "Underlying Entry Price", "Underlying Exit Price", "Underlying Directional Move %", "Underlying MFE %", "Underlying MAE %",
+    "Option Exit Bid", "Option Exit Ask", "Option Exit Mid", "Actual Exit Fill", "Exit Fill Slippage $", "Exit Fill Slippage %", "Option MFE %", "Option MAE %", "Option P&L %", "Contract Responsiveness", "Exit Reason",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -846,6 +852,19 @@ def init_google_sheets():
                 log("Ensured 'Premium Stress' header row in Google Sheets.")
         except Exception as header_err:
             log(f"Warning: Could not verify/set Premium Stress headers: {header_err}")
+
+        try:
+            contract_execution_ws = _gsheet.worksheet("Contract Execution")
+        except gspread.exceptions.WorksheetNotFound:
+            contract_execution_ws = _gsheet.add_worksheet(title="Contract Execution", rows=5000, cols=len(_CONTRACT_EXECUTION_HEADERS))
+            log("Created 'Contract Execution' tab in Google Sheets.")
+        try:
+            existing_contract_headers = contract_execution_ws.row_values(1)
+            if existing_contract_headers != _CONTRACT_EXECUTION_HEADERS:
+                contract_execution_ws.update(range_name="A1", values=[_CONTRACT_EXECUTION_HEADERS], value_input_option="USER_ENTERED")
+                log("Ensured 'Contract Execution' header row in Google Sheets.")
+        except Exception as header_err:
+            log(f"Warning: Could not verify/set Contract Execution headers: {header_err}")
         
         # Protect header row (row 1) so it cannot be edited.
         try:
@@ -6815,6 +6834,7 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "entry_contract_volume": _safe_int_num((option or {}).get("volume", 0), 0),
         "entry_contract_bid": _safe_float_num((option or {}).get("bid", 0.0), 0.0),
         "entry_contract_ask": _safe_float_num((option or {}).get("ask", 0.0), 0.0),
+        "entry_requested_price": _safe_float_num((option or {}).get("ask", fill_price), fill_price),
         "entry_contract_slippage_est": _safe_float_num((option or {}).get("slippage_est", 0.0), 0.0),
         "entry_contract_dte": _safe_int_num((option or {}).get("dte", 0), 0),
         "entry_contract_quote_age_seconds": round(quote_age_seconds, 2) if quote_age_seconds is not None else None,
@@ -8062,6 +8082,38 @@ def process_due_exit_reviews(now_ct=None):
         log(f"Exit review processing failed: {e}")
 
 
+def log_contract_execution(trade, exit_price, pnl_pct, closed_at, exit_market_context, reason, original_qty):
+    """Persist one final, analyzable contract-selection and execution observation."""
+    if _gsheet is None and not ensure_google_sheets_ready():
+        return
+    try:
+        entry = _safe_float_num(trade.get("entry"), 0.0)
+        entry_bid = _safe_float_num(trade.get("entry_contract_bid"), 0.0)
+        entry_ask = _safe_float_num(trade.get("entry_contract_ask"), 0.0)
+        entry_mid = (entry_bid + entry_ask) / 2.0 if entry_bid > 0 and entry_ask > 0 else 0.0
+        requested = _safe_float_num(trade.get("entry_requested_price"), entry_ask or entry_mid or entry)
+        exit_bid, exit_ask, exit_mid = _premium_stress_quote(trade.get("contract", ""))
+        exit_price = _safe_float_num(exit_price, 0.0)
+        entry_underlying = _safe_float_num(trade.get("underlying_entry_price"), 0.0)
+        exit_underlying = _safe_float_num((exit_market_context or {}).get("price"), 0.0)
+        side = str(trade.get("side", "") or "").upper()
+        raw_move = (exit_underlying - entry_underlying) / entry_underlying if entry_underlying > 0 else 0.0
+        directional_move = raw_move if side == "CALL" else -raw_move if side == "PUT" else 0.0
+        responsiveness = pnl_pct / directional_move if abs(directional_move) >= 0.0001 else None
+        entry_fill_slippage = entry - entry_mid if entry_mid > 0 else None
+        exit_fill_slippage = exit_price - exit_mid if exit_mid > 0 else None
+        row = [
+            trade.get("trade_id", trade.get("contract", "")), "CLOSED", trade.get("opened_at").strftime("%Y-%m-%d %H:%M:%S"), closed_at.strftime("%Y-%m-%d %H:%M:%S"),
+            trade.get("underlying", ""), trade.get("contract", ""), side, trade.get("setup_type", ""), trade.get("one_minute_trigger", ""), trade.get("strike", ""), trade.get("expiry", ""), trade.get("entry_contract_dte", ""),
+            original_qty, entry_bid or "", entry_ask or "", entry_mid or "", requested or "", entry or "", round(entry_fill_slippage, 4) if entry_fill_slippage is not None else "", round(entry_fill_slippage / entry_mid * 100, 2) if entry_mid > 0 else "", round(entry_ask - entry_bid, 4) if entry_mid > 0 else "", round((entry_ask - entry_bid) / entry_mid * 100, 2) if entry_mid > 0 else "", trade.get("entry_contract_delta", ""), trade.get("entry_contract_volume", ""), trade.get("entry_option_oi", ""), json.dumps(trade.get("entry_contract_quality", {}), sort_keys=True, default=str),
+            entry_underlying or "", entry_underlying or "", exit_underlying or "", round(directional_move * 100, 2) if entry_underlying > 0 and exit_underlying > 0 else "", round(_safe_float_num(trade.get("underlying_mfe_pct"), 0.0) * 100, 2), round(_safe_float_num(trade.get("underlying_mae_pct"), 0.0) * 100, 2),
+            exit_bid or "", exit_ask or "", exit_mid or "", exit_price or "", round(exit_fill_slippage, 4) if exit_fill_slippage is not None else "", round(exit_fill_slippage / exit_mid * 100, 2) if exit_mid > 0 else "", round(_safe_float_num(trade.get("max_pnl_pct"), 0.0) * 100, 2), round(_safe_float_num(trade.get("min_pnl_pct"), 0.0) * 100, 2), round(pnl_pct * 100, 2), round(responsiveness, 3) if responsiveness is not None else "", reason,
+        ]
+        _gsheet.worksheet("Contract Execution").append_row(row, value_input_option="USER_ENTERED")
+    except Exception as e:
+        log(f"[{trade.get('underlying', '?')}] Contract execution telemetry failed: {e}")
+
+
 def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=True):
     """Submit a paper exit (if enabled), Discord the result, and append to CSV.
 
@@ -8354,6 +8406,10 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         update_alert_close_to_sheets(combined_row, trade)
         log_trade_to_sheets(combined_row, trade, final_close=True)
         _log_exit_telemetry(trade, reason, combined_pnl_pct, closed_at, exit_market_context)
+        log_contract_execution(
+            trade, exit_price, combined_pnl_pct, closed_at, exit_market_context, reason,
+            close_qty_int + _prev_partial_qty,
+        )
         schedule_exit_review(
             trade, reason, entry_px, exit_px, combined_pnl_pct, closed_at, exit_market_context
         )
