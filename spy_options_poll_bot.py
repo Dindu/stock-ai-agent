@@ -521,7 +521,6 @@ ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD = os.getenv("ONE_MINUTE_BYPASS_5M_BREAKOUT_HO
 SNIPER_WATCH_ALERT_COOLDOWN_MINUTES = int(os.getenv("SNIPER_WATCH_ALERT_COOLDOWN_MINUTES", "30"))
 # Countertrend reversals must prove themselves on the next closed 1m candle before execution.
 COUNTERTREND_PROVING_ENABLED = os.getenv("COUNTERTREND_PROVING_ENABLED", "1") == "1"
-COUNTERTREND_PROVING_MAX_WAIT_BARS = max(1, int(os.getenv("COUNTERTREND_PROVING_MAX_WAIT_BARS", "2")))
 
 # Stricter confirmation for recovery-style CALL entries to reduce weak bounce losses.
 RECOVERY_CALL_STRICT_ENABLED = os.getenv("RECOVERY_CALL_STRICT_ENABLED", "1") == "1"
@@ -5049,8 +5048,6 @@ def countertrend_proving_entry_ok(symbol, side, data, bars_1m):
     _countertrend_proving_pending.pop(key, None)
     if proving_ok:
         return True, f"countertrend {side} 1m proof passed; held beyond {trigger_close:.2f}"
-    if pending["waited_bars"] >= COUNTERTREND_PROVING_MAX_WAIT_BARS:
-        return False, f"countertrend {side} proof failed within {COUNTERTREND_PROVING_MAX_WAIT_BARS} bar(s)"
     return False, f"countertrend {side} proof failed; waiting for a fresh reversal trigger"
 
 
