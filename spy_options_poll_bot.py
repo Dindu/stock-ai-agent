@@ -119,6 +119,8 @@ WS_EXIT_CHECK_SECONDS = int(os.getenv("WS_EXIT_CHECK_SECONDS", "5"))
 EXIT_REVIEW_ENABLED = os.getenv("EXIT_REVIEW_ENABLED", "1") == "1"
 EXIT_REVIEW_DELAY_MINUTES = int(os.getenv("EXIT_REVIEW_DELAY_MINUTES", "30"))
 EXIT_REVIEW_CHECK_SECONDS = int(os.getenv("EXIT_REVIEW_CHECK_SECONDS", "60"))
+PREMIUM_STRESS_TELEMETRY_ENABLED = os.getenv("PREMIUM_STRESS_TELEMETRY_ENABLED", "1") == "1"
+PREMIUM_STRESS_SNAPSHOT_MINUTES = (0, 1, 3, 5, 10, 15, 30)
 WS_LOOP_SLEEP_SECONDS = float(os.getenv("WS_LOOP_SLEEP_SECONDS", "0.5"))
 WS_FULL_SCAN_INTERVAL_SECONDS = int(os.getenv("WS_FULL_SCAN_INTERVAL_SECONDS", "30"))
 SCAN_PREFETCH_PARALLEL_ENABLED = os.getenv("SCAN_PREFETCH_PARALLEL_ENABLED", "1") == "1"
@@ -685,6 +687,12 @@ _EXIT_TELEMETRY_HEADERS = [
     "Current VWAP", "Current EMA20", "Current Side Score", "Current Opp Score", "Score Drop",
     "Market Map", "Comparison Notes",
 ]
+_PREMIUM_STRESS_HEADERS = [
+    "Event ID", "Status", "Due CT", "Captured CT", "Offset Minutes", "Trade ID", "Symbol", "Contract", "Side", "Setup Type", "1m Trigger",
+    "Option Entry", "Option Bid", "Option Ask", "Option Mid", "Option P&L %", "Spread %", "Entry Delta", "DTE",
+    "Underlying Price", "Underlying P&L %", "Underlying MFE %", "Underlying MAE %", "VWAP", "EMA9", "EMA20", "EMA50",
+    "Thesis State", "Structure State", "Side Score", "Opp Score", "Frozen Invalidation Level", "Entry Market Map",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +833,19 @@ def init_google_sheets():
                 log("Ensured 'Exit Telemetry' header row in Google Sheets.")
         except Exception as header_err:
             log(f"Warning: Could not verify/set Exit Telemetry headers: {header_err}")
+
+        try:
+            premium_stress_ws = _gsheet.worksheet("Premium Stress")
+        except gspread.exceptions.WorksheetNotFound:
+            premium_stress_ws = _gsheet.add_worksheet(title="Premium Stress", rows=5000, cols=len(_PREMIUM_STRESS_HEADERS))
+            log("Created 'Premium Stress' tab in Google Sheets.")
+        try:
+            existing_stress_headers = premium_stress_ws.row_values(1)
+            if existing_stress_headers != _PREMIUM_STRESS_HEADERS:
+                premium_stress_ws.update(range_name="A1", values=[_PREMIUM_STRESS_HEADERS], value_input_option="USER_ENTERED")
+                log("Ensured 'Premium Stress' header row in Google Sheets.")
+        except Exception as header_err:
+            log(f"Warning: Could not verify/set Premium Stress headers: {header_err}")
         
         # Protect header row (row 1) so it cannot be edited.
         try:
@@ -7273,6 +7294,85 @@ def _underlying_thesis_state(trade):
         return {"ready": False, "invalid": False, "reason": f"THESIS CHECK ERROR: {e}", "price": 0.0, "vwap": 0.0, "ema20": 0.0}
 
 
+def _premium_stress_quote(contract):
+    if _option_client is None or not contract:
+        return 0.0, 0.0, 0.0
+    try:
+        quote = _option_client.get_option_latest_quote(OptionLatestQuoteRequest(symbol_or_symbols=contract)).get(contract)
+        bid, ask = _safe_float_num(getattr(quote, "bid_price", 0.0), 0.0), _safe_float_num(getattr(quote, "ask_price", 0.0), 0.0)
+        return bid, ask, (bid + ask) / 2.0 if bid > 0 and ask > 0 else max(bid, ask)
+    except Exception:
+        return 0.0, 0.0, 0.0
+
+
+def _premium_stress_row(trade, status, due_at, offset, thesis_state, option_pnl_pct):
+    bid, ask, mid = _premium_stress_quote(trade.get("contract", ""))
+    entry = _safe_float_num(trade.get("entry"), 0.0)
+    side = str(trade.get("side", "") or "").upper()
+    underlying_entry = _safe_float_num(trade.get("underlying_entry_price"), 0.0)
+    underlying_now = _safe_float_num(thesis_state.get("price"), 0.0)
+    raw_move = (underlying_now - underlying_entry) / underlying_entry if underlying_entry > 0 else 0.0
+    directional_move = raw_move if side == "CALL" else -raw_move if side == "PUT" else 0.0
+    spread = (ask - bid) / mid if mid > 0 and bid > 0 and ask > 0 else None
+    captured = datetime.now(central)
+    return [
+        trade.get("premium_stress_event_id", ""), status, due_at.strftime("%Y-%m-%d %H:%M:%S"), captured.strftime("%Y-%m-%d %H:%M:%S"), offset,
+        trade.get("trade_id", ""), trade.get("underlying", ""), trade.get("contract", ""), side, trade.get("setup_type", ""), trade.get("one_minute_trigger", ""),
+        entry or "", bid or "", ask or "", mid or "", round(option_pnl_pct * 100, 2) if option_pnl_pct is not None else "", round(spread * 100, 2) if spread is not None else "", trade.get("entry_contract_delta", ""), trade.get("entry_contract_dte", ""),
+        underlying_now or "", round(directional_move * 100, 2) if underlying_entry > 0 else "", round(_safe_float_num(trade.get("underlying_mfe_pct"), 0.0) * 100, 2), round(_safe_float_num(trade.get("underlying_mae_pct"), 0.0) * 100, 2),
+        thesis_state.get("vwap", ""), thesis_state.get("ema9", ""), thesis_state.get("ema20", ""), thesis_state.get("ema50", ""),
+        "INVALID" if thesis_state.get("invalid") else "INTACT" if thesis_state.get("ready") else "UNAVAILABLE", thesis_state.get("reason", ""), thesis_state.get("current_side_score", ""), thesis_state.get("current_opp_score", ""), trade.get("entry_invalidation_level", ""), json.dumps(trade.get("entry_market_map", {}), sort_keys=True, default=str),
+    ]
+
+
+def schedule_premium_stress_snapshots(trade, thesis_state, pnl_pct):
+    if not PREMIUM_STRESS_TELEMETRY_ENABLED or trade.get("premium_stress_event_id"):
+        return
+    if _gsheet is None and not ensure_google_sheets_ready():
+        return
+    try:
+        now = datetime.now(central)
+        trade["premium_stress_event_id"] = str(uuid.uuid4())[:8].upper()
+        rows = []
+        for offset in PREMIUM_STRESS_SNAPSHOT_MINUTES:
+            due_at = now + timedelta(minutes=offset)
+            rows.append(_premium_stress_row(trade, "CAPTURED" if offset == 0 else "PENDING", due_at, offset, thesis_state, pnl_pct if offset == 0 else None))
+        _gsheet.worksheet("Premium Stress").append_rows(rows, value_input_option="USER_ENTERED")
+    except Exception as e:
+        log(f"[{trade.get('underlying', '?')}] Premium stress telemetry failed: {e}")
+
+
+def process_due_premium_stress_snapshots(now_ct=None):
+    if not PREMIUM_STRESS_TELEMETRY_ENABLED or (_gsheet is None and not ensure_google_sheets_ready()):
+        return
+    try:
+        now_ct = now_ct or datetime.now(central)
+        ws = _gsheet.worksheet("Premium Stress")
+        values = ws.get_all_values()
+        if len(values) <= 1:
+            return
+        headers = values[0]
+        index = {name: position for position, name in enumerate(headers)}
+        for row_number, raw_row in enumerate(values[1:], start=2):
+            row = list(raw_row) + [""] * max(0, len(headers) - len(raw_row))
+            if row[index["Status"]] != "PENDING":
+                continue
+            due_at = central.localize(datetime.strptime(row[index["Due CT"]], "%Y-%m-%d %H:%M:%S"))
+            if due_at > now_ct:
+                continue
+            trade = {"contract": row[index["Contract"]], "underlying": row[index["Symbol"]], "side": row[index["Side"]], "entry": _safe_float_num(row[index["Option Entry"]], 0.0)}
+            thesis = _underlying_thesis_state(trade)
+            bid, ask, mid = _premium_stress_quote(trade["contract"])
+            pnl = (mid - trade["entry"]) / trade["entry"] if mid > 0 and trade["entry"] > 0 else None
+            row[index["Status"]] = "CAPTURED"
+            row[index["Captured CT"]] = now_ct.strftime("%Y-%m-%d %H:%M:%S")
+            for name, value in {"Option Bid": bid, "Option Ask": ask, "Option Mid": mid, "Option P&L %": round(pnl * 100, 2) if pnl is not None else "", "Spread %": round((ask - bid) / mid * 100, 2) if mid > 0 and bid > 0 and ask > 0 else "", "Underlying Price": thesis.get("price", ""), "VWAP": thesis.get("vwap", ""), "EMA9": thesis.get("ema9", ""), "EMA20": thesis.get("ema20", ""), "EMA50": thesis.get("ema50", ""), "Thesis State": "INVALID" if thesis.get("invalid") else "INTACT" if thesis.get("ready") else "UNAVAILABLE", "Structure State": thesis.get("reason", ""), "Side Score": thesis.get("current_side_score", ""), "Opp Score": thesis.get("current_opp_score", "")}.items():
+                row[index[name]] = value
+            ws.update(range_name=f"A{row_number}", values=[row], value_input_option="USER_ENTERED")
+    except Exception as e:
+        log(f"Premium stress snapshot processing failed: {e}")
+
+
 def _record_exit_telemetry(trade, thesis_state, pnl_pct):
     """Record technical state and hypothetical normal-exit candidates."""
     telemetry = trade.setdefault("exit_telemetry", {})
@@ -7291,6 +7391,7 @@ def _record_exit_telemetry(trade, thesis_state, pnl_pct):
             telemetry["premium_stop_trigger_time"] = datetime.now(central)
             telemetry["premium_stop_pnl_pct"] = float(pnl_pct)
             telemetry["premium_stop_thesis_intact"] = bool(not thesis_state.get("invalid"))
+            schedule_premium_stress_snapshots(trade, thesis_state, pnl_pct)
     candidate_reason = ""
     if thesis_state.get("invalid"):
         candidate_reason = str(thesis_state.get("reason", "TECHNICAL INVALIDATION") or "TECHNICAL INVALIDATION")
@@ -8580,6 +8681,11 @@ def run_cycle(client):
         log(f"Exit review check error: {e}")
 
     try:
+        process_due_premium_stress_snapshots()
+    except Exception as e:
+        log(f"Premium stress snapshot check error: {e}")
+
+    try:
         maybe_send_hourly_perf_report(datetime.now(central))
     except Exception as e:
         log(f"Hourly perf report error: {e}")
@@ -8750,6 +8856,10 @@ def run_websocket_cycle(client):
                 process_due_exit_reviews(now_ct)
             except Exception as e:
                 log(f"Exit review check error: {e}")
+            try:
+                process_due_premium_stress_snapshots(now_ct)
+            except Exception as e:
+                log(f"Premium stress snapshot check error: {e}")
             next_exit_review_check_at = datetime.now(central) + timedelta(
                 seconds=max(10, EXIT_REVIEW_CHECK_SECONDS)
             )
