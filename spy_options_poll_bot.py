@@ -9675,6 +9675,15 @@ def main():
         log("Paper trading ENABLED — Alpaca paper TradingClient initialized.")
     else:
         log("Paper trading DISABLED — real-trades-only mode, no Discord/Sheets for setups (TradingClient used for option contract lookup only).")
+    log(
+        "[RISK CONFIG] "
+        f"stop=-{STOP_LOSS_PCT * 100:.2f}% "
+        f"thesis_grace={EMERGENCY_STOP_THESIS_GRACE_ENABLED} "
+        f"grace_seconds={EMERGENCY_STOP_THESIS_GRACE_SECONDS:.0f} "
+        f"max_extra_loss={EMERGENCY_STOP_MAX_EXTRA_LOSS_PCT * 100:.2f}% "
+        f"catastrophic_boundary=-{(STOP_LOSS_PCT + EMERGENCY_STOP_MAX_EXTRA_LOSS_PCT) * 100:.2f}% "
+        f"exit_check_seconds={WS_EXIT_CHECK_SECONDS}"
+    )
     if NO_GATING_MODE:
         if HARD_SCORE_GATE_ENABLED and HARD_SCORE_GATE_IN_NO_GATING_MODE:
             log("NO_GATING_MODE enabled - bypassing soft entry gates, hard score gate remains ON.")
