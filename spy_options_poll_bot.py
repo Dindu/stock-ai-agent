@@ -523,6 +523,7 @@ ONE_MINUTE_MAX_TRIGGER_AGE_BARS = int(os.getenv("ONE_MINUTE_MAX_TRIGGER_AGE_BARS
 # high/low (audit showed that single-bar rule was the dominant 1m-sniper blocker).
 ONE_MINUTE_RECLAIM_WINDOW_BARS = int(os.getenv("ONE_MINUTE_RECLAIM_WINDOW_BARS", "3"))
 ONE_MINUTE_REQUIRE_CLOSED_BAR = os.getenv("ONE_MINUTE_REQUIRE_CLOSED_BAR", "1") == "1"
+ONE_MINUTE_REQUIRED_FOR_CONTINUATIONS = os.getenv("ONE_MINUTE_REQUIRED_FOR_CONTINUATIONS", "1") == "1"
 PINE_ONE_MINUTE_PROOF_ENABLED = os.getenv("PINE_ONE_MINUTE_PROOF_ENABLED", "1") == "1"
 ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD = os.getenv("ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD", "1") == "1"
 SNIPER_WATCH_ALERT_COOLDOWN_MINUTES = int(os.getenv("SNIPER_WATCH_ALERT_COOLDOWN_MINUTES", "30"))
@@ -9396,6 +9397,16 @@ def run_symbol(client, symbol, prefetched_bars=None):
             log(f"[{symbol}] 1m sniper evaluation failed: {type(e).__name__}: {e}")
 
     if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and (COUNTERTREND_PROVING_ENABLED or True):
+        if (
+            ONE_MINUTE_REQUIRED_FOR_CONTINUATIONS
+            and not data.get("pine_signal_active", False)
+            and not data.get("one_minute_entry_confirmed", False)
+        ):
+            log(
+                f"[{symbol}] Strategy timing gate: {side} WAIT — "
+                "a completed 1m continuation trigger is required before execution."
+            )
+            return
         proof_data = data
         if data.get("pine_signal_active", False) and PINE_ONE_MINUTE_PROOF_ENABLED:
             proof_data = dict(data)
