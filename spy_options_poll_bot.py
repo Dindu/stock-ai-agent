@@ -692,6 +692,7 @@ _PREMIUM_STRESS_HEADERS = [
     "Option Entry", "Option Bid", "Option Ask", "Option Mid", "Option P&L %", "Spread %", "Entry Delta", "DTE",
     "Underlying Price", "Underlying P&L %", "Underlying MFE %", "Underlying MAE %", "VWAP", "EMA9", "EMA20", "EMA50",
     "Thesis State", "Structure State", "Side Score", "Opp Score", "Frozen Invalidation Level", "Entry Market Map",
+    "Underlying Entry Price",
 ]
 _CONTRACT_EXECUTION_HEADERS = [
     "Trade ID", "Status", "Opened CT", "Closed CT", "Symbol", "Contract", "Side", "Setup Type", "1m Trigger", "Strike", "Expiration", "DTE",
@@ -7344,6 +7345,7 @@ def _premium_stress_row(trade, status, due_at, offset, thesis_state, option_pnl_
         underlying_now or "", round(directional_move * 100, 2) if underlying_entry > 0 else "", round(_safe_float_num(trade.get("underlying_mfe_pct"), 0.0) * 100, 2), round(_safe_float_num(trade.get("underlying_mae_pct"), 0.0) * 100, 2),
         thesis_state.get("vwap", ""), thesis_state.get("ema9", ""), thesis_state.get("ema20", ""), thesis_state.get("ema50", ""),
         "INVALID" if thesis_state.get("invalid") else "INTACT" if thesis_state.get("ready") else "UNAVAILABLE", thesis_state.get("reason", ""), thesis_state.get("current_side_score", ""), thesis_state.get("current_opp_score", ""), trade.get("entry_invalidation_level", ""), json.dumps(trade.get("entry_market_map", {}), sort_keys=True, default=str),
+        underlying_entry or "",
     ]
 
 
@@ -7386,7 +7388,7 @@ def process_due_premium_stress_snapshots(now_ct=None):
             thesis = _underlying_thesis_state(trade)
             bid, ask, mid = _premium_stress_quote(trade["contract"])
             pnl = (mid - trade["entry"]) / trade["entry"] if mid > 0 and trade["entry"] > 0 else None
-            underlying_entry = _safe_float_num(row[index["Underlying Entry Price"]], 0.0)
+            underlying_entry = _safe_float_num(row[index.get("Underlying Entry Price", -1)], 0.0)
             underlying_now = _safe_float_num(thesis.get("price"), 0.0)
             raw_underlying_move = (underlying_now - underlying_entry) / underlying_entry if underlying_entry > 0 else 0.0
             directional_underlying_move = raw_underlying_move if trade["side"] == "CALL" else -raw_underlying_move if trade["side"] == "PUT" else 0.0
