@@ -7053,6 +7053,7 @@ def sync_open_trades_from_alpaca():
             "entry_delta_10m": prev.get("entry_delta_10m") if prev else None,
             "entry_rsi": prev.get("entry_rsi", 50.0) if prev else 50.0,
             "entry_timing": prev.get("entry_timing", "UNKNOWN") if prev else "UNKNOWN",
+            "one_minute_trigger": prev.get("one_minute_trigger", "") if prev else "",
             "one_minute_confirmation_status": prev.get("one_minute_confirmation_status", "") if prev else "",
             "setup_type": prev.get("setup_type", "UNKNOWN") if prev else "UNKNOWN",
             "strategy_source": prev.get("strategy_source", "LEGACY") if prev else "LEGACY",
