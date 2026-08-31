@@ -7217,6 +7217,8 @@ def _underlying_thesis_state(trade):
         price = _safe_float_num(latest.get("close"), 0.0)
         vwap = _safe_float_num(latest.get("VWAP"), price)
         ema20 = _safe_float_num(latest.get("EMA20"), price)
+        ema9 = _safe_float_num(df["close"].ewm(span=9, adjust=False).mean().iloc[-1], price)
+        ema50 = _safe_float_num(latest.get("EMA50"), price)
         if price <= 0 or vwap <= 0 or ema20 <= 0:
             return {"ready": False, "invalid": False, "reason": "INVALID INDICATOR VALUES", "price": price, "vwap": vwap, "ema20": ema20}
 
@@ -7271,7 +7273,7 @@ def _underlying_thesis_state(trade):
                 log(f"[{symbol}] Thesis score check failed (structure check still active): {score_err}")
 
         base_state = {
-            "ready": True, "price": price, "vwap": vwap, "ema20": ema20,
+            "ready": True, "price": price, "vwap": vwap, "ema9": ema9, "ema20": ema20, "ema50": ema50,
             "current_side_score": current_side_score, "current_opp_score": current_opp_score,
             "score_drop": score_drop, "score_deteriorated": score_deteriorated,
         }
@@ -7384,9 +7386,13 @@ def process_due_premium_stress_snapshots(now_ct=None):
             thesis = _underlying_thesis_state(trade)
             bid, ask, mid = _premium_stress_quote(trade["contract"])
             pnl = (mid - trade["entry"]) / trade["entry"] if mid > 0 and trade["entry"] > 0 else None
+            underlying_entry = _safe_float_num(row[index["Underlying Entry Price"]], 0.0)
+            underlying_now = _safe_float_num(thesis.get("price"), 0.0)
+            raw_underlying_move = (underlying_now - underlying_entry) / underlying_entry if underlying_entry > 0 else 0.0
+            directional_underlying_move = raw_underlying_move if trade["side"] == "CALL" else -raw_underlying_move if trade["side"] == "PUT" else 0.0
             row[index["Status"]] = "CAPTURED"
             row[index["Captured CT"]] = now_ct.strftime("%Y-%m-%d %H:%M:%S")
-            for name, value in {"Option Bid": bid, "Option Ask": ask, "Option Mid": mid, "Option P&L %": round(pnl * 100, 2) if pnl is not None else "", "Spread %": round((ask - bid) / mid * 100, 2) if mid > 0 and bid > 0 and ask > 0 else "", "Underlying Price": thesis.get("price", ""), "VWAP": thesis.get("vwap", ""), "EMA9": thesis.get("ema9", ""), "EMA20": thesis.get("ema20", ""), "EMA50": thesis.get("ema50", ""), "Thesis State": "INVALID" if thesis.get("invalid") else "INTACT" if thesis.get("ready") else "UNAVAILABLE", "Structure State": thesis.get("reason", ""), "Side Score": thesis.get("current_side_score", ""), "Opp Score": thesis.get("current_opp_score", "")}.items():
+            for name, value in {"Option Bid": bid, "Option Ask": ask, "Option Mid": mid, "Option P&L %": round(pnl * 100, 2) if pnl is not None else "", "Spread %": round((ask - bid) / mid * 100, 2) if mid > 0 and bid > 0 and ask > 0 else "", "Underlying Price": thesis.get("price", ""), "Underlying P&L %": round(directional_underlying_move * 100, 2) if underlying_entry > 0 and underlying_now > 0 else "", "VWAP": thesis.get("vwap", ""), "EMA9": thesis.get("ema9", ""), "EMA20": thesis.get("ema20", ""), "EMA50": thesis.get("ema50", ""), "Thesis State": "INVALID" if thesis.get("invalid") else "INTACT" if thesis.get("ready") else "UNAVAILABLE", "Structure State": thesis.get("reason", ""), "Side Score": thesis.get("current_side_score", ""), "Opp Score": thesis.get("current_opp_score", "")}.items():
                 row[index[name]] = value
             ws.update(range_name=f"A{row_number}", values=[row], value_input_option="USER_ENTERED")
     except Exception as e:
