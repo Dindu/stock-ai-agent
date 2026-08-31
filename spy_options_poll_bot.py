@@ -34,7 +34,7 @@ from dotenv import load_dotenv
 
 from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
 from alpaca.data.live import StockDataStream
-from alpaca.data.requests import StockBarsRequest, OptionLatestQuoteRequest, OptionSnapshotRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest, OptionLatestQuoteRequest, OptionSnapshotRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed, OptionsFeed
 from alpaca.trading.client import TradingClient
@@ -700,6 +700,7 @@ _CONTRACT_EXECUTION_HEADERS = [
     "Quantity", "Option Entry Bid", "Option Entry Ask", "Option Entry Mid", "Requested Entry Price", "Actual Entry Fill", "Entry Fill Slippage $", "Entry Fill Slippage %", "Entry Spread $", "Entry Spread %", "Selection Delta", "Selection Volume", "Selection OI", "Selection Quality",
     "Underlying Signal Price", "Underlying Entry Price", "Underlying Exit Price", "Underlying Directional Move %", "Underlying MFE %", "Underlying MAE %",
     "Option Exit Bid", "Option Exit Ask", "Option Exit Mid", "Actual Exit Fill", "Exit Fill Slippage $", "Exit Fill Slippage %", "Option MFE %", "Option MAE %", "Option P&L %", "Contract Responsiveness", "Exit Reason",
+    "Underlying Entry Bid", "Underlying Entry Ask", "Underlying Entry Bid Size", "Underlying Entry Ask Size", "Underlying Depth Imbalance", "Directional Depth Imbalance",
 ]
 
 
@@ -6840,6 +6841,7 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "entry_contract_slippage_est": _safe_float_num((option or {}).get("slippage_est", 0.0), 0.0),
         "entry_contract_dte": _safe_int_num((option or {}).get("dte", 0), 0),
         "entry_contract_quote_age_seconds": round(quote_age_seconds, 2) if quote_age_seconds is not None else None,
+        "entry_underlying_order_flow": dict((data or {}).get("underlying_order_flow", {}) or {}),
         "entry_est_max_risk_dollar": stop_dollar_risk,
         "entry_ignition_delta": ignition_delta,
         "entry_option_oi": option_oi,
@@ -7193,6 +7195,34 @@ def get_current_option_price(trade):
     except Exception as e:
         log(f"[{trade['underlying']}] Price check failed for {trade['contract']}: {e}")
         return None
+
+
+def underlying_order_flow_snapshot(symbol, side):
+    """Capture underlying quote depth for analysis; never gates a trade."""
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY or not symbol:
+        return {}
+    try:
+        client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        quote = client.get_stock_latest_quote(
+            StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed(FEED))
+        ).get(symbol)
+        bid = _safe_float_num(getattr(quote, "bid_price", 0.0), 0.0)
+        ask = _safe_float_num(getattr(quote, "ask_price", 0.0), 0.0)
+        bid_size = _safe_float_num(getattr(quote, "bid_size", 0.0), 0.0)
+        ask_size = _safe_float_num(getattr(quote, "ask_size", 0.0), 0.0)
+        total_size = bid_size + ask_size
+        imbalance = (bid_size - ask_size) / total_size if total_size > 0 else 0.0
+        return {
+            "bid": bid,
+            "ask": ask,
+            "bid_size": bid_size,
+            "ask_size": ask_size,
+            "imbalance": imbalance,
+            "directional_imbalance": imbalance if str(side).upper() == "CALL" else -imbalance,
+        }
+    except Exception as e:
+        log(f"[{symbol}] Underlying order-flow snapshot unavailable: {type(e).__name__}: {e}")
+        return {}
 
 
 def _underlying_thesis_state(trade):
@@ -8118,6 +8148,7 @@ def log_contract_execution(trade, exit_price, pnl_pct, closed_at, exit_market_co
             original_qty, entry_bid or "", entry_ask or "", entry_mid or "", requested or "", entry or "", round(entry_fill_slippage, 4) if entry_fill_slippage is not None else "", round(entry_fill_slippage / entry_mid * 100, 2) if entry_mid > 0 else "", round(entry_ask - entry_bid, 4) if entry_mid > 0 else "", round((entry_ask - entry_bid) / entry_mid * 100, 2) if entry_mid > 0 else "", trade.get("entry_contract_delta", ""), trade.get("entry_contract_volume", ""), trade.get("entry_option_oi", ""), json.dumps(trade.get("entry_contract_quality", {}), sort_keys=True, default=str),
             entry_underlying or "", entry_underlying or "", exit_underlying or "", round(directional_move * 100, 2) if entry_underlying > 0 and exit_underlying > 0 else "", round(_safe_float_num(trade.get("underlying_mfe_pct"), 0.0) * 100, 2), round(_safe_float_num(trade.get("underlying_mae_pct"), 0.0) * 100, 2),
             exit_bid or "", exit_ask or "", exit_mid or "", exit_price or "", round(exit_fill_slippage, 4) if exit_fill_slippage is not None else "", round(exit_fill_slippage / exit_mid * 100, 2) if exit_mid > 0 else "", round(_safe_float_num(trade.get("max_pnl_pct"), 0.0) * 100, 2), round(_safe_float_num(trade.get("min_pnl_pct"), 0.0) * 100, 2), round(pnl_pct * 100, 2), round(responsiveness, 3) if responsiveness is not None else "", reason,
+            _safe_float_num(trade.get("entry_underlying_order_flow", {}).get("bid"), 0.0) or "", _safe_float_num(trade.get("entry_underlying_order_flow", {}).get("ask"), 0.0) or "", _safe_float_num(trade.get("entry_underlying_order_flow", {}).get("bid_size"), 0.0) or "", _safe_float_num(trade.get("entry_underlying_order_flow", {}).get("ask_size"), 0.0) or "", round(_safe_float_num(trade.get("entry_underlying_order_flow", {}).get("imbalance"), 0.0), 4) if trade.get("entry_underlying_order_flow") else "", round(_safe_float_num(trade.get("entry_underlying_order_flow", {}).get("directional_imbalance"), 0.0), 4) if trade.get("entry_underlying_order_flow") else "",
         ]
         _gsheet.worksheet("Contract Execution").append_row(row, value_input_option="USER_ENTERED")
     except Exception as e:
@@ -8535,6 +8566,7 @@ def try_open_paper_trade(symbol, side, option, data):
         log(f"[{symbol}] Execution-time quote refresh failed for {option.get('contract', '')}: {refresh_reason} — skipping entry.")
         return False
     log(f"[{symbol}] Execution-time quote refresh: {refresh_reason}")
+    data["underlying_order_flow"] = underlying_order_flow_snapshot(symbol, side)
 
     score = int(data.get("effective_score", data["bull_score"] if side == "CALL" else data["bear_score"]))
     raw_score = int(data.get("raw_entry_score", score))
