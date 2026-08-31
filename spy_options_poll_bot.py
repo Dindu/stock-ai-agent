@@ -460,10 +460,10 @@ TRADE_LOG_FILE    = os.getenv("TRADE_LOG_FILE", "trade_results.csv")
 
 # Option quality filters (stock-only tightened defaults; ETFs remain baseline).
 ETF_MIN_OPTION_BID = float(os.getenv("ETF_MIN_OPTION_BID", "0.15"))
-ETF_MAX_OPTION_SPREAD_PCT = float(os.getenv("ETF_MAX_OPTION_SPREAD_PCT", "0.05"))
+ETF_MAX_OPTION_SPREAD_PCT = float(os.getenv("ETF_MAX_OPTION_SPREAD_PCT", "0.03"))
 ETF_MAX_OPTION_BID = float(os.getenv("ETF_MAX_OPTION_BID", "8.00"))
 STOCK_MIN_OPTION_BID = float(os.getenv("STOCK_MIN_OPTION_BID", "0.20"))
-STOCK_MAX_OPTION_SPREAD_PCT = float(os.getenv("STOCK_MAX_OPTION_SPREAD_PCT", "0.08"))
+STOCK_MAX_OPTION_SPREAD_PCT = float(os.getenv("STOCK_MAX_OPTION_SPREAD_PCT", "0.05"))
 STOCK_MAX_OPTION_BID = float(os.getenv("STOCK_MAX_OPTION_BID", "8.00"))
 STOCK_MIN_OPTION_VOLUME = int(os.getenv("STOCK_MIN_OPTION_VOLUME", "10"))
 STOCK_MIN_OPTION_OPEN_INTEREST = int(os.getenv("STOCK_MIN_OPTION_OPEN_INTEREST", "50"))
