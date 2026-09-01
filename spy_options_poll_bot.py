@@ -601,8 +601,8 @@ _qqq_vwap_cache: "dict" = {"side": None, "updated_at": None}
 # An ignition must be seen twice (two consecutive scans) before an entry is allowed.
 _ignition_pending: "dict[tuple, dict]" = {}
 # Entry Timing V1 persistent state: direction + setup lifecycle across scan cycles.
-# States: NO_SETUP, SETUP_FORMING, PULLBACK_RESET, TRIGGER_READY, CONFIRMED,
-# ENTRY_WINDOW, EXTENDED_CHASED, INVALIDATED.
+# States: NO_SETUP, SETUP_FORMING, RECLAIM, CONFIRMED, ENTRY_WINDOW, MISSED,
+# EXTENDED_CHASED, INVALIDATED.
 _entry_timing_v1_state: "dict[tuple, dict]" = {}
 # Initial breakout levels awaiting the next completed five-minute bar to hold.
 _breakout_hold_pending: "dict[tuple, dict]" = {}
@@ -2499,8 +2499,16 @@ def _entry_timing_v1_evaluate(symbol, side, data):
         ema9 = price
 
     is_bullish = bool(price > vwap and price > ema20 and price > ema9) if side == "CALL" else bool(price < vwap and price < ema20 and price < ema9)
-    is_reset_zone = bool((side == "CALL" and price > vwap and price > ema20 and abs(price - vwap) <= max(ENTRY_TIMING_V1_MAX_VWAP_EXTENSION_PCT, (atr14 / max(price, 1.0)) * 3.0)) or (side == "PUT" and price < vwap and price < ema20 and abs(price - vwap) <= max(ENTRY_TIMING_V1_MAX_VWAP_EXTENSION_PCT, (atr14 / max(price, 1.0)) * 3.0)))
+    reset_limit_pct = max(
+        ENTRY_TIMING_V1_MAX_VWAP_EXTENSION_PCT,
+        (atr14 / max(price, 1.0)) * 3.0,
+    )
+    is_reset_zone = bool(
+        is_bullish and abs(price - vwap) / max(vwap, 1.0) <= reset_limit_pct
+    )
     is_reclaim = bool((side == "CALL" and price > vwap and price > ema20 and price > ema9 and data.get("bullish_candle", False)) or (side == "PUT" and price < vwap and price < ema20 and price < ema9 and data.get("bearish_candle", False)))
+    confirmation_bar = str(data.get("one_minute_bar_time", "") or "")
+    completed_confirmation = bool(data.get("one_minute_entry_confirmed", False)) and bool(confirmation_bar)
     atr_norm = abs(price - vwap) / max(atr14, 1.0) if atr14 > 0 else 0.0
     chase_limit = max(ENTRY_TIMING_V1_MAX_VWAP_EXTENSION_PCT, (ENTRY_TIMING_V1_MAX_ATR_EXTENSION * atr14 / max(price, 1.0)) if atr14 > 0 else ENTRY_TIMING_V1_MAX_VWAP_EXTENSION_PCT)
     extended = bool(vwap_extension > chase_limit and not is_reset_zone)
@@ -2520,7 +2528,14 @@ def _entry_timing_v1_evaluate(symbol, side, data):
         "atr_normalized_distance": atr_norm,
     }
 
-    if not is_bullish and state not in {"NO_SETUP", "INVALIDATED"}:
+    if state in {"EXTENDED_CHASED", "INVALIDATED", "MISSED"} and is_reset_zone:
+        state = "SETUP_FORMING"
+        reason = "fresh reset after terminal timing state"
+        allow_entry = False
+    elif state in {"EXTENDED_CHASED", "INVALIDATED", "MISSED"}:
+        reason = "terminal timing state; waiting for a fresh reset"
+        allow_entry = False
+    elif not is_bullish and state != "NO_SETUP":
         state = "INVALIDATED"
         reason = "direction lost alignment; setup invalidated"
         allow_entry = False
@@ -2528,27 +2543,32 @@ def _entry_timing_v1_evaluate(symbol, side, data):
         state = "EXTENDED_CHASED"
         reason = "setup missed; price extended beyond acceptable VWAP/ATR location"
         allow_entry = False
-    elif state in {"EXTENDED_CHASED", "INVALIDATED"} and is_reset_zone:
-        state = "SETUP_FORMING"
-        reason = "fresh reset after chase invalidation"
+    elif state == "ENTRY_WINDOW" and (
+        (datetime.now(central) - current.get("entry_window_started", now)).total_seconds() / 60.0
+    ) > ENTRY_TIMING_V1_ENTRY_WINDOW_MINUTES:
+        state = "MISSED"
+        reason = "entry window expired; require a fresh reset"
         allow_entry = False
-    elif is_reset_zone and (state in {"NO_SETUP", "INVALIDATED", "EXTENDED_CHASED"} or state == "SETUP_FORMING"):
+    elif is_reset_zone and state in {"NO_SETUP", "INVALIDATED", "EXTENDED_CHASED"}:
         state = "SETUP_FORMING"
         reason = "controlled pullback toward VWAP/value"
         allow_entry = False
-    elif is_reclaim and vol_ratio >= ENTRY_TIMING_V1_MIN_VOL_RATIO:
-        state = "TRIGGER_READY"
-        reason = "reclaim met; waiting for completed 1m confirmation"
+    elif state == "SETUP_FORMING" and is_reclaim and vol_ratio >= ENTRY_TIMING_V1_MIN_VOL_RATIO and completed_confirmation:
+        state = "RECLAIM"
+        reason = "first completed 1m reclaim candle accepted"
         allow_entry = False
-    elif state == "TRIGGER_READY" and is_reclaim and vol_ratio >= ENTRY_TIMING_V1_MIN_VOL_RATIO:
+    elif state == "RECLAIM" and is_reclaim and vol_ratio >= ENTRY_TIMING_V1_MIN_VOL_RATIO and completed_confirmation and confirmation_bar != current.get("reclaim_bar"):
         state = "CONFIRMED"
-        reason = "completed 1m confirmation with participation re-expansion"
+        reason = "second completed 1m confirmation held the reclaim"
         allow_entry = False
-    elif state in {"CONFIRMED", "TRIGGER_READY"} and is_reset_zone and vol_ratio >= ENTRY_TIMING_V1_MIN_VOL_RATIO:
+    elif state == "RECLAIM":
+        reason = "waiting for a distinct second completed 1m confirmation"
+        allow_entry = False
+    elif state == "CONFIRMED" and is_reset_zone and vol_ratio >= ENTRY_TIMING_V1_MIN_VOL_RATIO:
         state = "ENTRY_WINDOW"
         reason = "confirmed setup still inside acceptable entry location"
         allow_entry = True
-    elif state == "ENTRY_WINDOW" and is_reset_zone and ((datetime.now(central) - current.get("entry_window_started", now)).total_seconds() / 60.0) <= ENTRY_TIMING_V1_ENTRY_WINDOW_MINUTES:
+    elif state == "ENTRY_WINDOW" and is_reset_zone:
         allow_entry = True
         reason = "timing v1 open entry window"
     else:
@@ -2564,8 +2584,9 @@ def _entry_timing_v1_evaluate(symbol, side, data):
         "state": state,
         "since": current.get("since", now),
         "last_price": price,
-        "reset_price": current.get("reset_price"),
-        "entry_window_started": current.get("entry_window_started", now) if state == "ENTRY_WINDOW" else now if allow_entry else current.get("entry_window_started"),
+        "reset_price": price if state == "SETUP_FORMING" else current.get("reset_price"),
+        "reclaim_bar": confirmation_bar if state == "RECLAIM" else current.get("reclaim_bar"),
+        "entry_window_started": now if state == "ENTRY_WINDOW" and current.get("state") != "ENTRY_WINDOW" else current.get("entry_window_started"),
         "reason": reason,
         "updated_at": now,
     }
@@ -9542,6 +9563,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
             trigger, trigger_reason = one_minute_entry_timing(symbol, side, bars_1m, data)
             data["one_minute_trigger"] = trigger or ""
             data["one_minute_entry_confirmed"] = bool(trigger)
+            data["one_minute_bar_time"] = str(bars_1m.index[-1]) if bars_1m is not None and len(bars_1m) else ""
             data["one_minute_confirmation_reason"] = str(trigger_reason or "")
             if trigger:
                 log(f"[{symbol}] 1m SNIPER PASS: {trigger} — {trigger_reason}")
