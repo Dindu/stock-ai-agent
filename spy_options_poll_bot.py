@@ -527,6 +527,15 @@ ONE_MINUTE_REQUIRED_FOR_CONTINUATIONS = os.getenv("ONE_MINUTE_REQUIRED_FOR_CONTI
 PINE_ONE_MINUTE_PROOF_ENABLED = os.getenv("PINE_ONE_MINUTE_PROOF_ENABLED", "1") == "1"
 ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD = os.getenv("ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD", "1") == "1"
 SNIPER_WATCH_ALERT_COOLDOWN_MINUTES = int(os.getenv("SNIPER_WATCH_ALERT_COOLDOWN_MINUTES", "30"))
+# Entry Timing V1: independent state machine between direction detection and exec.
+# This is paper-only by default; it logs state and rejects entries until a controlled,
+# confirmed setup is present instead of blindly chasing strong score.
+ENTRY_TIMING_V1_ENABLED = os.getenv("ENTRY_TIMING_V1_ENABLED", "1") == "1"
+ENTRY_TIMING_V1_PAPER_ONLY = os.getenv("ENTRY_TIMING_V1_PAPER_ONLY", "1") == "1"
+ENTRY_TIMING_V1_ENTRY_WINDOW_MINUTES = int(os.getenv("ENTRY_TIMING_V1_ENTRY_WINDOW_MINUTES", "3"))
+ENTRY_TIMING_V1_MAX_VWAP_EXTENSION_PCT = float(os.getenv("ENTRY_TIMING_V1_MAX_VWAP_EXTENSION_PCT", "0.012"))
+ENTRY_TIMING_V1_MAX_ATR_EXTENSION = float(os.getenv("ENTRY_TIMING_V1_MAX_ATR_EXTENSION", "2.5"))
+ENTRY_TIMING_V1_MIN_VOL_RATIO = float(os.getenv("ENTRY_TIMING_V1_MIN_VOL_RATIO", "1.0"))
 # Countertrend reversals must prove themselves on the next closed 1m candle before execution.
 COUNTERTREND_PROVING_ENABLED = os.getenv("COUNTERTREND_PROVING_ENABLED", "1") == "1"
 
@@ -591,6 +600,10 @@ _qqq_vwap_cache: "dict" = {"side": None, "updated_at": None}
 # Ignition confirmation buffer: (symbol, side) -> {"score": int, "delta": int, "at": datetime}
 # An ignition must be seen twice (two consecutive scans) before an entry is allowed.
 _ignition_pending: "dict[tuple, dict]" = {}
+# Entry Timing V1 persistent state: direction + setup lifecycle across scan cycles.
+# States: NO_SETUP, SETUP_FORMING, PULLBACK_RESET, TRIGGER_READY, CONFIRMED,
+# ENTRY_WINDOW, EXTENDED_CHASED, INVALIDATED.
+_entry_timing_v1_state: "dict[tuple, dict]" = {}
 # Initial breakout levels awaiting the next completed five-minute bar to hold.
 _breakout_hold_pending: "dict[tuple, dict]" = {}
 _breakout_continuations: "dict[tuple, dict]" = {}
@@ -2450,6 +2463,118 @@ def _one_minute_confirmation_status(data):
     if confirmed and trigger:
         return "PASS"
     return "WAIT"
+
+
+def _entry_timing_v1_evaluate(symbol, side, data):
+    """Independent Entry Timing V1 state machine.
+
+    This intentionally sits between the Direction Engine and option execution. It does
+    not replace the existing trend gates; it coordinates the timing lifecycle that must
+    persist across scan cycles instead of being re-derived from a single snapshot.
+    """
+    if not ENTRY_TIMING_V1_ENABLED:
+        return True, "DISABLED", "timing v1 disabled", {"mode": "disabled"}
+
+    symbol = str(symbol or "").upper()
+    side = str(side or "").upper()
+    if side not in {"CALL", "PUT"}:
+        return False, "INVALIDATED", "invalid side for timing v1", {"side": side}
+
+    data = data or {}
+    key = (symbol, side)
+    now = datetime.now(central)
+    current = _entry_timing_v1_state.get(key, {"state": "NO_SETUP", "since": now, "last_price": None, "reset_price": None})
+    price = _safe_float_num(data.get("price", 0.0), 0.0)
+    vwap = _safe_float_num(data.get("vwap", price), price)
+    ema9 = _safe_float_num(data.get("ema9", price), price)
+    ema20 = _safe_float_num(data.get("ema20", price), price)
+    atr14 = _safe_float_num(data.get("atr14", 0.0), 0.0)
+    vwap_extension = abs(_safe_float_num(data.get("vwap_extension_pct", 0.0), 0.0))
+    vol_ratio = _safe_float_num(data.get("vol_ratio", 1.0), 1.0)
+    if vwap <= 0:
+        vwap = price
+    if ema20 <= 0:
+        ema20 = price
+    if ema9 <= 0:
+        ema9 = price
+
+    is_bullish = bool(price > vwap and price > ema20 and price > ema9) if side == "CALL" else bool(price < vwap and price < ema20 and price < ema9)
+    is_reset_zone = bool((side == "CALL" and price > vwap and price > ema20 and abs(price - vwap) <= max(ENTRY_TIMING_V1_MAX_VWAP_EXTENSION_PCT, (atr14 / max(price, 1.0)) * 3.0)) or (side == "PUT" and price < vwap and price < ema20 and abs(price - vwap) <= max(ENTRY_TIMING_V1_MAX_VWAP_EXTENSION_PCT, (atr14 / max(price, 1.0)) * 3.0)))
+    is_reclaim = bool((side == "CALL" and price > vwap and price > ema20 and price > ema9 and data.get("bullish_candle", False)) or (side == "PUT" and price < vwap and price < ema20 and price < ema9 and data.get("bearish_candle", False)))
+    atr_norm = abs(price - vwap) / max(atr14, 1.0) if atr14 > 0 else 0.0
+    chase_limit = max(ENTRY_TIMING_V1_MAX_VWAP_EXTENSION_PCT, (ENTRY_TIMING_V1_MAX_ATR_EXTENSION * atr14 / max(price, 1.0)) if atr14 > 0 else ENTRY_TIMING_V1_MAX_VWAP_EXTENSION_PCT)
+    extended = bool(vwap_extension > chase_limit and not is_reset_zone)
+
+    state = str(current.get("state", "NO_SETUP") or "NO_SETUP").upper()
+    metrics = {
+        "symbol": symbol,
+        "side": side,
+        "price": price,
+        "vwap": vwap,
+        "ema9": ema9,
+        "ema20": ema20,
+        "atr14": atr14,
+        "vwap_extension_pct": vwap_extension,
+        "pullback_depth": abs(price - vwap) / max(vwap, 1.0),
+        "vol_ratio": vol_ratio,
+        "atr_normalized_distance": atr_norm,
+    }
+
+    if not is_bullish and state not in {"NO_SETUP", "INVALIDATED"}:
+        state = "INVALIDATED"
+        reason = "direction lost alignment; setup invalidated"
+        allow_entry = False
+    elif extended:
+        state = "EXTENDED_CHASED"
+        reason = "setup missed; price extended beyond acceptable VWAP/ATR location"
+        allow_entry = False
+    elif state in {"EXTENDED_CHASED", "INVALIDATED"} and is_reset_zone:
+        state = "SETUP_FORMING"
+        reason = "fresh reset after chase invalidation"
+        allow_entry = False
+    elif is_reset_zone and (state in {"NO_SETUP", "INVALIDATED", "EXTENDED_CHASED"} or state == "SETUP_FORMING"):
+        state = "SETUP_FORMING"
+        reason = "controlled pullback toward VWAP/value"
+        allow_entry = False
+    elif is_reclaim and vol_ratio >= ENTRY_TIMING_V1_MIN_VOL_RATIO:
+        state = "TRIGGER_READY"
+        reason = "reclaim met; waiting for completed 1m confirmation"
+        allow_entry = False
+    elif state == "TRIGGER_READY" and is_reclaim and vol_ratio >= ENTRY_TIMING_V1_MIN_VOL_RATIO:
+        state = "CONFIRMED"
+        reason = "completed 1m confirmation with participation re-expansion"
+        allow_entry = False
+    elif state in {"CONFIRMED", "TRIGGER_READY"} and is_reset_zone and vol_ratio >= ENTRY_TIMING_V1_MIN_VOL_RATIO:
+        state = "ENTRY_WINDOW"
+        reason = "confirmed setup still inside acceptable entry location"
+        allow_entry = True
+    elif state == "ENTRY_WINDOW" and is_reset_zone and ((datetime.now(central) - current.get("entry_window_started", now)).total_seconds() / 60.0) <= ENTRY_TIMING_V1_ENTRY_WINDOW_MINUTES:
+        allow_entry = True
+        reason = "timing v1 open entry window"
+    else:
+        if is_bullish:
+            state = "SETUP_FORMING" if state not in {"CONFIRMED", "ENTRY_WINDOW"} else state
+            reason = "direction intact but setup still forming"
+        else:
+            state = "NO_SETUP"
+            reason = "no active entry timing setup"
+        allow_entry = False
+
+    _entry_timing_v1_state[key] = {
+        "state": state,
+        "since": current.get("since", now),
+        "last_price": price,
+        "reset_price": current.get("reset_price"),
+        "entry_window_started": current.get("entry_window_started", now) if state == "ENTRY_WINDOW" else now if allow_entry else current.get("entry_window_started"),
+        "reason": reason,
+        "updated_at": now,
+    }
+
+    data["entry_timing_v1_state"] = state
+    data["entry_timing_v1_reason"] = reason
+    data["entry_timing_v1_would_enter"] = bool(allow_entry)
+    data["entry_timing_v1_metrics"] = metrics
+    return allow_entry, state, reason, metrics
 
 
 def _entry_directional_disagreement(side, data):
@@ -9557,6 +9682,19 @@ def run_symbol(client, symbol, prefetched_bars=None):
             return
 
     log_v2_pre_contract_components(symbol, side, data)
+
+    if ENTRY_TIMING_V1_ENABLED:
+        timing_ok, timing_state, timing_reason, timing_metrics = _entry_timing_v1_evaluate(symbol, side, data)
+        data["entry_timing_v1_state"] = timing_state
+        data["entry_timing_v1_reason"] = timing_reason
+        data["entry_timing_v1_metrics"] = timing_metrics
+        if not timing_ok:
+            log(
+                f"[{symbol}] Entry Timing V1: {side} {timing_state} — {timing_reason} | "
+                f"vwap_ext={timing_metrics.get('vwap_extension_pct', 0.0) * 100:.2f}% | "
+                f"pullback={timing_metrics.get('pullback_depth', 0.0) * 100:.2f}% | vol_ratio={timing_metrics.get('vol_ratio', 1.0):.2f}"
+            )
+            return
 
     option = get_option_contract(
         symbol,
