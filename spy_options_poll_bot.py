@@ -5884,6 +5884,77 @@ def _fetch_daily_change_summary(client, symbol):
         return None
 
 
+def _fetch_briefing_top25(client, symbols, articles):
+    """Rank recent Stocktwits symbols for the briefing using price, volume, and news."""
+    candidates = list(dict.fromkeys(str(sym or "").upper().strip() for sym in symbols if str(sym or "").strip()))
+    candidates = [sym for sym in candidates if sym not in ETF_SYMBOLS]
+    if not candidates:
+        return []
+
+    news_by_symbol = {sym: [] for sym in candidates}
+    for article in articles:
+        title = str(article.get("headline") or article.get("title") or "").strip()
+        if not title:
+            continue
+        article_symbols = article.get("symbols") or article.get("tickers") or []
+        if isinstance(article_symbols, str):
+            article_symbols = [article_symbols]
+        for article_symbol in article_symbols:
+            if isinstance(article_symbol, dict):
+                article_symbol = article_symbol.get("symbol") or article_symbol.get("ticker")
+            normalized = str(article_symbol or "").upper().strip()
+            if normalized in news_by_symbol:
+                news_by_symbol[normalized].append(title)
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=45)
+    try:
+        request = StockBarsRequest(
+            symbol_or_symbols=candidates,
+            timeframe=TimeFrame(1, TimeFrameUnit.Day),
+            start=start,
+            end=end,
+            feed=DataFeed(FEED),
+        )
+        bars = client.get_stock_bars(request).df
+    except Exception as exc:
+        log(f"[BRIEFING] Top-25 stock snapshot failed: {type(exc).__name__}: {exc}")
+        return []
+
+    rows = []
+    for symbol in candidates:
+        try:
+            symbol_bars = bars.xs(symbol, level=0) if isinstance(bars.index, pd.MultiIndex) else bars
+            symbol_bars = symbol_bars[["close", "volume"]].dropna().tail(25)
+            if len(symbol_bars) < 3:
+                continue
+            close = symbol_bars["close"].astype(float)
+            volume = symbol_bars["volume"].astype(float)
+            today_pct = ((close.iloc[-1] / close.iloc[-2]) - 1.0) * 100.0
+            yesterday_pct = ((close.iloc[-2] / close.iloc[-3]) - 1.0) * 100.0
+            average_volume = float(volume.iloc[:-1].tail(20).mean())
+            volume_ratio = float(volume.iloc[-1] / average_volume) if average_volume > 0 else 0.0
+            headline = news_by_symbol.get(symbol, [""])[0]
+            impact_label, impact_reason = _classify_news_impact(" ".join(news_by_symbol.get(symbol, [])))
+            impact_points = {"HIGH": 3.0, "MEDIUM": 1.5, "LOW": 0.0}.get(impact_label, 0.0)
+            bullish_points = max(0.0, today_pct) + max(0.0, yesterday_pct)
+            rank_score = (bullish_points * 4.0) + min(max(volume_ratio, 0.0), 8.0) * 2.0 + impact_points
+            rows.append({
+                "symbol": symbol,
+                "close": float(close.iloc[-1]),
+                "today_pct": today_pct,
+                "yesterday_pct": yesterday_pct,
+                "volume_ratio": volume_ratio,
+                "impact_label": impact_label,
+                "impact_reason": impact_reason,
+                "headline": headline,
+                "rank_score": rank_score,
+            })
+        except Exception:
+            continue
+    return sorted(rows, key=lambda row: row["rank_score"], reverse=True)[:25]
+
+
 def _categorize_market_headlines(articles, now_ct):
     """Split headlines into FED/FOMC, earnings, geopolitics, and broad market buckets."""
     fed_keys = (
@@ -6036,12 +6107,18 @@ def _maybe_send_scheduled_briefing(client, now_ct, title, target_hour, target_mi
         symbols_csv = ",".join(
             [s.strip().upper() for s in str(MORNING_BRIEFING_NEWS_SYMBOLS).split(",") if s.strip()]
         )
+        briefing_trending_symbols = list(dict.fromkeys(_fetch_stocktwits_trending_symbols()))
+        news_symbols = list(dict.fromkeys(
+            [s.strip().upper() for s in str(MORNING_BRIEFING_NEWS_SYMBOLS).split(",") if s.strip()]
+            + briefing_trending_symbols
+        ))
         payload = _alpaca_data_get_json(
             "/v1beta1/news",
-            params={"symbols": symbols_csv, "limit": max(10, MORNING_BRIEFING_NEWS_LIMIT), "sort": "desc"},
+            params={"symbols": ",".join(news_symbols) or symbols_csv, "limit": max(10, MORNING_BRIEFING_NEWS_LIMIT), "sort": "desc"},
             timeout=10,
         )
         articles = _extract_news_articles(payload)
+        top25 = _fetch_briefing_top25(client, briefing_trending_symbols, articles)
         fed_news, earnings_news, geopolitics_news, market_news = _categorize_market_headlines(articles, now_ct)
 
         n = max(1, MORNING_BRIEFING_HEADLINES_PER_SECTION)
@@ -6054,6 +6131,15 @@ def _maybe_send_scheduled_briefing(client, now_ct, title, target_hour, target_mi
         earn_block = "\n".join(earn_lines)
         geopolitics_block = "\n".join(geopolitics_lines)
         market_block = "\n".join(market_lines)
+        top25_lines = []
+        for index, row in enumerate(top25, 1):
+            catalyst = _trim_text(row["headline"] or "No matching corporate headline", max_len=120)
+            top25_lines.append(
+                f"{index}. `{row['symbol']}` close `{row['close']:.2f}` | today `{row['today_pct']:+.2f}%` | "
+                f"yesterday `{row['yesterday_pct']:+.2f}%` | vol `{row['volume_ratio']:.1f}x` | "
+                f"news `{row['impact_label']}`: {catalyst}"
+            )
+        top25_block = "\n".join(top25_lines) or "- No Stocktwits trending stock snapshots available"
 
         send_discord(
             f"\U0001f305 **{title} ({now_ct:%Y-%m-%d %H:%M} CT)**\n\n"
@@ -6071,6 +6157,17 @@ def _maybe_send_scheduled_briefing(client, now_ct, title, target_hour, target_mi
             color=DISCORD_COLOR_WARN,
             webhook_url=DISCORD_WEBHOOK_MORNING_BRIEFING_URL or DISCORD_WEBHOOK_URL,
         )
+        top25_rows = top25_lines or ["- No Stocktwits trending stock snapshots available"]
+        for start_index in range(0, len(top25_rows), 12):
+            end_index = min(start_index + 12, len(top25_rows))
+            part_label = f" ({start_index + 1}-{end_index})" if len(top25_rows) > 12 else ""
+            send_discord(
+                f"\U0001f4ca **{title}: Top 25 Stocks{part_label}**\n"
+                f"Volume, bullish trend, two-session price movement, and corporate news\n\n"
+                f"{chr(10).join(top25_rows[start_index:end_index])}",
+                color=DISCORD_COLOR_WARN,
+                webhook_url=DISCORD_WEBHOOK_MORNING_BRIEFING_URL or DISCORD_WEBHOOK_URL,
+            )
         _mark_briefing_sent(sent_key, today_str, now_ct)
         log(f"{title} sent to Discord.")
         return now_ct.date()
