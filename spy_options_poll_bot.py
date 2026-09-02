@@ -8166,6 +8166,11 @@ def run_symbol(client, symbol, prefetched_bars=None):
             log(f"[{symbol}] GainzAlgo confirmed {side}: {gainz_metrics.get('reason', '')}")
         else:
             side = "NO TRADE"
+            log(
+                f"[{symbol}] GainzAlgo: no confirmed signal — {gainz_metrics.get('reason', '')} "
+                f"trend_strength={gainz_metrics.get('gainz_trend_strength', 0.0):+.1f} "
+                f"volume_ok={gainz_metrics.get('gainz_volume_ok', False)}"
+            )
     if data:
         news_context = _get_symbol_news_context(symbol)
         data["latest_news"] = news_context.get("latest_news", "No recent Alpaca news")
