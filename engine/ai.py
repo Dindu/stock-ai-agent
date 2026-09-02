@@ -102,6 +102,13 @@ Return JSON only:
         return _analyze_ollama(symbol, prompt)
 
 
+def analyze_briefing(prompt):
+    """Generate one model-backed market briefing from an aggregate prompt."""
+    if GROQ_API_KEY:
+        return _analyze_groq_briefing(prompt)
+    return _analyze_ollama_briefing(prompt)
+
+
 
 
 def _analyze_groq(symbol, prompt):
@@ -161,4 +168,47 @@ def _analyze_ollama(symbol, prompt):
         return None
     except Exception as e:
         print(f"[AI] ERROR for {symbol}: {e}", flush=True)
+        return None
+
+
+def _analyze_groq_briefing(prompt):
+    print("[AI] Sending aggregate briefing to Groq...", flush=True)
+    try:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "llama-3.1-8b-instant",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+            },
+            timeout=45,
+        )
+        data = r.json()
+        if "choices" in data:
+            print("[AI] Got aggregate briefing response", flush=True)
+            return data["choices"][0]["message"].get("content")
+        print(f"[AI] Groq briefing ERROR: {data.get('error', data)}", flush=True)
+    except Exception as e:
+        print(f"[AI] Groq briefing ERROR: {e}", flush=True)
+    return None
+
+
+def _analyze_ollama_briefing(prompt):
+    print("[AI] Sending aggregate briefing to Ollama...", flush=True)
+    try:
+        r = requests.post(
+            OLLAMA_URL,
+            json={"model": "llama3.1", "prompt": prompt, "stream": False},
+            timeout=90,
+        )
+        result = r.json().get("response")
+        if result:
+            print("[AI] Got aggregate briefing response", flush=True)
+        return result
+    except Exception as e:
+        print(f"[AI] Ollama briefing ERROR: {e}", flush=True)
         return None

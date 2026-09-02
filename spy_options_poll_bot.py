@@ -31,6 +31,7 @@ import pandas as pd
 import pytz
 import requests
 from dotenv import load_dotenv
+from engine.ai import analyze_briefing
 
 from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
 from alpaca.data.live import StockDataStream
@@ -5955,6 +5956,40 @@ def _fetch_briefing_top25(client, symbols, articles):
     return sorted(rows, key=lambda row: row["rank_score"], reverse=True)[:25]
 
 
+def _generate_briefing_ai(top25, now_ct):
+    """Ask the configured LLM to interpret the ranked market snapshot."""
+    if not top25:
+        return "AI analysis unavailable: no Stocktwits trending stock data was collected."
+    rows = "\n".join(
+        f"{row['symbol']} | today={row['today_pct']:+.2f}% | yesterday={row['yesterday_pct']:+.2f}% | "
+        f"relative_volume={row['volume_ratio']:.1f}x | news_impact={row['impact_label']} | "
+        f"headline={row['headline'] or 'none'}"
+        for row in top25
+    )
+    prompt = f"""You are a disciplined market-news analyst. Analyze this {now_ct:%Y-%m-%d %H:%M} CT snapshot.
+The data comes from Stocktwits trending symbols, Alpaca daily bars, and Alpaca news. Do not invent facts,
+prices, catalysts, or events. Treat a missing headline as no confirmed catalyst.
+
+Return concise Markdown with exactly these sections:
+1. **Top Conviction**: 5 tickers and one sentence each explaining the combination of bullish movement,
+   relative volume, and confirmed catalyst.
+2. **Corporate Catalysts**: identify any confirmed FDA approval, acquisition/merger, regulatory initiative,
+   earnings/guidance, contract, or other material event; label unconfirmed items clearly.
+3. **Risks and Watchlist**: 5 tickers or themes that need caution, including extended moves, weak volume,
+   contradictory price action, or no confirmed news.
+4. **Trading Takeaway**: a short paragraph explaining what deserves further bot validation, not a trade command.
+
+Snapshot:
+{rows}
+"""
+    try:
+        result = analyze_briefing(prompt)
+        return str(result).strip() if result else "AI analysis unavailable: configured model returned no response."
+    except Exception as exc:
+        log(f"[BRIEFING] AI analysis failed: {type(exc).__name__}: {exc}")
+        return "AI analysis unavailable: model request failed."
+
+
 def _categorize_market_headlines(articles, now_ct):
     """Split headlines into FED/FOMC, earnings, geopolitics, and broad market buckets."""
     fed_keys = (
@@ -6119,6 +6154,7 @@ def _maybe_send_scheduled_briefing(client, now_ct, title, target_hour, target_mi
         )
         articles = _extract_news_articles(payload)
         top25 = _fetch_briefing_top25(client, briefing_trending_symbols, articles)
+        ai_analysis = _generate_briefing_ai(top25, now_ct)
         fed_news, earnings_news, geopolitics_news, market_news = _categorize_market_headlines(articles, now_ct)
 
         n = max(1, MORNING_BRIEFING_HEADLINES_PER_SECTION)
@@ -6154,6 +6190,11 @@ def _maybe_send_scheduled_briefing(client, now_ct, title, target_hour, target_mi
             f"**Other Market Drivers**\n"
             f"{market_block}\n\n"
             f"\U0001f4cc **Note:** headline scan is news-based; always verify exact event times on your economic/earnings calendar.",
+            color=DISCORD_COLOR_WARN,
+            webhook_url=DISCORD_WEBHOOK_MORNING_BRIEFING_URL or DISCORD_WEBHOOK_URL,
+        )
+        send_discord(
+            f"\U0001f9e0 **{title}: AI Market Analysis**\n\n{_trim_text(ai_analysis, max_len=3900)}",
             color=DISCORD_COLOR_WARN,
             webhook_url=DISCORD_WEBHOOK_MORNING_BRIEFING_URL or DISCORD_WEBHOOK_URL,
         )
