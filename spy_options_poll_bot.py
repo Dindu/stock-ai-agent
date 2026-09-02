@@ -623,6 +623,7 @@ _perf_stats: "dict" = {
     "hydrated_for": None,
     "hydrated_source": "",
     "last_hydrate_attempt": None,
+    "entry_blocks": {},
 }
 # Last date for which morning briefing was already sent.
 _morning_briefing_sent_date: "date | None" = None
@@ -4531,10 +4532,16 @@ def _entry_timing_v1_evaluate(symbol, side, data):
             return True, "ENTRY_WINDOW", "confirmed setup remains inside the V1 entry window"
         current = {"state": "MISSED"}
 
+    if current.get("state") == "RECLAIM":
+        age_minutes = (now - current.get("updated_at", now)).total_seconds() / 60.0
+        if age_minutes > ENTRY_TIMING_V1_ENTRY_WINDOW_MINUTES:
+            current = {"state": "MISSED"}
+
     if not trigger:
         state_name = "SETUP_FORMING" if current.get("state") not in {"RECLAIM", "MISSED"} else current["state"]
         _entry_timing_v1_state[key] = {"state": state_name, "updated_at": now, "bar": bar_time}
-        return False, state_name, "waiting for a completed 1m trigger"
+        reason = "prior V1 confirmation expired; waiting for a fresh setup" if state_name == "MISSED" else "waiting for a completed 1m trigger"
+        return False, state_name, reason
 
     if current.get("state") == "RECLAIM" and current.get("bar") and current.get("bar") != bar_time:
         _entry_timing_v1_state[key] = {
@@ -5469,6 +5476,15 @@ def _reset_perf_stats_if_new_day(now_ct=None):
     _perf_stats["hydrated_for"] = None
     _perf_stats["hydrated_source"] = ""
     _perf_stats["last_hydrate_attempt"] = None
+    _perf_stats["entry_blocks"] = {}
+
+
+def _record_entry_block(category):
+    """Count a normalized entry-block reason for daily performance reporting."""
+    _reset_perf_stats_if_new_day()
+    blocks = _perf_stats.setdefault("entry_blocks", {})
+    key = str(category or "other").strip().lower() or "other"
+    blocks[key] = int(blocks.get(key, 0)) + 1
 
 
 def _blank_perf_snapshot(today):
@@ -5798,6 +5814,12 @@ def maybe_send_hourly_perf_report(now_ct=None):
         pf_text = "INF"
     elif gross_loss_dollar > 0:
         pf_text = f"{profit_factor:.2f}"
+    entry_blocks = _perf_stats.get("entry_blocks", {}) or {}
+    block_summary = ", ".join(
+        f"{key}={int(value)}"
+        for key, value in sorted(entry_blocks.items(), key=lambda item: (-int(item[1]), item[0]))
+        if int(value) > 0
+    ) or "none"
 
     color = DISCORD_COLOR_WARN
     if realized_pnl_dollar > 0:
@@ -5818,6 +5840,7 @@ def maybe_send_hourly_perf_report(now_ct=None):
         f"**Profit Factor:** `{pf_text}`\n"
         f"**Avg Win / Loss (%):** `{avg_win_pct:+.2f}%` / `{avg_loss_pct:+.2f}%`\n"
         f"**Best / Worst Trade ($):** `{best_win_symbol or '-'} {best_win_dollar:+,.2f}` / `{worst_loss_symbol or '-'} {worst_loss_dollar:+,.2f}`\n"
+        f"**Entry Blockers:** `{block_summary}`\n"
         f"**Since Last Report:** Entries `{delta_entries:+d}` | Closed `{delta_closed:+d}` | "
         f"W/L `{delta_wins:+d}/{delta_losses:+d}` | WinRate `{delta_win_rate:.1f}%` | "
         f"P&L `{delta_realized_pnl:+,.2f}`",
@@ -7686,6 +7709,7 @@ def try_open_paper_trade(symbol, side, option, data):
     direction_capacity_ok, direction_capacity_reason = same_direction_position_capacity_ok(symbol, side)
     if not direction_capacity_ok:
         log(f"[{symbol}] Correlated-entry guard: {direction_capacity_reason} — skipping.")
+        _record_entry_block("exposure_cap")
         return False
     if _trading_client is None:
         return False
@@ -7695,6 +7719,7 @@ def try_open_paper_trade(symbol, side, option, data):
     refresh_ok, refresh_reason = _refresh_option_quote_before_execution(symbol, option)
     if not refresh_ok:
         log(f"[{symbol}] Execution-time quote refresh failed for {option.get('contract', '')}: {refresh_reason} — skipping entry.")
+        _record_entry_block("quote_refresh")
         return False
     log(f"[{symbol}] Execution-time quote refresh: {refresh_reason}")
 
@@ -8256,6 +8281,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
             if cooldown_until and now_ct < cooldown_until:
                 mins_left = max(1, int((cooldown_until - now_ct).total_seconds() // 60))
                 log(f"[{symbol}] Already alerted {side} today (cooldown active, {mins_left}m left) — suppressed.")
+                _record_entry_block("cooldown")
                 return
             if cooldown_until and now_ct >= cooldown_until:
                 _alerted_today["keys"].discard(alert_key)
@@ -8273,6 +8299,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 _alert_cooldowns.pop(alert_key, None)
             else:
                 log(f"[{symbol}] Already alerted {side} today ({live_detail}) — suppressed.")
+                _record_entry_block("existing_position")
                 return
 
     # Trend-ignition filter: only fire when the move is *just starting*, not mid- or late-trend.
@@ -8538,6 +8565,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 data["entry_timing_v1_reason"] = timing_reason
                 log(f"[{symbol}] Entry Timing V1: {side} {timing_state} — {timing_reason}")
                 if not timing_ok:
+                    _record_entry_block("v1_wait")
                     return
         except Exception as e:
             data["one_minute_trigger"] = ""
@@ -8578,11 +8606,13 @@ def run_symbol(client, symbol, prefetched_bars=None):
             reason_text = str(playbook_reason or "")
             tag = "WAIT" if reason_text.startswith("ARMED_BREAKOUT_") else "BLOCKED"
             log(f"[{symbol}] Playbook gate: {side} {tag} — {playbook_reason}.")
+            _record_entry_block("playbook_wait" if tag == "WAIT" else "playbook_block")
             return
         data["entry_playbook"] = playbook
         data["setup_type"] = playbook
         if playbook == "BREAKOUT" and side == "PUT" and not BREAKOUT_PUT_ENTRIES_ENABLED:
             log(f"[{symbol}] Playbook gate: BREAKOUT PUT blocked by BREAKOUT_PUT_ENTRIES_ENABLED=0.")
+            _record_entry_block("breakout_put_disabled")
             return
         log(f"[{symbol}] Playbook gate: {playbook} {side} passed — {playbook_reason}.")
 
