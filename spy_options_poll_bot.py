@@ -32,6 +32,7 @@ import pytz
 import requests
 from dotenv import load_dotenv
 from engine.ai import analyze_briefing
+from engine.gainz_algo import evaluate as evaluate_gainz_algo
 
 from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
 from alpaca.data.live import StockDataStream
@@ -93,7 +94,7 @@ DEFAULT_SYMBOLS = "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,TSLA,AMD,PLTR,GOOGL,AVGO,ADBE
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
 ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")
 ALPACA_TRADING_BASE_URL = os.getenv("ALPACA_TRADING_BASE_URL", "https://paper-api.alpaca.markets")
-ENABLE_TRENDING_STOCKS = os.getenv("ENABLE_TRENDING_STOCKS", "10") == "1"
+ENABLE_TRENDING_STOCKS = os.getenv("ENABLE_TRENDING_STOCKS", "1") == "1"
 TRENDING_STOCK_COUNT = int(os.getenv("TRENDING_STOCK_COUNT", "10"))
 TRENDING_REFRESH_SECONDS = int(os.getenv("TRENDING_REFRESH_SECONDS", "1800"))
 TRENDING_NEWS_HEADLINES = int(os.getenv("TRENDING_NEWS_HEADLINES", "2"))
@@ -307,6 +308,9 @@ ENABLE_STATE_TRANSITION_ALERTS = os.getenv("ENABLE_STATE_TRANSITION_ALERTS", "0"
 TRANSITION_ALERT_MIN_TIER = os.getenv("TRANSITION_ALERT_MIN_TIER", "SIGNAL").strip().upper()
 TRANSITION_ALERT_COOLDOWN_SECONDS = int(os.getenv("TRANSITION_ALERT_COOLDOWN_SECONDS", "90"))
 ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
+GAINZ_ALGO_ENTRY_ENABLED = os.getenv("GAINZ_ALGO_ENTRY_ENABLED", "1") == "1"
+GAINZ_ALGO_PIVOT_LENGTH = int(os.getenv("GAINZ_ALGO_PIVOT_LENGTH", "5"))
+GAINZ_ALGO_MOMENTUM_THRESHOLD_PCT = float(os.getenv("GAINZ_ALGO_MOMENTUM_THRESHOLD_PCT", "0.01"))
 
 # Paper-trading execution. When ENABLE_ALPACA_PAPER_TRADING=1 the bot will
 # submit a paper-account market BUY when a STRONG signal fires, then poll the
@@ -2093,7 +2097,7 @@ def classify_entry_confluence(symbol, side, data, option):
 
     # STRUCTURE — mandatory: must be a named, valid playbook.
     playbook = str(data.get("entry_playbook", "") or "")
-    points["structure"] = 2.0 if playbook in {"BREAKOUT", "PULLBACK_CONTINUATION", "BREAKOUT_CONTINUATION"} else 0.0
+    points["structure"] = 2.0 if playbook in {"BREAKOUT", "PULLBACK_CONTINUATION", "BREAKOUT_CONTINUATION", "GAINZ_ALGO"} else 0.0
 
     # TIMING — 1m sniper trigger quality.
     trigger = str(data.get("one_minute_trigger", "") or "").upper()
@@ -2182,7 +2186,7 @@ def _v2_pre_contract_scores(symbol, side, data):
     location_score = 0.55 * extension_score + 0.45 * room_score
 
     playbook = str(data.get("entry_playbook", "") or "").upper()
-    if playbook in {"PULLBACK_CONTINUATION", "BREAKOUT_CONTINUATION", "BREAKOUT"}:
+    if playbook in {"PULLBACK_CONTINUATION", "BREAKOUT_CONTINUATION", "BREAKOUT", "GAINZ_ALGO"}:
         setup_score = 100.0
     elif playbook:
         setup_score = 55.0
@@ -2190,7 +2194,9 @@ def _v2_pre_contract_scores(symbol, side, data):
         setup_score = 0.0
 
     trigger = str(data.get("one_minute_trigger", "") or "").upper()
-    if trigger == "BREAKOUT_RETEST":
+    if trigger == "GAINZ_ALGO_CONFIRMED":
+        trigger_score = 85.0
+    elif trigger == "BREAKOUT_RETEST":
         trigger_score = 100.0
     elif trigger == "FIRST_PULLBACK":
         trigger_score = 85.0
@@ -8138,6 +8144,28 @@ def run_symbol(client, symbol, prefetched_bars=None):
     max_ext_from_vwap = float(profile["max_ext_from_vwap"])
 
     side, data = analyze(bars, client, symbol)
+    if GAINZ_ALGO_ENTRY_ENABLED:
+        gainz_bars = fetch_1m_bars(client, symbol)
+        gainz_side, gainz_metrics = evaluate_gainz_algo(
+            gainz_bars,
+            bars,
+            pivot_length=GAINZ_ALGO_PIVOT_LENGTH,
+            momentum_threshold_base=GAINZ_ALGO_MOMENTUM_THRESHOLD_PCT,
+            support_level=(data or {}).get("support_level", {}).get("level") if isinstance((data or {}).get("support_level"), dict) else None,
+            resistance_level=(data or {}).get("resistance_level", {}).get("level") if isinstance((data or {}).get("resistance_level"), dict) else None,
+        )
+        data = dict(data or {})
+        data.update(gainz_metrics)
+        data["one_minute_trigger"] = "GAINZ_ALGO_CONFIRMED" if gainz_side else ""
+        data["one_minute_entry_confirmed"] = bool(gainz_side)
+        if gainz_side:
+            side = gainz_side
+            data["signal"] = f"GAINZ ALGO {side}"
+            data["entry_playbook"] = "GAINZ_ALGO"
+            data["setup_type"] = "GAINZ_ALGO"
+            log(f"[{symbol}] GainzAlgo confirmed {side}: {gainz_metrics.get('reason', '')}")
+        else:
+            side = "NO TRADE"
     if data:
         news_context = _get_symbol_news_context(symbol)
         data["latest_news"] = news_context.get("latest_news", "No recent Alpaca news")
@@ -8548,7 +8576,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     data["effective_score"] = effective_score
 
     # Real lower-timeframe timing: only after the 5m setup passes the hard score gate.
-    if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and ONE_MINUTE_ENTRY_ENABLED:
+    if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and ONE_MINUTE_ENTRY_ENABLED and not GAINZ_ALGO_ENTRY_ENABLED:
         try:
             bars_1m = fetch_1m_bars(client, symbol)
             trigger, trigger_reason = one_minute_entry_timing(symbol, side, bars_1m, data)
@@ -8571,11 +8599,11 @@ def run_symbol(client, symbol, prefetched_bars=None):
             data["one_minute_trigger"] = ""
             data["one_minute_entry_confirmed"] = False
             log(f"[{symbol}] 1m sniper evaluation failed: {type(e).__name__}: {e}")
-    else:
+    elif not GAINZ_ALGO_ENTRY_ENABLED:
         data["one_minute_trigger"] = "DISABLED" if not ONE_MINUTE_ENTRY_ENABLED else ""
         data["one_minute_entry_confirmed"] = not ONE_MINUTE_ENTRY_ENABLED
 
-    if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE:
+    if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and not GAINZ_ALGO_ENTRY_ENABLED:
         playbook_ok, playbook, playbook_reason = playbook_entry_ok(side, data, symbol)
         if not playbook_ok:
             if (
@@ -8709,7 +8737,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
         log(f"[{symbol}] Entry quality checklist blocked {side} — {entry_reason}.")
         return
 
-    if V2_ENTRY_QUALITY_ENABLED and not NO_GATING_MODE:
+    if V2_ENTRY_QUALITY_ENABLED and not NO_GATING_MODE and not GAINZ_ALGO_ENTRY_ENABLED:
         quality_ok, quality_score, quality_detail = unified_entry_quality_v2(symbol, side, data, option)
         data["entry_quality_v2_score"] = quality_score
         legacy_ok, legacy_detail = _legacy_shadow_verdict(symbol, side, data, option)
@@ -8721,7 +8749,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
             log(f"[{symbol}] Entry quality V2 gate: {side} blocked — {quality_detail}.")
             return
         log(f"[{symbol}] Entry quality V2: {side} CONFIRMED — {quality_score:.1f}/100 ({quality_detail}).")
-    elif ENTRY_CONFLUENCE_ENABLED and not NO_GATING_MODE:
+    elif ENTRY_CONFLUENCE_ENABLED and not NO_GATING_MODE and not GAINZ_ALGO_ENTRY_ENABLED:
         confluence_ok, confluence_points, confluence_detail = classify_entry_confluence(symbol, side, data, option)
         data["entry_confluence_points"] = confluence_points
         if not confluence_ok:
@@ -8731,6 +8759,10 @@ def run_symbol(client, symbol, prefetched_bars=None):
             log(f"[{symbol}] Entry confluence gate: {side} blocked — {confluence_detail}.")
             return
         log(f"[{symbol}] Entry confluence: {side} CONFIRMED — {confluence_points:.1f}/12 ({confluence_detail}).")
+    elif GAINZ_ALGO_ENTRY_ENABLED and not NO_GATING_MODE:
+        data["entry_quality_v2_score"] = None
+        data["entry_confluence_points"] = None
+        log(f"[{symbol}] GainzAlgo authoritative — duplicate V2/confluence strategy gates bypassed; execution safety gates remain active.")
 
     if TWO_PLAYBOOK_ENTRY_MODE:
         return {
