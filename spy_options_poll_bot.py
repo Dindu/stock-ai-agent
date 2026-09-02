@@ -500,6 +500,8 @@ ONE_MINUTE_MAX_TRIGGER_AGE_BARS = int(os.getenv("ONE_MINUTE_MAX_TRIGGER_AGE_BARS
 ONE_MINUTE_RECLAIM_WINDOW_BARS = int(os.getenv("ONE_MINUTE_RECLAIM_WINDOW_BARS", "3"))
 ONE_MINUTE_REQUIRE_CLOSED_BAR = os.getenv("ONE_MINUTE_REQUIRE_CLOSED_BAR", "1") == "1"
 ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD = os.getenv("ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD", "1") == "1"
+ENTRY_TIMING_V1_ENABLED = os.getenv("ENTRY_TIMING_V1_ENABLED", "0") == "1"
+ENTRY_TIMING_V1_ENTRY_WINDOW_MINUTES = int(os.getenv("ENTRY_TIMING_V1_ENTRY_WINDOW_MINUTES", "3"))
 SNIPER_WATCH_ALERT_COOLDOWN_MINUTES = int(os.getenv("SNIPER_WATCH_ALERT_COOLDOWN_MINUTES", "30"))
 
 # Stricter confirmation for recovery-style CALL entries to reduce weak bounce losses.
@@ -550,6 +552,8 @@ _option_client: "OptionHistoricalDataClient | None" = None
 _alert_cooldowns: "dict[tuple, datetime]" = {}
 # (symbol, side) -> datetime after which another near-entry sniper watch alert is allowed.
 _sniper_watch_cooldowns: "dict[tuple, datetime]" = {}
+# Persistent V1 timing state keyed by symbol and side.
+_entry_timing_v1_state: "dict[tuple, dict]" = {}
 # (symbol, side) -> reference state from the most recent losing trade, used to require
 # a genuinely fresh setup (not the same chop) before re-entering the same side same day.
 _post_loss_setup: "dict[tuple, dict]" = {}
@@ -4507,6 +4511,43 @@ def fetch_1m_bars(client, symbol):
     return bars.tail(ONE_MINUTE_LOOKBACK_BARS)
 
 
+def _entry_timing_v1_evaluate(symbol, side, data):
+    key = (str(symbol or "").upper(), str(side or "").upper())
+    now = datetime.now(central)
+    current = _entry_timing_v1_state.get(key, {})
+    trigger = str((data or {}).get("one_minute_trigger", "") or "").upper()
+    bar_time = str((data or {}).get("one_minute_bar_time", "") or "")
+    extension = abs(_safe_float_num((data or {}).get("vwap_extension_pct", 0.0), 0.0))
+
+    if extension > PLAYBOOK_VWAP_EXTENDED_MAX:
+        state = {"state": "EXTENDED_CHASED", "updated_at": now, "bar": bar_time}
+        _entry_timing_v1_state[key] = state
+        return False, state["state"], "extension exceeds the very-extended safety limit"
+
+    if current.get("state") == "ENTRY_WINDOW":
+        age_minutes = (now - current.get("window_started", now)).total_seconds() / 60.0
+        if age_minutes <= ENTRY_TIMING_V1_ENTRY_WINDOW_MINUTES:
+            return True, "ENTRY_WINDOW", "confirmed setup remains inside the V1 entry window"
+        current = {"state": "MISSED"}
+
+    if not trigger:
+        state_name = "SETUP_FORMING" if current.get("state") not in {"RECLAIM", "MISSED"} else current["state"]
+        _entry_timing_v1_state[key] = {"state": state_name, "updated_at": now, "bar": bar_time}
+        return False, state_name, "waiting for a completed 1m trigger"
+
+    if current.get("state") == "RECLAIM" and current.get("bar") and current.get("bar") != bar_time:
+        _entry_timing_v1_state[key] = {
+            "state": "ENTRY_WINDOW",
+            "updated_at": now,
+            "window_started": now,
+            "bar": bar_time,
+        }
+        return True, "ENTRY_WINDOW", "distinct completed 1m confirmation accepted"
+
+    _entry_timing_v1_state[key] = {"state": "RECLAIM", "updated_at": now, "bar": bar_time}
+    return False, "RECLAIM", "first completed 1m trigger accepted; waiting for a distinct confirmation"
+
+
 def one_minute_entry_timing(symbol, side, bars_1m, five_min_data):
     """Return a concrete 1m trigger for a qualified 5m directional setup.
 
@@ -5356,9 +5397,11 @@ def _fetch_stocktwits_trending_symbols():
 
 
 def get_trending_symbols(client, base_symbols):
-    """Get trending stock symbols from Alpaca screener, with Alpaca-bars fallback.
+    """Return the Stocktwits trending universe for the normal scanner.
 
-    Returns (symbols, reasons) where reasons explains why each symbol is trending.
+    Stocktwits selects the symbols; the regular bot pipeline decides whether any
+    symbol produces a trade. No asset, bar, price, volume, or source blending
+    filter is applied here.
     """
     if not ENABLE_TRENDING_STOCKS or TRENDING_STOCK_COUNT <= 0:
         return [], {}
@@ -5368,121 +5411,20 @@ def get_trending_symbols(client, base_symbols):
     if updated_at and (now - updated_at).total_seconds() < max(30, TRENDING_REFRESH_SECONDS):
         return list(_trending_cache.get("symbols", [])), dict(_trending_cache.get("reasons", {}))
 
-    base_set = {s.upper() for s in base_symbols}
-
-    ranked = {}
-    screener_sources = [
-        ("/v1beta1/screener/stocks/movers", {"top": max(10, TRENDING_STOCK_COUNT * 4)}),
-        ("/v1beta1/screener/stocks/most-actives", {"top": max(10, TRENDING_STOCK_COUNT * 4)}),
-    ]
-
-    for path, params in screener_sources:
-        payload = _alpaca_data_get_json(path, params=params, timeout=8)
-        items = _extract_screener_items(payload)
-        if payload is None:
-            log(f"[TRENDING] Alpaca screener {path} returned no payload (request failed or non-200).")
-        elif not items:
-            log(f"[TRENDING] Alpaca screener {path} returned 0 usable items (payload keys: {list(payload.keys()) if isinstance(payload, dict) else type(payload)}).")
-        else:
-            log(f"[TRENDING] Alpaca screener {path} returned {len(items)} raw item(s).")
-        for idx, item in enumerate(items):
-            sym = str(item.get("symbol") or item.get("ticker") or "").upper().strip()
-            if not sym or sym in ETF_SYMBOLS or sym in base_set:
-                continue
-            if not _is_valid_trending_symbol(sym):
-                continue
-            if not _is_stock_like_trending_candidate(sym):
-                continue
-
-            # Validate real-time tradability characteristics via recent bars.
-            try:
-                bars = fetch_bars(client, sym)
-                if len(bars) < TRENDING_MIN_BAR_COUNT:
-                    continue
-                last_close = float(bars["close"].iloc[-1])
-                last_volume = int(float(bars["volume"].iloc[-1]))
-                if last_close < TRENDING_MIN_PRICE or last_volume < TRENDING_MIN_LAST_VOLUME:
-                    continue
-            except Exception:
-                continue
-
-            pct = _safe_float_num(
-                item.get("percent_change", item.get("change_percent", item.get("change", 0.0))),
-                0.0,
-            )
-            vol = _safe_float_num(item.get("volume", 0.0), 0.0)
-            rank_bonus = max(0.0, 40.0 - (idx * 2.0))
-            score = (abs(pct) * 6.0) + min(vol / 1_000_000.0, 20.0) + rank_bonus
-            reason = f"screener pct={pct:+.2f}% vol={int(vol)}"
-
-            prev = ranked.get(sym)
-            if (prev is None) or (score > prev[0]):
-                ranked[sym] = (score, reason)
-
-    # Blend in social momentum from Stocktwits trending feed.
     stocktwits_syms = _fetch_stocktwits_trending_symbols()
-    for idx, sym in enumerate(stocktwits_syms):
-        if not sym or sym in ETF_SYMBOLS or sym in base_set:
-            continue
-        if not _is_valid_trending_symbol(sym):
-            continue
-        if not _is_stock_like_trending_candidate(sym):
-            continue
-
-        try:
-            bars = fetch_bars(client, sym)
-            if len(bars) < TRENDING_MIN_BAR_COUNT:
-                continue
-            last_close = float(bars["close"].iloc[-1])
-            last_volume = int(float(bars["volume"].iloc[-1]))
-            if last_close < TRENDING_MIN_PRICE or last_volume < TRENDING_MIN_LAST_VOLUME:
-                continue
-        except Exception:
-            continue
-
-        rank_bonus = max(0.0, 26.0 - (idx * 1.5))
-        score = 30.0 + rank_bonus
-        reason = "stocktwits trending"
-
-        prev = ranked.get(sym)
-        if (prev is None) or (score > prev[0]):
-            ranked[sym] = (score, reason)
-
-    # Fallback: derive trend candidates from Alpaca bars for top liquid stocks.
-    if not ranked:
-        for sym in sorted(TOP_STOCK_SYMBOLS):
-            if sym in ETF_SYMBOLS or sym in base_set:
-                continue
-            try:
-                bars = fetch_bars(client, sym)
-                if len(bars) < 25:
-                    continue
-                c0 = float(bars["close"].iloc[-1])
-                c5 = float(bars["close"].iloc[-6]) if len(bars) >= 6 else c0
-                v0 = float(bars["volume"].iloc[-1])
-                vavg = float(bars["volume"].tail(20).mean())
-                ret5 = ((c0 / c5) - 1.0) * 100.0 if c5 > 0 else 0.0
-                vr = (v0 / vavg) if vavg > 0 else 1.0
-                score = abs(ret5) * 5.0 + min(max(vr - 1.0, 0.0), 4.0) * 10.0
-                ranked[sym] = (score, f"bars 5m={ret5:+.2f}% volx={vr:.2f}")
-            except Exception:
-                continue
-
-    ordered = sorted(ranked.items(), key=lambda kv: kv[1][0], reverse=True)
-    selected = [sym for sym, _ in ordered[:TRENDING_STOCK_COUNT]]
+    selected = list(dict.fromkeys(stocktwits_syms))[:TRENDING_STOCK_COUNT]
 
     reasons = {}
     for sym in selected:
-        base_reason = ranked.get(sym, (0.0, ""))[1]
         news_reason = _fetch_trending_news_reason(sym)
-        reasons[sym] = f"{base_reason}; news: {news_reason}" if news_reason else base_reason
+        reasons[sym] = f"stocktwits trending; news: {news_reason}" if news_reason else "stocktwits trending"
 
     _trending_cache["updated_at"] = now
     _trending_cache["symbols"] = selected
     _trending_cache["reasons"] = reasons
 
     if selected:
-        log(f"Trending stocks from Alpaca/Stocktwits: {', '.join(selected)}")
+        log(f"Trending stocks from Stocktwits: {', '.join(selected)}")
         for sym in selected:
             why = reasons.get(sym, "")
             if why:
@@ -8447,10 +8389,18 @@ def run_symbol(client, symbol, prefetched_bars=None):
             trigger, trigger_reason = one_minute_entry_timing(symbol, side, bars_1m, data)
             data["one_minute_trigger"] = trigger or ""
             data["one_minute_entry_confirmed"] = bool(trigger)
+            data["one_minute_bar_time"] = str(bars_1m.index[-1]) if bars_1m is not None and len(bars_1m) else ""
             if trigger:
                 log(f"[{symbol}] 1m SNIPER PASS: {trigger} — {trigger_reason}")
             else:
                 log(f"[{symbol}] 1m SNIPER WAIT: {trigger_reason}")
+            if ENTRY_TIMING_V1_ENABLED:
+                timing_ok, timing_state, timing_reason = _entry_timing_v1_evaluate(symbol, side, data)
+                data["entry_timing_v1_state"] = timing_state
+                data["entry_timing_v1_reason"] = timing_reason
+                log(f"[{symbol}] Entry Timing V1: {side} {timing_state} — {timing_reason}")
+                if not timing_ok:
+                    return
         except Exception as e:
             data["one_minute_trigger"] = ""
             data["one_minute_entry_confirmed"] = False
