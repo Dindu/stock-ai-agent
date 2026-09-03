@@ -46,7 +46,7 @@ OBSERVER_DISCORD_WEBHOOK=<read-only-observer-webhook> python3 market_observer.py
 - `OBSERVER_DISCORD_WEBHOOK`: optional separate webhook; defaults to the existing `DISCORD_WEBHOOK`
 - `OBSERVER_OLLAMA_URL`: default `http://localhost:11434/api/generate`
 - `OBSERVER_OLLAMA_MODEL`: default `qwen2.5:7b`
-- `OBSERVER_GROQ_API_KEY`: optional cloud provider key
+- `OBSERVER_GROQ_API_KEY`: optional observer-specific cloud key; defaults to the existing `GROQ_API_KEY`
 - `OBSERVER_GROQ_MODEL`: default `llama-3.1-8b-instant`
 - `OBSERVER_INTERVAL_SECONDS`: report interval, default `600` (10 minutes)
 - `OBSERVER_NEWS_INTERVAL_SECONDS`: RSS refresh interval, default `900`
