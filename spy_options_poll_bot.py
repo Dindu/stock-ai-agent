@@ -308,6 +308,7 @@ ENABLE_STATE_TRANSITION_ALERTS = os.getenv("ENABLE_STATE_TRANSITION_ALERTS", "0"
 TRANSITION_ALERT_MIN_TIER = os.getenv("TRANSITION_ALERT_MIN_TIER", "SIGNAL").strip().upper()
 TRANSITION_ALERT_COOLDOWN_SECONDS = int(os.getenv("TRANSITION_ALERT_COOLDOWN_SECONDS", "90"))
 ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
+FORCE_MARKET_OPEN = os.getenv("FORCE_MARKET_OPEN", "0") == "1"
 GAINZ_ALGO_ENTRY_ENABLED = os.getenv("GAINZ_ALGO_ENTRY_ENABLED", "1") == "1"
 GAINZ_ALGO_PIVOT_LENGTH = int(os.getenv("GAINZ_ALGO_PIVOT_LENGTH", "5"))
 GAINZ_ALGO_MOMENTUM_THRESHOLD_PCT = float(os.getenv("GAINZ_ALGO_MOMENTUM_THRESHOLD_PCT", "0.01"))
@@ -490,6 +491,7 @@ ENTRY_ALLOWED_SETUPS = {
 # Real 1-minute sniper timing engine: 5m finds the setup, 1m times the entry.
 ONE_MINUTE_ENTRY_ENABLED = os.getenv("ONE_MINUTE_ENTRY_ENABLED", "1") == "1"
 ONE_MINUTE_LOOKBACK_BARS = int(os.getenv("ONE_MINUTE_LOOKBACK_BARS", "60"))
+ONE_MINUTE_HISTORY_HOURS = int(os.getenv("ONE_MINUTE_HISTORY_HOURS", "48"))
 ONE_MINUTE_EMA9_TOUCH_TOLERANCE = float(os.getenv("ONE_MINUTE_EMA9_TOUCH_TOLERANCE", "0.0015"))
 ONE_MINUTE_LEVEL_RETEST_TOLERANCE = float(os.getenv("ONE_MINUTE_LEVEL_RETEST_TOLERANCE", "0.0015"))
 ONE_MINUTE_MIN_VOLUME_RATIO = float(os.getenv("ONE_MINUTE_MIN_VOLUME_RATIO", "1.20"))
@@ -1364,6 +1366,8 @@ def maybe_send_trade_progress_alert(trade, current_price, pnl_pct):
 
 
 def market_open_now():
+    if FORCE_MARKET_OPEN:
+        return True
     now = datetime.now(central)
     if now.weekday() >= 5:
         return False
@@ -4493,7 +4497,7 @@ def fetch_1m_bars(client, symbol):
     lower-timeframe confirmation used to time the actual option entry.
     """
     end = datetime.now(timezone.utc)
-    start = end - timedelta(hours=4)
+    start = end - timedelta(hours=max(4, ONE_MINUTE_HISTORY_HOURS))
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=TimeFrame(1, TimeFrameUnit.Minute),
