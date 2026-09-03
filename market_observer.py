@@ -33,7 +33,15 @@ GROQ_API_KEY = (
     os.getenv("OBSERVER_GROQ_API_KEY", "").strip()
     or os.getenv("GROQ_API_KEY", "").strip()
 )
-GROQ_MODEL = os.getenv("OBSERVER_GROQ_MODEL", os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"))
+_configured_observer_model = (
+    os.getenv("OBSERVER_GROQ_MODEL", "").strip()
+    or os.getenv("GROQ_MODEL", "").strip()
+)
+GROQ_MODEL = (
+    "llama-3.3-70b-versatile"
+    if _configured_observer_model in {"", "llama-3.1-8b-instant"}
+    else _configured_observer_model
+)
 INTERVAL_SECONDS = max(60, int(os.getenv("OBSERVER_INTERVAL_SECONDS", "600")))
 NEWS_INTERVAL_SECONDS = max(300, int(os.getenv("OBSERVER_NEWS_INTERVAL_SECONDS", "900")))
 NEWS_FEEDS = [
