@@ -8188,6 +8188,20 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 f"trend_strength={gainz_metrics.get('gainz_trend_strength', 0.0):+.1f} "
                 f"volume_ok={gainz_metrics.get('gainz_volume_ok', False)}"
             )
+            if gainz_metrics.get("gainz_current_volume") is not None:
+                log(
+                    f"[{symbol}] Gainz volume diagnostics: "
+                    f"bar={gainz_metrics.get('gainz_current_volume', 0.0):.0f} "
+                    f"avg{gainz_metrics.get('gainz_volume_period', 0)}="
+                    f"{gainz_metrics.get('gainz_volume_average', 0.0):.0f} "
+                    f"ratio={gainz_metrics.get('gainz_volume_ratio', 0.0):.2f} "
+                    f"short5={gainz_metrics.get('gainz_short_volume_average', 0.0):.0f} "
+                    f"prev_short5={gainz_metrics.get('gainz_previous_short_volume_average', 0.0):.0f} "
+                    f"short_ratio={gainz_metrics.get('gainz_short_volume_ratio', 0.0):.2f} "
+                    f"above_avg={gainz_metrics.get('gainz_volume_above_average', False)} "
+                    f"short_rising={gainz_metrics.get('gainz_short_volume_rising', False)} "
+                    f"bar_ts={gainz_metrics.get('gainz_last_bar_timestamp', 'unknown')}"
+                )
     if data:
         news_context = _get_symbol_news_context(symbol)
         data["latest_news"] = news_context.get("latest_news", "No recent Alpaca news")

@@ -53,7 +53,13 @@ def evaluate(bars_1m, bars_5m=None, *, pivot_length=5, momentum_threshold_base=0
     trend_strength = trend_strength_raw / 7.0 * 100.0
     volume_average = frame["volume"].rolling(volume_period).mean().iloc[-1]
     short_volume = frame["volume"].rolling(5).mean()
-    volume_ok = float(frame["volume"].iloc[-1]) > float(volume_average) and short_volume.iloc[-1] > short_volume.iloc[-2]
+    current_volume = float(frame["volume"].iloc[-1])
+    volume_average = float(volume_average)
+    short_volume_current = float(short_volume.iloc[-1])
+    short_volume_previous = float(short_volume.iloc[-2])
+    volume_above_average = current_volume > volume_average
+    short_volume_rising = short_volume_current > short_volume_previous
+    volume_ok = volume_above_average and short_volume_rising
     highest = frame["high"].rolling(breakout_period).max().shift(1).iloc[-1]
     lowest = frame["low"].rolling(breakout_period).min().shift(1).iloc[-1]
     support = float(support_level or frame["low"].rolling(20).min().iloc[-1])
@@ -78,6 +84,16 @@ def evaluate(bars_1m, bars_5m=None, *, pivot_length=5, momentum_threshold_base=0
         "gainz_price_change_pct": price_change,
         "gainz_momentum_threshold_pct": momentum_threshold,
         "gainz_volume_ok": volume_ok,
+        "gainz_current_volume": current_volume,
+        "gainz_volume_period": volume_period,
+        "gainz_volume_average": volume_average,
+        "gainz_volume_ratio": current_volume / volume_average if volume_average > 0 else 0.0,
+        "gainz_short_volume_average": short_volume_current,
+        "gainz_previous_short_volume_average": short_volume_previous,
+        "gainz_short_volume_ratio": short_volume_current / short_volume_previous if short_volume_previous > 0 else 0.0,
+        "gainz_volume_above_average": volume_above_average,
+        "gainz_short_volume_rising": short_volume_rising,
+        "gainz_last_bar_timestamp": frame.index[-1].isoformat(),
         "gainz_support": support,
         "gainz_resistance": resistance,
         "gainz_support_distance_pct": support_distance * 100.0,
