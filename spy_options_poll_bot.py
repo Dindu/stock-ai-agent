@@ -312,6 +312,7 @@ FORCE_MARKET_OPEN = os.getenv("FORCE_MARKET_OPEN", "0") == "1"
 GAINZ_ALGO_ENTRY_ENABLED = os.getenv("GAINZ_ALGO_ENTRY_ENABLED", "1") == "1"
 GAINZ_ALGO_PIVOT_LENGTH = int(os.getenv("GAINZ_ALGO_PIVOT_LENGTH", "5"))
 GAINZ_ALGO_MOMENTUM_THRESHOLD_PCT = float(os.getenv("GAINZ_ALGO_MOMENTUM_THRESHOLD_PCT", "0.01"))
+GAINZ_ALGO_MIN_OPPOSING_LEVEL_ATR = float(os.getenv("GAINZ_ALGO_MIN_OPPOSING_LEVEL_ATR", "0.35"))
 
 # Paper-trading execution. When ENABLE_ALPACA_PAPER_TRADING=1 the bot will
 # submit a paper-account market BUY when a STRONG signal fires, then poll the
@@ -8162,6 +8163,18 @@ def run_symbol(client, symbol, prefetched_bars=None):
         data.update(gainz_metrics)
         data["one_minute_trigger"] = "GAINZ_ALGO_CONFIRMED" if gainz_side else ""
         data["one_minute_entry_confirmed"] = bool(gainz_side)
+        if gainz_side:
+            opposing_level = (data or {}).get("resistance_level") if gainz_side == "CALL" else (data or {}).get("support_level")
+            opposing_distance_atr = _safe_float_num((opposing_level or {}).get("distance_atr", 999.0), 999.0)
+            if opposing_distance_atr <= GAINZ_ALGO_MIN_OPPOSING_LEVEL_ATR:
+                log(
+                    f"[{symbol}] GainzAlgo {gainz_side} rejected by Danny location rule — "
+                    f"opposing level only {opposing_distance_atr:.2f} ATR away "
+                    f"(minimum {GAINZ_ALGO_MIN_OPPOSING_LEVEL_ATR:.2f} ATR)."
+                )
+                gainz_side = None
+                gainz_metrics["reason"] = "GainzAlgo signal rejected: too close to opposing level"
+                gainz_metrics["gainz_location_ok"] = False
         if gainz_side:
             side = gainz_side
             data["signal"] = f"GAINZ ALGO {side}"
