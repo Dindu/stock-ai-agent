@@ -313,6 +313,7 @@ ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
 FORCE_MARKET_OPEN = os.getenv("FORCE_MARKET_OPEN", "0") == "1"
 GAINZ_ALGO_ENTRY_ENABLED = os.getenv("GAINZ_ALGO_ENTRY_ENABLED", "1") == "1"
 GAINZ_ALGO_PRE_ORDER_REVALIDATION_ENABLED = os.getenv("GAINZ_ALGO_PRE_ORDER_REVALIDATION_ENABLED", "1") == "1"
+GAINZ_ALGO_MAX_BAR_AGE_SECONDS = float(os.getenv("GAINZ_ALGO_MAX_BAR_AGE_SECONDS", "180"))
 GAINZ_ALGO_PIVOT_LENGTH = int(os.getenv("GAINZ_ALGO_PIVOT_LENGTH", "5"))
 GAINZ_ALGO_MOMENTUM_THRESHOLD_PCT = float(os.getenv("GAINZ_ALGO_MOMENTUM_THRESHOLD_PCT", "0.01"))
 GAINZ_ALGO_MIN_OPPOSING_LEVEL_ATR = float(os.getenv("GAINZ_ALGO_MIN_OPPOSING_LEVEL_ATR", "0.50"))
@@ -7695,6 +7696,24 @@ def try_open_paper_trade(symbol, side, option, data):
             )
             _record_entry_block("gainz_revalidation")
             return False
+        latest_bar_timestamp = latest_metrics.get("gainz_last_bar_timestamp")
+        try:
+            latest_bar_ts = pd.Timestamp(latest_bar_timestamp)
+            if latest_bar_ts.tzinfo is None:
+                latest_bar_ts = latest_bar_ts.tz_localize("UTC")
+            else:
+                latest_bar_ts = latest_bar_ts.tz_convert("UTC")
+            latest_bar_age_seconds = (datetime.now(timezone.utc) - latest_bar_ts.to_pydatetime()).total_seconds()
+        except Exception:
+            latest_bar_age_seconds = float("inf")
+        if latest_bar_age_seconds > max(1.0, GAINZ_ALGO_MAX_BAR_AGE_SECONDS):
+            log(
+                f"[{symbol}] Gainz pre-order revalidation failed — latest closed bar is "
+                f"{latest_bar_age_seconds:.0f}s old (maximum "
+                f"{GAINZ_ALGO_MAX_BAR_AGE_SECONDS:.0f}s)."
+            )
+            _record_entry_block("gainz_revalidation")
+            return False
         opposing_distance_atr = latest_metrics.get(
             "gainz_resistance_distance_atr" if side == "CALL" else "gainz_support_distance_atr",
             999.0,
@@ -7712,7 +7731,8 @@ def try_open_paper_trade(symbol, side, option, data):
             f"[{symbol}] Gainz pre-order revalidation passed — {side} "
             f"momentum={latest_metrics.get('gainz_price_change_pct', 0.0):+.2f}% "
             f"volume_ratio={latest_metrics.get('gainz_volume_ratio', 0.0):.2f} "
-            f"opposing={opposing_distance_atr:.2f} ATR."
+            f"opposing={opposing_distance_atr:.2f} ATR "
+            f"bar_age={latest_bar_age_seconds:.0f}s."
         )
 
     # The contract search result may be cached for up to OPTION_SEARCH_CACHE_TTL_SECONDS —
