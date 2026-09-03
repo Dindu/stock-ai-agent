@@ -275,7 +275,8 @@ ENTRY_CONT_MIN_DELTA_5M = int(os.getenv("ENTRY_CONT_MIN_DELTA_5M", "1"))
 ENTRY_CONT_MIN_EMA20_SLOPE_PCT = float(os.getenv("ENTRY_CONT_MIN_EMA20_SLOPE_PCT", "0.0001"))  # Relaxed from 0.00015 (was too tight)
 ENTRY_CONT_MIN_MOMENTUM_QUALITY = float(os.getenv("ENTRY_CONT_MIN_MOMENTUM_QUALITY", "8.0"))
 ENTRY_MAX_TREND_AGE_BARS = int(os.getenv("ENTRY_MAX_TREND_AGE_BARS", "4"))
-ENTRY_1DTE_MIN_DELTA = float(os.getenv("ENTRY_1DTE_MIN_DELTA", "0.40"))
+ENTRY_1DTE_MIN_DELTA = float(os.getenv("ENTRY_1DTE_MIN_DELTA", "0.45"))
+GAINZ_ALGO_BLOCK_LATE_CHASE = os.getenv("GAINZ_ALGO_BLOCK_LATE_CHASE", "1") == "1"
 # ML entry gate (optional): model reads current rule-engine features and returns win probability.
 ML_GATE_ENABLED = os.getenv("ML_GATE_ENABLED", "0") == "1"  # Disabled: enable only after 100+ trades
 ML_GATE_MODEL_PATH = os.getenv("ML_GATE_MODEL_PATH", "models/entry_model.json")
@@ -2449,6 +2450,7 @@ def _breakout_hold_confirmation(symbol, side, data):
     score = _safe_float_num((data or {}).get("bull_score" if call_side else "bear_score", 0.0), 0.0)
     opposite = _safe_float_num((data or {}).get("bear_score" if call_side else "bull_score", 0.0), 0.0)
     fresh_break = bool((data or {}).get("fresh_breakout", False)) if side == "CALL" else bool((data or {}).get("fresh_breakdown", False))
+
     pending = _breakout_hold_pending.get(key)
 
     if pending:
@@ -4761,6 +4763,13 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
         0,
     )
     fresh_break = bool((data or {}).get("fresh_breakout", False)) if side == "CALL" else bool((data or {}).get("fresh_breakdown", False))
+
+    if (
+        GAINZ_ALGO_BLOCK_LATE_CHASE
+        and str((data or {}).get("entry_playbook", "") or "").upper() == "GAINZ_ALGO"
+        and entry_timing == "LATE_CHASE"
+    ):
+        return False, "Gainz late-chase timing"
 
     if not TWO_PLAYBOOK_ENTRY_MODE and ENTRY_ALLOWED_SETUPS and entry_timing not in ENTRY_ALLOWED_SETUPS:
         if not (RECALL_FIRST_MODE and effective_score >= 82 and delta_5m is not None and delta_5m >= 0):
