@@ -8125,6 +8125,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
             log(f"[{symbol}] GainzAlgo confirmed {side}: {gainz_metrics.get('reason', '')}")
         else:
             side = "NO TRADE"
+            data["signal"] = "NO TRADE"
             log(
                 f"[{symbol}] GainzAlgo: no confirmed signal — {gainz_metrics.get('reason', '')} "
                 f"trend_strength={gainz_metrics.get('gainz_trend_strength', 0.0):+.1f} "
@@ -8139,7 +8140,8 @@ def run_symbol(client, symbol, prefetched_bars=None):
                     f"trend1={gainz_metrics.get('gainz_trends', {}).get('1m', 0):+d} "
                     f"breakout={gainz_metrics.get('gainz_buy_breakout', False)} "
                     f"breakdown={gainz_metrics.get('gainz_sell_breakdown', False)} "
-                    f"location={gainz_metrics.get('gainz_location_ok', False)} "
+                    f"loc_call={gainz_metrics.get('gainz_buy_location_ok', False)} "
+                    f"loc_put={gainz_metrics.get('gainz_sell_location_ok', False)} "
                     f"bar={gainz_metrics.get('gainz_current_volume', 0.0):.0f} "
                     f"avg{gainz_metrics.get('gainz_volume_period', 0)}="
                     f"{gainz_metrics.get('gainz_volume_average', 0.0):.0f} "
@@ -8160,7 +8162,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
 
         if GAINZ_ALGO_ENTRY_ENABLED:
             log(
-                f"[{symbol}] {data['price']:.2f} | Gainz {data['signal']} | "
+                f"[{symbol}] {data['price']:.2f} | Gainz {side} | "
                 f"trend={data.get('gainz_trend_strength', 0.0):+.1f} "
                 f"volume={data.get('gainz_volume_ok', False)}"
             )

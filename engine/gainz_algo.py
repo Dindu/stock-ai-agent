@@ -104,6 +104,8 @@ def evaluate(bars_1m, bars_5m=None, *, pivot_length=5, momentum_threshold_base=0
         "gainz_sell_trend_ok": sell_trend_ok,
         "gainz_buy_breakout": buy_breakout,
         "gainz_sell_breakdown": sell_breakdown,
+        "gainz_buy_location_ok": buy_location_ok,
+        "gainz_sell_location_ok": sell_location_ok,
         "gainz_bullish_candle": bullish,
         "gainz_bearish_candle": bearish,
         "gainz_support": support,
