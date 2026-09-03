@@ -30,7 +30,7 @@ OBSERVER_ENABLED = os.getenv("OBSERVER_ENABLED", "1") == "1"
 OLLAMA_URL = os.getenv("OBSERVER_OLLAMA_URL", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OBSERVER_OLLAMA_MODEL", "qwen2.5:7b")
 GROQ_API_KEY = os.getenv("OBSERVER_GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("OBSERVER_GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL = os.getenv("OBSERVER_GROQ_MODEL", os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"))
 INTERVAL_SECONDS = max(60, int(os.getenv("OBSERVER_INTERVAL_SECONDS", "600")))
 NEWS_INTERVAL_SECONDS = max(300, int(os.getenv("OBSERVER_NEWS_INTERVAL_SECONDS", "900")))
 NEWS_FEEDS = [

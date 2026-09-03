@@ -2,7 +2,7 @@ import json
 import re
 import time
 import requests
-from config import OLLAMA_URL, GROQ_API_KEY
+from config import OLLAMA_URL, GROQ_API_KEY, GROQ_MODEL
 
 def analyze(stock, news, macro):
     """
@@ -123,7 +123,7 @@ def _analyze_groq(symbol, prompt):
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": "llama-3.1-8b-instant",
+                    "model": GROQ_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.2,
                     "response_format": {"type": "json_object"}
@@ -181,7 +181,7 @@ def _analyze_groq_briefing(prompt):
                 "Content-Type": "application/json",
             },
             json={
-                "model": "llama-3.1-8b-instant",
+                "model": GROQ_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.2,
             },
