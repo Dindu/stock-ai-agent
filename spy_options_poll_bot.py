@@ -78,20 +78,20 @@ else:
 ETF_SYMBOLS = {"SPY", "QQQ", "IWM"}
 TOP_STOCK_SYMBOLS = {
     "AAPL", "NVDA", "MSFT", "AMZN",
-    "TSLA", "AMD", "PLTR", "GOOGL",
-    "AVGO", "INTC", "SPCX",
+    "TSLA", "META", "PLTR", "GOOGL",
+    "NFLX", "INTC", "SPCX",
     "ADBE", "HOOD", "ORCL",
 }
-AGGRESSIVE_STOCK_SYMBOLS = {"TSLA", "AMD", "PLTR", "GOOGL"}
+AGGRESSIVE_STOCK_SYMBOLS = {"TSLA", "META", "PLTR", "GOOGL"}
 # Shadow-only liquidity tier classification (see _shadow_tier_liquidity_check) — logging only,
 # does not gate contract selection until validated against real fills/outcomes.
-MEGA_LIQUID_SYMBOLS = {"AAPL", "NVDA", "MSFT", "AMZN", "TSLA", "GOOGL", "AMD"}
+MEGA_LIQUID_SYMBOLS = {"AAPL", "NVDA", "MSFT", "AMZN", "TSLA", "GOOGL", "META", "NFLX"}
 TIER_LIQUIDITY_THRESHOLDS = {
     "ETF":          {"min_oi": 2000, "min_volume": 200, "max_spread_pct": 0.03},
     "MEGA_LIQUID":  {"min_oi": 500,  "min_volume": 50,  "max_spread_pct": 0.06},
     "STANDARD":     {"min_oi": 100,  "min_volume": 10,  "max_spread_pct": 0.10},
 }
-DEFAULT_SYMBOLS = "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,TSLA,AMD,PLTR,GOOGL,AVGO,ADBE,HOOD,ORCL"
+DEFAULT_SYMBOLS = "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,TSLA,META,PLTR,GOOGL,NFLX,ADBE,HOOD,ORCL"
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
 ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")
 ALPACA_TRADING_BASE_URL = os.getenv("ALPACA_TRADING_BASE_URL", "https://paper-api.alpaca.markets")
