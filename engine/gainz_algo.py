@@ -74,8 +74,12 @@ def evaluate(bars_1m, bars_5m=None, *, pivot_length=5, momentum_threshold_base=0
     sell_breakdown = price < lowest
     buy_location_ok = support_distance <= 0.0035 or (buy_breakout and room_to_resistance >= 0.0020)
     sell_location_ok = resistance_distance <= 0.0035 or (sell_breakdown and room_to_support >= 0.0020)
-    buy = price_change > momentum_threshold and trends["5m"] == 1 and trends["1m"] != -1 and volume_ok and buy_breakout and buy_location_ok
-    sell = price_change < -momentum_threshold and trends["5m"] == -1 and trends["1m"] != 1 and volume_ok and sell_breakdown and sell_location_ok
+    buy_momentum_ok = price_change > momentum_threshold
+    sell_momentum_ok = price_change < -momentum_threshold
+    buy_trend_ok = trends["5m"] == 1 and trends["1m"] != -1
+    sell_trend_ok = trends["5m"] == -1 and trends["1m"] != 1
+    buy = buy_momentum_ok and buy_trend_ok and volume_ok and buy_breakout and buy_location_ok
+    sell = sell_momentum_ok and sell_trend_ok and volume_ok and sell_breakdown and sell_location_ok
     if not (bullish or bearish):
         buy = sell = False
     return ("CALL" if buy else "PUT" if sell else None), {
@@ -94,6 +98,14 @@ def evaluate(bars_1m, bars_5m=None, *, pivot_length=5, momentum_threshold_base=0
         "gainz_volume_above_average": volume_above_average,
         "gainz_short_volume_rising": short_volume_rising,
         "gainz_last_bar_timestamp": frame.index[-1].isoformat(),
+        "gainz_buy_momentum_ok": buy_momentum_ok,
+        "gainz_sell_momentum_ok": sell_momentum_ok,
+        "gainz_buy_trend_ok": buy_trend_ok,
+        "gainz_sell_trend_ok": sell_trend_ok,
+        "gainz_buy_breakout": buy_breakout,
+        "gainz_sell_breakdown": sell_breakdown,
+        "gainz_bullish_candle": bullish,
+        "gainz_bearish_candle": bearish,
         "gainz_support": support,
         "gainz_resistance": resistance,
         "gainz_support_distance_pct": support_distance * 100.0,
