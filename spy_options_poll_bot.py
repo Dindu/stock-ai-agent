@@ -33,6 +33,7 @@ import requests
 from dotenv import load_dotenv
 from engine.ai import analyze_briefing
 from engine.gainz_algo import evaluate as evaluate_gainz_algo
+from market_observer import start_background_observer
 
 from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
 from alpaca.data.live import StockDataStream
@@ -8967,6 +8968,7 @@ def main():
         f"Options Alert Bot started. Symbols={','.join(SYMBOLS)} "
         f"Mode=websocket (tick-triggered). Feed={FEED}."
     )
+    start_background_observer(log)
     try:
         run_websocket_cycle(client)
     except Exception:
