@@ -48,7 +48,7 @@ NEWS_FEEDS = [
     feed.strip()
     for feed in os.getenv(
         "OBSERVER_NEWS_FEEDS",
-        "https://feeds.finance.yahoo.com/rss/2.0/headline?s=SPY%2CQQQ%2CNVDA%2CAAPL&region=US&lang=en-US",
+        "https://news.google.com/rss/search?q=stocks%20OR%20markets%20OR%20SPY%20OR%20QQQ%20OR%20NVDA%20OR%20AAPL&hl=en-US&gl=US&ceid=US%3Aen",
     ).split(",")
     if feed.strip()
 ]

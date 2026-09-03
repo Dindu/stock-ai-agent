@@ -50,6 +50,6 @@ OBSERVER_DISCORD_WEBHOOK=<read-only-observer-webhook> python3 market_observer.py
 - `OBSERVER_GROQ_MODEL`: default `llama-3.3-70b-versatile`; retired `llama-3.1-8b-instant` is automatically replaced
 - `OBSERVER_INTERVAL_SECONDS`: report interval, default `600` (10 minutes)
 - `OBSERVER_NEWS_INTERVAL_SECONDS`: RSS refresh interval, default `900`
-- `OBSERVER_NEWS_FEEDS`: comma-separated public RSS URLs
+- `OBSERVER_NEWS_FEEDS`: comma-separated public RSS URLs; the default uses Google News RSS because the retired Yahoo Finance RSS endpoint can return 404
 
 The trading bot starts this observer automatically as a daemon worker when `DISCORD_WEBHOOK` or `OBSERVER_DISCORD_WEBHOOK` is configured. It remains a separate worker so an observer outage cannot affect trading. Set `OBSERVER_ENABLED=0` to disable automatic startup, or run `python3 market_observer.py --once` manually for a print-only report.
