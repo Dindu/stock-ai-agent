@@ -60,6 +60,40 @@ def evaluate(bars_1m, bars_5m=None, *, pivot_length=5, momentum_threshold_base=0
     volume_above_average = current_volume > volume_average
     short_volume_rising = short_volume_current > short_volume_previous
     volume_ok = volume_above_average and short_volume_rising
+    # --- Entry Timing V1 (shadow telemetry only; does not affect buy/sell decision) ---
+    price_change_series = (close.diff() / prev_close.replace(0, pd.NA)) * 100.0
+    def _move_atr(n):
+        if len(frame) <= n:
+            return 0.0
+        return float((price - float(close.iloc[-1 - n])) / max(atr, 0.01))
+    move_1m_atr = _move_atr(1)
+    move_3m_atr = _move_atr(3)
+    move_5m_atr = _move_atr(5)
+    prior_price_change = float(price_change_series.iloc[-2]) if len(price_change_series) >= 2 and pd.notna(price_change_series.iloc[-2]) else 0.0
+    momentum_acceleration = price_change - prior_price_change
+    prev_short_volume_2 = float(short_volume.iloc[-3]) if len(short_volume) >= 3 else short_volume_previous
+    volume_acceleration = (short_volume_current - short_volume_previous) - (short_volume_previous - prev_short_volume_2)
+    overlap_window = frame.iloc[-5:] if len(frame) >= 5 else frame
+    overlap_pairs = 0
+    overlap_total = max(1, len(overlap_window) - 1)
+    for i in range(1, len(overlap_window)):
+        prev_row, cur_row = overlap_window.iloc[i - 1], overlap_window.iloc[i]
+        if min(prev_row["high"], cur_row["high"]) > max(prev_row["low"], cur_row["low"]):
+            overlap_pairs += 1
+    candle_overlap_ratio = overlap_pairs / overlap_total
+    move_consumed_atr = abs(move_5m_atr)
+    if move_consumed_atr >= 1.2 and momentum_acceleration <= 0:
+        timing_phase = "LATE"
+    elif candle_overlap_ratio >= 0.75 and abs(momentum_acceleration) < momentum_threshold:
+        timing_phase = "CHOP"
+    elif move_consumed_atr <= 0.5 and momentum_acceleration > 0:
+        timing_phase = "IGNITION"
+    elif momentum_acceleration > 0:
+        timing_phase = "EARLY_EXPANSION"
+    else:
+        timing_phase = "RECLAIM"
+    # --- end Entry Timing V1 ---
+
     highest = frame["high"].rolling(breakout_period).max().shift(1).iloc[-1]
     lowest = frame["low"].rolling(breakout_period).min().shift(1).iloc[-1]
     support = float(support_level or frame["low"].rolling(20).min().iloc[-1])
@@ -120,5 +154,12 @@ def evaluate(bars_1m, bars_5m=None, *, pivot_length=5, momentum_threshold_base=0
         "gainz_room_to_support_pct": room_to_support * 100.0,
         "gainz_location_ok": buy_location_ok if buy else sell_location_ok if sell else False,
         "gainz_breakout": "BUY" if buy else "SELL" if sell else "NONE",
+        "gainz_move_1m_atr": move_1m_atr,
+        "gainz_move_3m_atr": move_3m_atr,
+        "gainz_move_5m_atr": move_5m_atr,
+        "gainz_momentum_acceleration": momentum_acceleration,
+        "gainz_volume_acceleration": volume_acceleration,
+        "gainz_candle_overlap_ratio": candle_overlap_ratio,
+        "gainz_timing_phase": timing_phase,
         "reason": "confirmed GainzAlgo BUY" if buy else "confirmed GainzAlgo SELL" if sell else "no confirmed GainzAlgo signal",
     }

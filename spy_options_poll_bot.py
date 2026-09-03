@@ -656,6 +656,7 @@ _ALERTS_HEADERS = [
     "VWAP", "EMA20", "EMA50", "PDH", "PDL", "Recent High", "Recent Low",
     "Bar Volume", "Bar Vol Avg",
     "1m Trigger", "Trade Status", "P&L ($)", "P&L %", "Exit Reason", "Closed At (CT)", "Updated At (CT)", "Setup Type",
+    "Timing Phase", "Move 5m ATR", "Momentum Accel", "Candle Overlap",
 ]
 _TRADES_HEADERS = [
     "Trade ID", "Symbol", "Entry Price", "Exit Price", "Strike", "Direction",
@@ -884,6 +885,10 @@ def log_alert_to_sheets(symbol, data, option):
             "",
             now_ct,
             str(data.get("setup_type", _classify_entry_timing(data, data.get("side", ""))) or "UNKNOWN"),
+            str(data.get("gainz_timing_phase", "") or ""),
+            round(_safe_float_num(data.get("gainz_move_5m_atr", 0.0), 0.0), 3),
+            round(_safe_float_num(data.get("gainz_momentum_acceleration", 0.0), 0.0), 4),
+            round(_safe_float_num(data.get("gainz_candle_overlap_ratio", 0.0), 0.0), 3),
         ]
         ws = _gsheet.worksheet("Alerts")
         ws.append_row(row, value_input_option="USER_ENTERED")
@@ -8202,6 +8207,17 @@ def run_symbol(client, symbol, prefetched_bars=None):
             data["entry_playbook"] = "GAINZ_ALGO"
             data["setup_type"] = "GAINZ_ALGO"
             log(f"[{symbol}] GainzAlgo confirmed {side}: {gainz_metrics.get('reason', '')}")
+            # Entry Timing V1 — shadow telemetry only, does not block or alter this trade.
+            log(
+                f"[{symbol}] [TIMING SHADOW] phase={gainz_metrics.get('gainz_timing_phase', 'unknown')} "
+                f"move_1m={gainz_metrics.get('gainz_move_1m_atr', 0.0):+.2f}ATR "
+                f"move_3m={gainz_metrics.get('gainz_move_3m_atr', 0.0):+.2f}ATR "
+                f"move_5m={gainz_metrics.get('gainz_move_5m_atr', 0.0):+.2f}ATR "
+                f"mom_accel={gainz_metrics.get('gainz_momentum_acceleration', 0.0):+.3f} "
+                f"vol_accel={gainz_metrics.get('gainz_volume_acceleration', 0.0):+.1f} "
+                f"overlap={gainz_metrics.get('gainz_candle_overlap_ratio', 0.0):.2f} "
+                f"(not blocking — shadow mode)"
+            )
         else:
             side = "NO TRADE"
             data["signal"] = "NO TRADE"
