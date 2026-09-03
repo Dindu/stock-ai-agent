@@ -138,6 +138,8 @@ RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
 MIN_DTE = int(os.getenv("MIN_DTE", "1"))   # Minimum DTE (exclude 0DTE)
 MAX_DTE = int(os.getenv("MAX_DTE", "3"))  # Primary DTE window (normally 1-3)
 FALLBACK_MAX_DTE = int(os.getenv("FALLBACK_MAX_DTE", "5"))  # If primary window has no tradeable contract, extend to 4-5 DTE
+GAINZ_ALGO_MIN_DTE = int(os.getenv("GAINZ_ALGO_MIN_DTE", "1"))
+GAINZ_ALGO_MAX_DTE = int(os.getenv("GAINZ_ALGO_MAX_DTE", "3"))
 VOLUME_MULTIPLIER = 1.5
 
 # Scoring thresholds (0-100)
@@ -310,6 +312,7 @@ TRANSITION_ALERT_COOLDOWN_SECONDS = int(os.getenv("TRANSITION_ALERT_COOLDOWN_SEC
 ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
 FORCE_MARKET_OPEN = os.getenv("FORCE_MARKET_OPEN", "0") == "1"
 GAINZ_ALGO_ENTRY_ENABLED = os.getenv("GAINZ_ALGO_ENTRY_ENABLED", "1") == "1"
+GAINZ_ALGO_PRE_ORDER_REVALIDATION_ENABLED = os.getenv("GAINZ_ALGO_PRE_ORDER_REVALIDATION_ENABLED", "1") == "1"
 GAINZ_ALGO_PIVOT_LENGTH = int(os.getenv("GAINZ_ALGO_PIVOT_LENGTH", "5"))
 GAINZ_ALGO_MOMENTUM_THRESHOLD_PCT = float(os.getenv("GAINZ_ALGO_MOMENTUM_THRESHOLD_PCT", "0.01"))
 GAINZ_ALGO_MIN_OPPOSING_LEVEL_ATR = float(os.getenv("GAINZ_ALGO_MIN_OPPOSING_LEVEL_ATR", "0.50"))
@@ -556,6 +559,8 @@ _open_trades: "dict[str, dict]" = {}
 _trading_client: "TradingClient | None" = None
 # Lazily-initialized Alpaca OptionHistoricalDataClient (created in main()).
 _option_client: "OptionHistoricalDataClient | None" = None
+# Lazily-initialized Alpaca stock market-data client (created in main()).
+_market_data_client: "StockHistoricalDataClient | None" = None
 # (symbol, side) -> datetime after which re-alerting is allowed (post-trade cooldown).
 _alert_cooldowns: "dict[tuple, datetime]" = {}
 # (symbol, side) -> datetime after which another near-entry sniper watch alert is allowed.
@@ -3994,13 +3999,18 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
     it just avoids re-running the same expensive Alpaca chain/snapshot query within
     a few seconds of an identical prior search.
     """
+    is_gainz = GAINZ_ALGO_ENTRY_ENABLED and str((data or {}).get("entry_playbook", "") or "").upper() == "GAINZ_ALGO"
+    search_min_dte = max(MIN_DTE, GAINZ_ALGO_MIN_DTE) if is_gainz else MIN_DTE
+    search_max_dte = max(search_min_dte, GAINZ_ALGO_MAX_DTE) if is_gainz else MAX_DTE
+    fallback_max_dte = max(search_max_dte, FALLBACK_MAX_DTE) if is_gainz else FALLBACK_MAX_DTE
+
     if not OPTION_SEARCH_CACHE_ENABLED:
-        primary = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=MIN_DTE, search_max_dte=MAX_DTE)
-        if primary is not None or FALLBACK_MAX_DTE <= MAX_DTE:
+        primary = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=search_min_dte, search_max_dte=search_max_dte)
+        if primary is not None or fallback_max_dte <= search_max_dte:
             return primary
-        fallback_min = max(MIN_DTE, MAX_DTE + 1)
-        log(f"[{symbol}] No tradeable contract in {MIN_DTE}-{MAX_DTE} DTE; extending search to {fallback_min}-{FALLBACK_MAX_DTE} DTE.")
-        return _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=fallback_min, search_max_dte=FALLBACK_MAX_DTE)
+        fallback_min = max(search_min_dte, search_max_dte + 1)
+        log(f"[{symbol}] No tradeable contract in {search_min_dte}-{search_max_dte} DTE; extending search to {fallback_min}-{fallback_max_dte} DTE.")
+        return _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=fallback_min, search_max_dte=fallback_max_dte)
 
     setup_type = str((data or {}).get("entry_playbook", "") or (data or {}).get("setup_type", "") or "")
     bar_time = (data or {}).get("bar_time")
@@ -4014,11 +4024,11 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
         log(f"[{symbol}] Contract search cache hit ({signal}) — reusing result from {(now - cached['cached_at']).total_seconds():.0f}s ago.")
         return cached["result"]
 
-    result = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=MIN_DTE, search_max_dte=MAX_DTE)
-    if result is None and FALLBACK_MAX_DTE > MAX_DTE:
-        fallback_min = max(MIN_DTE, MAX_DTE + 1)
-        log(f"[{symbol}] No tradeable contract in {MIN_DTE}-{MAX_DTE} DTE; extending search to {fallback_min}-{FALLBACK_MAX_DTE} DTE.")
-        result = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=fallback_min, search_max_dte=FALLBACK_MAX_DTE)
+    result = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=search_min_dte, search_max_dte=search_max_dte)
+    if result is None and fallback_max_dte > search_max_dte:
+        fallback_min = max(search_min_dte, search_max_dte + 1)
+        log(f"[{symbol}] No tradeable contract in {search_min_dte}-{search_max_dte} DTE; extending search to {fallback_min}-{fallback_max_dte} DTE.")
+        result = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=fallback_min, search_max_dte=fallback_max_dte)
     is_negative = result is None
     ttl_seconds = OPTION_SEARCH_NEGATIVE_CACHE_TTL_SECONDS if is_negative else OPTION_SEARCH_CACHE_TTL_SECONDS
     if is_negative:
@@ -7668,6 +7678,43 @@ def try_open_paper_trade(symbol, side, option, data):
     if _trading_client is None:
         return False
 
+    if GAINZ_ALGO_ENTRY_ENABLED and GAINZ_ALGO_PRE_ORDER_REVALIDATION_ENABLED:
+        latest_bars = fetch_1m_bars(_market_data_client, symbol) if _market_data_client is not None else None
+        latest_side, latest_metrics = evaluate_gainz_algo(
+            latest_bars,
+            data.get("_gainz_bars_5m"),
+            pivot_length=GAINZ_ALGO_PIVOT_LENGTH,
+            momentum_threshold_base=GAINZ_ALGO_MOMENTUM_THRESHOLD_PCT,
+            support_level=(data.get("support_level") or {}).get("level") if isinstance(data.get("support_level"), dict) else None,
+            resistance_level=(data.get("resistance_level") or {}).get("level") if isinstance(data.get("resistance_level"), dict) else None,
+        )
+        if latest_side != side:
+            log(
+                f"[{symbol}] Gainz pre-order revalidation failed — signal changed "
+                f"from {side} to {latest_side or 'NO TRADE'}; skipping entry."
+            )
+            _record_entry_block("gainz_revalidation")
+            return False
+        opposing_distance_atr = latest_metrics.get(
+            "gainz_resistance_distance_atr" if side == "CALL" else "gainz_support_distance_atr",
+            999.0,
+        )
+        if opposing_distance_atr <= GAINZ_ALGO_MIN_OPPOSING_LEVEL_ATR:
+            log(
+                f"[{symbol}] Gainz pre-order revalidation failed — opposing level "
+                f"{opposing_distance_atr:.2f} ATR away (minimum "
+                f"{GAINZ_ALGO_MIN_OPPOSING_LEVEL_ATR:.2f} ATR)."
+            )
+            _record_entry_block("gainz_revalidation")
+            return False
+        data.update(latest_metrics)
+        log(
+            f"[{symbol}] Gainz pre-order revalidation passed — {side} "
+            f"momentum={latest_metrics.get('gainz_price_change_pct', 0.0):+.2f}% "
+            f"volume_ratio={latest_metrics.get('gainz_volume_ratio', 0.0):.2f} "
+            f"opposing={opposing_distance_atr:.2f} ATR."
+        )
+
     # The contract search result may be cached for up to OPTION_SEARCH_CACHE_TTL_SECONDS —
     # re-validate the live quote/spread right before committing capital.
     refresh_ok, refresh_reason = _refresh_option_quote_before_execution(symbol, option)
@@ -8104,6 +8151,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
         )
         data = dict(data or {})
         data.update(gainz_metrics)
+        data["_gainz_bars_5m"] = bars
         data["one_minute_trigger"] = "GAINZ_ALGO_CONFIRMED" if gainz_side else ""
         data["one_minute_entry_confirmed"] = bool(gainz_side)
         if gainz_side:
@@ -8857,7 +8905,8 @@ def main():
 
     client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-    global _trading_client, _option_client, _gsheet
+    global _trading_client, _option_client, _market_data_client, _gsheet
+    _market_data_client = client
     _option_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
     log("OptionHistoricalDataClient initialized — live Alpaca option data (no yfinance).")
     # Always init TradingClient — needed for GetOptionContractsRequest even when paper

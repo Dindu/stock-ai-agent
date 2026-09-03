@@ -66,6 +66,8 @@ def evaluate(bars_1m, bars_5m=None, *, pivot_length=5, momentum_threshold_base=0
     resistance = float(resistance_level or frame["high"].rolling(20).max().iloc[-1])
     support_distance = abs(price - support) / max(price, 0.01)
     resistance_distance = abs(resistance - price) / max(price, 0.01)
+    support_distance_atr = abs(price - support) / max(atr, 0.01)
+    resistance_distance_atr = abs(resistance - price) / max(atr, 0.01)
     room_to_resistance = (resistance - price) / max(price, 0.01)
     room_to_support = (price - support) / max(price, 0.01)
     bullish = price > float(frame["open"].iloc[-1])
@@ -112,6 +114,8 @@ def evaluate(bars_1m, bars_5m=None, *, pivot_length=5, momentum_threshold_base=0
         "gainz_resistance": resistance,
         "gainz_support_distance_pct": support_distance * 100.0,
         "gainz_resistance_distance_pct": resistance_distance * 100.0,
+        "gainz_support_distance_atr": support_distance_atr,
+        "gainz_resistance_distance_atr": resistance_distance_atr,
         "gainz_room_to_resistance_pct": room_to_resistance * 100.0,
         "gainz_room_to_support_pct": room_to_support * 100.0,
         "gainz_location_ok": buy_location_ok if buy else sell_location_ok if sell else False,
