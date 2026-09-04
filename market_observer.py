@@ -26,7 +26,7 @@ OBSERVER_WEBHOOK = (
     os.getenv("OBSERVER_DISCORD_WEBHOOK", "").strip()
     or os.getenv("DISCORD_WEBHOOK", "").strip()
 )
-OBSERVER_ENABLED = os.getenv("OBSERVER_ENABLED", "1") == "1"
+OBSERVER_ENABLED = os.getenv("OBSERVER_ENABLED", "0") == "1"
 OLLAMA_URL = os.getenv("OBSERVER_OLLAMA_URL", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OBSERVER_OLLAMA_MODEL", "qwen2.5:7b")
 GROQ_API_KEY = (
