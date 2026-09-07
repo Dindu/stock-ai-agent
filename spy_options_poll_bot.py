@@ -33,6 +33,7 @@ import requests
 from dotenv import load_dotenv
 from engine.ai import analyze_briefing
 from engine.gainz_algo import evaluate as evaluate_gainz_algo
+from engine.honesty import build_honesty_overlay
 from market_observer import start_background_observer
 
 from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
@@ -8663,6 +8664,34 @@ def run_symbol(client, symbol, prefetched_bars=None):
     data["raw_entry_score"] = raw_score
     data["macro_penalty"] = macro_penalty
     data["effective_score"] = effective_score
+
+    # Honest-trading overlay: soft risk cap and audit trail only. The live bot
+    # keeps its current entry logic, but now logs whether the trade is in a
+    # higher-volatility / drawdown / loss-streak regime and caps the size
+    # conservatively before execution.
+    try:
+        recent_drawdown_pct = float(data.get("recent_drawdown_pct", 0.0) or 0.0)
+        consecutive_losses = int(data.get("consecutive_losses", 0) or 0)
+        vol_ratio = float(data.get("volatility_ratio", 1.0) or 1.0)
+    except Exception:
+        recent_drawdown_pct = 0.0
+        consecutive_losses = 0
+        vol_ratio = 1.0
+    honesty_overlay = build_honesty_overlay(
+        symbol=symbol,
+        side=side,
+        score=effective_score,
+        data=data,
+        recent_drawdown_pct=recent_drawdown_pct,
+        consecutive_losses=consecutive_losses,
+        volatility_ratio=vol_ratio,
+    )
+    data["honesty_overlay"] = honesty_overlay
+    if honesty_overlay["qty_cap"] <= 0:
+        log(f"[{symbol}] Honest-trading overlay: {side} quality too weak to size ({honesty_overlay['summary']}) — skipping.")
+        return
+    if honesty_overlay["risk_multiplier"] < 1.0:
+        log(f"[{symbol}] Honest-trading overlay: {honesty_overlay['summary']}")
 
     # Real lower-timeframe timing: only after the 5m setup passes the hard score gate.
     if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and ONE_MINUTE_ENTRY_ENABLED and not GAINZ_ALGO_ENTRY_ENABLED:
