@@ -7657,7 +7657,10 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         total_partial_cost = float(trade.get("partial_realized_cost", 0.0) or 0.0)
         total_partial_dollar = float(trade.get("partial_realized_dollar", 0.0) or 0.0)
         trade["partial_pnl_pct"] = (total_partial_dollar / total_partial_cost) if total_partial_cost > 0 else pnl_pct
-        log(f"[{trade['underlying']}] Partial close executed: {close_qty_int} closed, {trade['qty']} remaining.")
+        log(
+            f"[{trade['underlying']}] Partial take profit executed: "
+            f"closed {close_qty_int} of {current_qty}; runner remaining: {trade['qty']}."
+        )
         return
 
     _open_trades.pop(trade["contract"], None)
