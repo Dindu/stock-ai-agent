@@ -32,6 +32,7 @@ import pytz
 import requests
 from dotenv import load_dotenv
 from engine.ai import analyze_briefing
+from engine.danny_state import update as update_danny_state
 from engine.gainz_algo import evaluate as evaluate_gainz_algo
 from engine.honesty import build_honesty_overlay
 from market_observer import start_background_observer
@@ -92,7 +93,9 @@ TIER_LIQUIDITY_THRESHOLDS = {
     "MEGA_LIQUID":  {"min_oi": 500,  "min_volume": 50,  "max_spread_pct": 0.06},
     "STANDARD":     {"min_oi": 100,  "min_volume": 10,  "max_spread_pct": 0.10},
 }
-DEFAULT_SYMBOLS = "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,TSLA,META,PLTR,GOOGL,NFLX,ADBE,HOOD,ORCL"
+# Swing universe: individual stocks with liquid, longer-dated option markets.
+# Index ETFs are excluded from the active symbol scan by default.
+DEFAULT_SYMBOLS = "AAPL,NVDA,MSFT,AMZN,TSLA,META,PLTR,GOOGL,NFLX,ADBE,HOOD,ORCL"
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
 ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")
 ALPACA_TRADING_BASE_URL = os.getenv("ALPACA_TRADING_BASE_URL", "https://paper-api.alpaca.markets")
@@ -115,8 +118,9 @@ TRENDING_EXCLUDE_SYMBOLS = {
 ENABLE_SYMBOL_NEWS_CONTEXT = os.getenv("ENABLE_SYMBOL_NEWS_CONTEXT", "1") == "1"
 SYMBOL_NEWS_HEADLINES = int(os.getenv("SYMBOL_NEWS_HEADLINES", "2"))
 SYMBOL_NEWS_REFRESH_SECONDS = int(os.getenv("SYMBOL_NEWS_REFRESH_SECONDS", "300"))
-BAR_MINUTES = 5
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index options
+SWING_STRATEGY_ENABLED = os.getenv("SWING_STRATEGY_ENABLED", "1") == "1"
+BAR_MINUTES = int(os.getenv("BAR_MINUTES", "60" if SWING_STRATEGY_ENABLED else "5"))
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "300" if SWING_STRATEGY_ENABLED else "30"))
 WS_SYMBOL_MIN_EVAL_SECONDS = int(os.getenv("WS_SYMBOL_MIN_EVAL_SECONDS", "5"))
 WS_EXIT_CHECK_SECONDS = int(os.getenv("WS_EXIT_CHECK_SECONDS", "5"))
 EXIT_REVIEW_ENABLED = os.getenv("EXIT_REVIEW_ENABLED", "1") == "1"
@@ -128,20 +132,20 @@ SCAN_PREFETCH_PARALLEL_ENABLED = os.getenv("SCAN_PREFETCH_PARALLEL_ENABLED", "1"
 SCAN_PREFETCH_MAX_WORKERS = max(1, int(os.getenv("SCAN_PREFETCH_MAX_WORKERS", "8")))
 ENABLE_SCAN_TIMING_LOGS = os.getenv("ENABLE_SCAN_TIMING_LOGS", "1") == "1"
 SCAN_SYMBOL_LOG_THRESHOLD_MS = float(os.getenv("SCAN_SYMBOL_LOG_THRESHOLD_MS", "250"))
-OPENING_NO_TRADE_MINUTES = int(os.getenv("OPENING_NO_TRADE_MINUTES", "15"))
+OPENING_NO_TRADE_MINUTES = int(os.getenv("OPENING_NO_TRADE_MINUTES", "0" if SWING_STRATEGY_ENABLED else "15"))
 OPENING_EXCEPTION_ENABLED = os.getenv("OPENING_EXCEPTION_ENABLED", "1") == "1"
 OPENING_EXCEPTION_MIN_SCORE = int(os.getenv("OPENING_EXCEPTION_MIN_SCORE", "85"))
 OPENING_EXCEPTION_MIN_DOMINANCE = int(os.getenv("OPENING_EXCEPTION_MIN_DOMINANCE", "50"))
 OPENING_EXCEPTION_MIN_SIDE_DELTA_5M = int(os.getenv("OPENING_EXCEPTION_MIN_SIDE_DELTA_5M", "8"))
 OPENING_EXCEPTION_MIN_VOL_RATIO = float(os.getenv("OPENING_EXCEPTION_MIN_VOL_RATIO", "1.20"))
-CLOSING_NO_TRADE_MINUTES = max(60, int(os.getenv("CLOSING_NO_TRADE_MINUTES", "60")))
+CLOSING_NO_TRADE_MINUTES = max(0, int(os.getenv("CLOSING_NO_TRADE_MINUTES", "0" if SWING_STRATEGY_ENABLED else "60")))
 LOOKBACK_BARS = 120
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
-MIN_DTE = int(os.getenv("MIN_DTE", "1"))   # Minimum DTE (exclude 0DTE)
-MAX_DTE = int(os.getenv("MAX_DTE", "3"))  # Primary DTE window (normally 1-3)
-FALLBACK_MAX_DTE = int(os.getenv("FALLBACK_MAX_DTE", "5"))  # If primary window has no tradeable contract, extend to 4-5 DTE
-GAINZ_ALGO_MIN_DTE = int(os.getenv("GAINZ_ALGO_MIN_DTE", "1"))
-GAINZ_ALGO_MAX_DTE = int(os.getenv("GAINZ_ALGO_MAX_DTE", "3"))
+MIN_DTE = int(os.getenv("MIN_DTE", "14" if SWING_STRATEGY_ENABLED else "1"))
+MAX_DTE = int(os.getenv("MAX_DTE", "45" if SWING_STRATEGY_ENABLED else "3"))
+FALLBACK_MAX_DTE = int(os.getenv("FALLBACK_MAX_DTE", "60" if SWING_STRATEGY_ENABLED else "5"))
+GAINZ_ALGO_MIN_DTE = int(os.getenv("GAINZ_ALGO_MIN_DTE", "14" if SWING_STRATEGY_ENABLED else "1"))
+GAINZ_ALGO_MAX_DTE = int(os.getenv("GAINZ_ALGO_MAX_DTE", "45" if SWING_STRATEGY_ENABLED else "3"))
 VOLUME_MULTIPLIER = 1.5
 
 # Scoring thresholds (0-100)
@@ -320,6 +324,13 @@ GAINZ_ALGO_MAX_BAR_AGE_SECONDS = float(os.getenv("GAINZ_ALGO_MAX_BAR_AGE_SECONDS
 GAINZ_ALGO_PIVOT_LENGTH = int(os.getenv("GAINZ_ALGO_PIVOT_LENGTH", "5"))
 GAINZ_ALGO_MOMENTUM_THRESHOLD_PCT = float(os.getenv("GAINZ_ALGO_MOMENTUM_THRESHOLD_PCT", "0.01"))
 GAINZ_ALGO_MIN_OPPOSING_LEVEL_ATR = float(os.getenv("GAINZ_ALGO_MIN_OPPOSING_LEVEL_ATR", "0.50"))
+# Danny-style sequential lifecycle. Danny READY is the sole setup authority;
+# the existing execution path remains responsible for contract, quote, sizing,
+# and risk validation after the staged evidence is ready.
+DANNY_STATE_MACHINE_ENABLED = os.getenv("DANNY_STATE_MACHINE_ENABLED", "1") == "1"
+DANNY_STATE_MACHINE_GATE_ENTRIES = os.getenv("DANNY_STATE_MACHINE_GATE_ENTRIES", "1") == "1"
+DANNY_STATE_MAX_SETUP_MINUTES = int(os.getenv("DANNY_STATE_MAX_SETUP_MINUTES", "4320" if SWING_STRATEGY_ENABLED else "30"))
+DANNY_STATE_READY_WINDOW_MINUTES = int(os.getenv("DANNY_STATE_READY_WINDOW_MINUTES", "1440" if SWING_STRATEGY_ENABLED else "8"))
 
 # Paper-trading execution. When ENABLE_ALPACA_PAPER_TRADING=1 the bot will
 # submit a paper-account market BUY when a STRONG signal fires, then poll the
@@ -362,7 +373,7 @@ RUNNER_TARGET_PCT = float(os.getenv("RUNNER_TARGET_PCT", "0.24"))
 RUNNER_PARTIAL_TP_PCT = float(os.getenv("RUNNER_PARTIAL_TP_PCT", "0.14"))
 RUNNER_PARTIAL_CLOSE_FRACTION = float(os.getenv("RUNNER_PARTIAL_CLOSE_FRACTION", "0.35"))
 RUNNER_TRAILING_GIVEBACK_PCT = float(os.getenv("RUNNER_TRAILING_GIVEBACK_PCT", "0.08"))
-MAX_TRADE_HOLD_MINUTES = int(os.getenv("MAX_TRADE_HOLD_MINUTES", "90"))
+MAX_TRADE_HOLD_MINUTES = int(os.getenv("MAX_TRADE_HOLD_MINUTES", "0" if SWING_STRATEGY_ENABLED else "90"))
 # Regime-aware target/stop profile.
 ADAPTIVE_EXIT_PROFILE_ENABLED = os.getenv("ADAPTIVE_EXIT_PROFILE_ENABLED", "1") == "1"
 HIGH_VOL_RATIO = float(os.getenv("HIGH_VOL_RATIO", "1.50"))
@@ -8279,8 +8290,38 @@ def run_symbol(client, symbol, prefetched_bars=None):
         _update_symbol_opportunity_cache(symbol, data)
         _maybe_send_transition_alert(symbol, data)
 
+        if DANNY_STATE_MACHINE_ENABLED:
+            danny_state = update_danny_state(
+                symbol,
+                data,
+                max_age_minutes=DANNY_STATE_MAX_SETUP_MINUTES,
+                ready_window_minutes=DANNY_STATE_READY_WINDOW_MINUTES,
+            )
+            data["danny_state"] = danny_state
+            data["danny_stage"] = (
+                danny_state.get("call_stage") if side == "CALL"
+                else danny_state.get("put_stage") if side == "PUT"
+                else danny_state.get("call_stage") or danny_state.get("put_stage")
+            )
+            data["danny_ready_side"] = danny_state.get("ready_side")
+            log(
+                f"[{symbol}] Danny lifecycle: CALL={danny_state.get('call_stage', 'IDLE')} "
+                f"PUT={danny_state.get('put_stage', 'IDLE')} "
+                f"ready={danny_state.get('ready_side') or 'NONE'}"
+            )
+
     if side == "NO TRADE":
         return
+
+    if DANNY_STATE_MACHINE_ENABLED and DANNY_STATE_MACHINE_GATE_ENTRIES:
+        ready_side = str((data or {}).get("danny_ready_side") or "").upper()
+        if ready_side != str(side or "").upper():
+            log(
+                f"[{symbol}] Danny sequential gate: {side} is not READY "
+                f"(current={ready_side or 'NONE'}); entry blocked until READY."
+            )
+            _record_entry_block("danny_state")
+            return
 
     closing_block_minutes = closing_no_trade_minutes_remaining()
     if closing_block_minutes > 0:
