@@ -19,7 +19,7 @@ LEVEL_BOUNCE = "LEVEL_BOUNCE"
 @dataclass
 class SetupState:
     stage: str = IDLE
-    playbook: str = "REVERSAL"
+    playbook: str = LEVEL_BOUNCE
     level: float | None = None
     started_at: datetime | None = None
     volume_confirmed: bool = False
@@ -78,7 +78,7 @@ def _resistance_level(data: dict[str, Any]) -> float | None:
 
 def _reset(state: SetupState) -> None:
     state.stage = IDLE
-    state.playbook = "REVERSAL"
+    state.playbook = LEVEL_BOUNCE
     state.level = None
     state.started_at = None
     state.volume_confirmed = False
@@ -107,7 +107,7 @@ def _state_result(symbol: str) -> dict[str, Any]:
     put = _STATES.get((symbol, "PUT"), SetupState())
     ready_sides = []
     for side, state in (("CALL", call), ("PUT", put)):
-        if state.stage == READY and (state.playbook != "REVERSAL" or state.ready_retest_seen):
+        if state.stage == READY and (state.playbook != LEVEL_BOUNCE or state.ready_retest_seen):
             ready_sides.append(side)
     return {
         "call_stage": call.stage,
@@ -217,7 +217,7 @@ def update(symbol: str, data: dict[str, Any], now: datetime | None = None, *,
             if invalidated or age_expired or (state.stage == READY and ready_expired):
                 _reset(state)
 
-            if state.stage == READY and state.playbook == "REVERSAL" and state.ready_bar != bar_key:
+            if state.stage == READY and state.playbook == LEVEL_BOUNCE and state.ready_bar != bar_key:
                 ready_anchor = state.level if state.level is not None else price
                 candle_low = _number(data.get("low"), price)
                 candle_high = _number(data.get("high"), price)
@@ -279,7 +279,7 @@ def update(symbol: str, data: dict[str, Any], now: datetime | None = None, *,
             side for side in ("CALL", "PUT")
             if results.get(f"{side.lower()}_stage") == READY
             and not results.get(f"{side.lower()}_executed", False)
-            and (results.get(f"{side.lower()}_playbook") != "REVERSAL" or results.get(f"{side.lower()}_ready_retest_seen"))
+            and (results.get(f"{side.lower()}_playbook") != LEVEL_BOUNCE or results.get(f"{side.lower()}_ready_retest_seen"))
         ]
         if len(ready_sides) == 1:
             results["ready_side"] = ready_sides[0]
