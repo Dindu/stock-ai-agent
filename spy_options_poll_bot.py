@@ -332,6 +332,7 @@ GAINZ_ALGO_MIN_OPPOSING_LEVEL_ATR = float(os.getenv("GAINZ_ALGO_MIN_OPPOSING_LEV
 # and risk validation after the staged evidence is ready.
 DANNY_STATE_MACHINE_ENABLED = os.getenv("DANNY_STATE_MACHINE_ENABLED", "1") == "1"
 DANNY_STATE_MACHINE_GATE_ENTRIES = os.getenv("DANNY_STATE_MACHINE_GATE_ENTRIES", "1") == "1"
+DANNY_ONLY_ENTRY_MODE = os.getenv("DANNY_ONLY_ENTRY_MODE", "1") == "1"
 DANNY_STATE_MAX_SETUP_MINUTES = int(os.getenv("DANNY_STATE_MAX_SETUP_MINUTES", "4320" if SWING_STRATEGY_ENABLED else "30"))
 DANNY_STATE_READY_WINDOW_MINUTES = int(os.getenv("DANNY_STATE_READY_WINDOW_MINUTES", "1440" if SWING_STRATEGY_ENABLED else "8"))
 
@@ -7709,7 +7710,7 @@ def try_open_paper_trade(symbol, side, option, data):
     if _trading_client is None:
         return False
 
-    if GAINZ_ALGO_ENTRY_ENABLED and GAINZ_ALGO_PRE_ORDER_REVALIDATION_ENABLED:
+    if GAINZ_ALGO_ENTRY_ENABLED and GAINZ_ALGO_PRE_ORDER_REVALIDATION_ENABLED and not DANNY_ONLY_ENTRY_MODE:
         latest_bars = (
             fetch_bars(_market_data_client, symbol)
             if SWING_STRATEGY_ENABLED and _market_data_client is not None
@@ -8313,6 +8314,9 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 else danny_state.get("call_stage") or danny_state.get("put_stage")
             )
             data["danny_ready_side"] = danny_state.get("ready_side")
+            if danny_state.get("ready_side") in {"CALL", "PUT"}:
+                side = danny_state["ready_side"]
+                data["signal"] = side
             log(
                 f"[{symbol}] Danny lifecycle: CALL={danny_state.get('call_stage', 'IDLE')} "
                 f"PUT={danny_state.get('put_stage', 'IDLE')} "
@@ -8341,7 +8345,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
         return
 
     watchlist_promoted = False
-    if data.get("tier") == "WATCH" and not TWO_PLAYBOOK_ENTRY_MODE:
+    if data.get("tier") == "WATCH" and not TWO_PLAYBOOK_ENTRY_MODE and not DANNY_ONLY_ENTRY_MODE:
         if EXECUTE_WATCHLIST_SIGNALS:
             watchlist_promoted = True
             log(f"[{symbol}] WATCHLIST execution enabled globally (EXECUTE_WATCHLIST_SIGNALS=1).")
@@ -8372,6 +8376,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     # only enforced as a hard block in legacy (non-V2) mode.
     enforce_hard_gate = (
         HARD_SCORE_GATE_ENABLED
+        and not DANNY_ONLY_ENTRY_MODE
         and (not (V2_ENTRY_QUALITY_ENABLED and TWO_PLAYBOOK_ENTRY_MODE))
         and ((not NO_GATING_MODE) or HARD_SCORE_GATE_IN_NO_GATING_MODE)
     )
@@ -8414,6 +8419,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     # Only send Discord alerts for STRONG tier unless watchlist was selectively promoted.
     if (
         (not NO_GATING_MODE)
+        and not DANNY_ONLY_ENTRY_MODE
         and not TWO_PLAYBOOK_ENTRY_MODE
         and data["tier"] != "STRONG"
         and not data.get("watchlist_promoted", False)
@@ -8422,7 +8428,9 @@ def run_symbol(client, symbol, prefetched_bars=None):
             f"\u2014 below STRONG threshold, no Discord alert.")
         return
 
-    enforce_opening_window = (not NO_GATING_MODE) or ENFORCE_OPENING_WINDOW_IN_NO_GATING
+    enforce_opening_window = not DANNY_ONLY_ENTRY_MODE and (
+        (not NO_GATING_MODE) or ENFORCE_OPENING_WINDOW_IN_NO_GATING
+    )
     if enforce_opening_window:
         opening_block_minutes = opening_no_trade_minutes_remaining()
         if opening_block_minutes > 0:
@@ -8471,7 +8479,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 return
 
     # Trend-ignition filter: only fire when the move is *just starting*, not mid- or late-trend.
-    if IGNITION_REQUIRED and not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
+    if IGNITION_REQUIRED and not NO_GATING_MODE and not DANNY_ONLY_ENTRY_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         entry_timing = _classify_entry_timing(data or {}, side)
         if side == "CALL":
             now_score = data["bull_score"]
@@ -8653,7 +8661,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
 
     # Continuation check: relaxed version (ignition delta already requires momentum confirmation)
     # Note: We're keeping this gate but making it advisory only during fresh ignitions
-    if not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE and not data.get("ignition_confirmed", False):
+    if not NO_GATING_MODE and not DANNY_ONLY_ENTRY_MODE and not TWO_PLAYBOOK_ENTRY_MODE and not data.get("ignition_confirmed", False):
         cont_ok, cont_reason = entry_momentum_continuation_ok(symbol, side, data)
         if not cont_ok:
             log(f"[{symbol}] Momentum continuation filter: {side} blocked — {cont_reason}.")
@@ -8662,7 +8670,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     # ── RSI exhaustion filter ─────────────────────────────────────────────────
     # Don't enter CALLs when RSI is already overbought (move likely exhausted),
     # or PUTs when RSI is already oversold.
-    if RSI_FILTER and not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
+    if RSI_FILTER and not NO_GATING_MODE and not DANNY_ONLY_ENTRY_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         rsi = data.get("rsi", 50.0)
         if side == "CALL" and rsi >= rsi_overbought:
             log(f"[{symbol}] RSI filter: CALL blocked — RSI {rsi:.1f} >= {rsi_overbought} (overbought, late entry).")
@@ -8673,7 +8681,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
 
     # ── Macro alignment context (penalty by default, optional hard block) ───
     macro_penalty = 0
-    if SPY_MACRO_ALIGN and (not NO_GATING_MODE) and symbol != "SPY" and "SPY" in SYMBOLS:
+    if SPY_MACRO_ALIGN and (not NO_GATING_MODE) and not DANNY_ONLY_ENTRY_MODE and symbol != "SPY" and "SPY" in SYMBOLS:
         spy_vwap_side = _spy_vwap_side()
         misaligned = (side == "CALL" and spy_vwap_side != "bull") or (side == "PUT" and spy_vwap_side != "bear")
         if misaligned:
@@ -8695,6 +8703,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
         BEARISH_TAPE_CALL_PENALTY_ENABLED
         and side == "CALL"
         and (not NO_GATING_MODE)
+        and not DANNY_ONLY_ENTRY_MODE
     ):
         spy_side = _spy_vwap_side()
         qqq_side = _qqq_vwap_cache.get("side")
@@ -8744,7 +8753,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
         log(f"[{symbol}] Honest-trading overlay: {honesty_overlay['summary']}")
 
     # Real lower-timeframe timing: only after the 5m setup passes the hard score gate.
-    if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and ONE_MINUTE_ENTRY_ENABLED and not GAINZ_ALGO_ENTRY_ENABLED:
+    if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and not DANNY_ONLY_ENTRY_MODE and ONE_MINUTE_ENTRY_ENABLED and not GAINZ_ALGO_ENTRY_ENABLED:
         try:
             bars_1m = fetch_1m_bars(client, symbol)
             trigger, trigger_reason = one_minute_entry_timing(symbol, side, bars_1m, data)
@@ -8771,7 +8780,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
         data["one_minute_trigger"] = "DISABLED" if not ONE_MINUTE_ENTRY_ENABLED else ""
         data["one_minute_entry_confirmed"] = not ONE_MINUTE_ENTRY_ENABLED
 
-    if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and not GAINZ_ALGO_ENTRY_ENABLED:
+    if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and not DANNY_ONLY_ENTRY_MODE and not GAINZ_ALGO_ENTRY_ENABLED:
         playbook_ok, playbook, playbook_reason = playbook_entry_ok(side, data, symbol)
         if not playbook_ok:
             if (
@@ -8812,7 +8821,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
             return
         log(f"[{symbol}] Playbook gate: {playbook} {side} passed — {playbook_reason}.")
 
-    if ML_GATE_ENABLED and (not NO_GATING_MODE) and not TWO_PLAYBOOK_ENTRY_MODE:
+    if ML_GATE_ENABLED and (not NO_GATING_MODE) and not DANNY_ONLY_ENTRY_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         ml_prob, ml_exp_ret, ml_source = _predict_ml_entry(symbol, side, data)
         data["ml_probability"] = ml_prob
         data["ml_expected_return"] = ml_exp_ret
@@ -8841,7 +8850,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     # ── Anti-chase filters ───────────────────────────────────────────────────
     # Avoid buying when price is already too extended away from VWAP, and avoid
     # entering when the latest candle already flipped against our side.
-    if ANTI_CHASE_FILTER and not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
+    if ANTI_CHASE_FILTER and not NO_GATING_MODE and not DANNY_ONLY_ENTRY_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         ext_pct = float(data.get("vwap_extension_pct", 0.0))
         if ext_pct > max_ext_from_vwap:
             log(
@@ -8850,7 +8859,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
             )
             return
 
-    if CANDLE_CONFIRMATION and not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
+    if CANDLE_CONFIRMATION and not NO_GATING_MODE and not DANNY_ONLY_ENTRY_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         if side == "CALL" and not data.get("bullish_candle", False):
             log(f"[{symbol}] Candle filter: CALL blocked — latest candle is not bullish.")
             return
@@ -8863,7 +8872,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         _alerted_today["keys"].add(alert_key)
 
-    if not NO_GATING_MODE:
+    if not NO_GATING_MODE and not DANNY_ONLY_ENTRY_MODE:
         fresh_ok, fresh_reason = fresh_setup_confirmed(symbol, side, data)
         if not fresh_ok:
             if ALERT_ONLY_COOLDOWN_MINUTES > 0:
