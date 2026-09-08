@@ -8318,10 +8318,9 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 f"volume={data.get('gainz_volume_ok', False)}"
             )
         else:
-            trend_5m = f" | 5m\u0394 BULL {data['bull_score'] - data['bull_5m']:+d}" if data['bull_5m'] is not None else ""
             log(
                 f"[{symbol}] {data['price']:.2f} | {data['signal']} | "
-                f"BULL {data['bull_score']} BEAR {data['bear_score']} ({data['sentiment']}){trend_5m}"
+                f"BULL {data['bull_score']} BEAR {data['bear_score']} ({data['sentiment']})"
             )
         # Keep SPY VWAP macro cache fresh for the alignment filter used by QQQ/IWM.
         if symbol == "SPY":
