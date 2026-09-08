@@ -23,9 +23,12 @@ class SetupState:
     started_at: datetime | None = None
     volume_confirmed: bool = False
     ready_at: datetime | None = None
+    ready_bar: Any = None
+    ready_retest_seen: bool = False
 
 
 _STATES: dict[tuple[str, str], SetupState] = {}
+_LAST_BAR_BY_SYMBOL: dict[str, Any] = {}
 _LOCK = RLock()
 
 
@@ -74,6 +77,8 @@ def _reset(state: SetupState) -> None:
     state.started_at = None
     state.volume_confirmed = False
     state.ready_at = None
+    state.ready_bar = None
+    state.ready_retest_seen = False
 
 
 def _transition(state: SetupState, stage: str, now: datetime) -> None:
@@ -84,6 +89,35 @@ def _transition(state: SetupState, stage: str, now: datetime) -> None:
         state.volume_confirmed = False
     elif stage == READY:
         state.ready_at = now
+
+
+def _state_result(symbol: str) -> dict[str, Any]:
+    call = _STATES.get((symbol, "CALL"), SetupState())
+    put = _STATES.get((symbol, "PUT"), SetupState())
+    ready_sides = []
+    for side, state in (("CALL", call), ("PUT", put)):
+        if state.stage == READY and (state.playbook != "REVERSAL" or state.ready_retest_seen):
+            ready_sides.append(side)
+    return {
+        "call_stage": call.stage,
+        "call_playbook": call.playbook,
+        "call_level": call.level,
+        "call_volume_confirmed": call.volume_confirmed,
+        "call_ready_retest_seen": call.ready_retest_seen,
+        "put_stage": put.stage,
+        "put_playbook": put.playbook,
+        "put_level": put.level,
+        "put_volume_confirmed": put.volume_confirmed,
+        "put_ready_retest_seen": put.ready_retest_seen,
+        "ready_side": ready_sides[0] if len(ready_sides) == 1 else None,
+        "reason": (
+            f"{ready_sides[0]} sequential setup READY"
+            if len(ready_sides) == 1
+            else "no unique READY setup"
+            if not ready_sides
+            else "conflicting READY setups"
+        ),
+    }
 
 
 def update(symbol: str, data: dict[str, Any], now: datetime | None = None, *,
@@ -106,10 +140,16 @@ def update(symbol: str, data: dict[str, Any], now: datetime | None = None, *,
         return {"call_stage": IDLE, "put_stage": IDLE, "ready_side": None, "reason": "missing price/ATR"}
 
     with _LOCK:
+        bar_key = data.get("bar_time")
+        if bar_key is not None and _LAST_BAR_BY_SYMBOL.get(symbol) == bar_key:
+            return _state_result(symbol)
+        if bar_key is not None:
+            _LAST_BAR_BY_SYMBOL[symbol] = bar_key
+
         results: dict[str, Any] = {}
         for side, level, score_key, opposite_key, structure_key, momentum_key, volume_key in (
-            ("CALL", _support_level(data), "bull_score", "bear_score", "gainz_buy_breakout", "gainz_buy_momentum_ok", "gainz_volume_ratio"),
-            ("PUT", _resistance_level(data), "bear_score", "bull_score", "gainz_sell_breakdown", "gainz_sell_momentum_ok", "gainz_volume_ratio"),
+            ("CALL", _support_level(data), "bull_score", "bear_score", "fresh_breakout", "momentum_pct", "vol_ratio"),
+            ("PUT", _resistance_level(data), "bear_score", "bull_score", "fresh_breakdown", "momentum_pct", "vol_ratio"),
         ):
             state = _STATES.setdefault((symbol, side), SetupState())
             score = _number(data.get(score_key))
@@ -130,27 +170,40 @@ def update(symbol: str, data: dict[str, Any], now: datetime | None = None, *,
             hold = state.level is not None and (
                 price >= state.level if side == "CALL" else price <= state.level
             )
-            structure = bool(data.get(structure_key)) or bool(data.get("gainz_breakout" if side == "CALL" else "gainz_breakdown")) or bool(data.get("fresh_breakout" if side == "CALL" else "fresh_breakdown"))
-            momentum = bool(data.get(momentum_key)) or (
-                _number(data.get("gainz_price_change_pct")) > 0 if side == "CALL"
-                else _number(data.get("gainz_price_change_pct")) < 0
-            )
+            structure = bool(data.get(structure_key))
+            momentum_value = _number(data.get(momentum_key))
+            momentum = momentum_value > 0 if side == "CALL" else momentum_value < 0
             volume = _number(data.get(volume_key), _number(data.get("vol_ratio"), 0.0)) >= min_volume_ratio
             trend_strength = _number(
                 data.get("market_regime_score_bull" if side == "CALL" else "market_regime_score_bear"),
-                abs(_number(data.get("gainz_trend_strength"))),
+                0.0,
             )
             trend_established = aligned and trend_strength >= 16.0
             continuation_level = level
             breakout = bool(data.get("fresh_breakout" if side == "CALL" else "fresh_breakdown"))
             if not breakout:
-                breakout = bool(data.get(structure_key)) or bool(
-                    data.get("gainz_breakout" if side == "CALL" else "gainz_breakdown")
-                )
+                breakout = bool(data.get(structure_key))
             location_ok = not bool(data.get("bull_extended" if side == "CALL" else "bear_extended", False))
 
             if invalidated or age_expired or (state.stage == READY and ready_expired):
                 _reset(state)
+
+            if state.stage == READY and state.playbook == "REVERSAL" and state.ready_bar != bar_key:
+                ready_anchor = state.level if state.level is not None else price
+                candle_low = _number(data.get("low"), price)
+                candle_high = _number(data.get("high"), price)
+                candle_open = _number(data.get("open"), price)
+                close = price
+                retest = (
+                    candle_low <= ready_anchor + atr * 0.55
+                    and close >= ready_anchor - atr * 0.05
+                    and close >= candle_open
+                ) if side == "CALL" else (
+                    candle_high >= ready_anchor - atr * 0.55
+                    and close <= ready_anchor + atr * 0.05
+                    and close <= candle_open
+                )
+                state.ready_retest_seen = state.ready_retest_seen or retest
 
             if state.stage == IDLE and authorized and trend_established and continuation_level is not None and location_ok and near:
                 state.level = continuation_level
@@ -171,14 +224,20 @@ def update(symbol: str, data: dict[str, Any], now: datetime | None = None, *,
             elif state.stage == CONFIRMING:
                 state.volume_confirmed = state.volume_confirmed or volume
                 if state.volume_confirmed and authorized and (aligned or structure) and momentum:
+                    state.ready_bar = bar_key
                     _transition(state, READY, now)
 
             results[f"{side.lower()}_stage"] = state.stage
             results[f"{side.lower()}_playbook"] = state.playbook
             results[f"{side.lower()}_level"] = state.level
             results[f"{side.lower()}_volume_confirmed"] = state.volume_confirmed
+            results[f"{side.lower()}_ready_retest_seen"] = state.ready_retest_seen
 
-        ready_sides = [side for side in ("CALL", "PUT") if results.get(f"{side.lower()}_stage") == READY]
+        ready_sides = [
+            side for side in ("CALL", "PUT")
+            if results.get(f"{side.lower()}_stage") == READY
+            and (results.get(f"{side.lower()}_playbook") != "REVERSAL" or results.get(f"{side.lower()}_ready_retest_seen"))
+        ]
         if len(ready_sides) == 1:
             results["ready_side"] = ready_sides[0]
             results["reason"] = f"{ready_sides[0]} sequential setup READY"
@@ -193,7 +252,9 @@ def reset(symbol: str | None = None) -> None:
     with _LOCK:
         if symbol is None:
             _STATES.clear()
+            _LAST_BAR_BY_SYMBOL.clear()
             return
         symbol = str(symbol).upper()
         for key in [key for key in _STATES if key[0] == symbol]:
             _STATES.pop(key, None)
+        _LAST_BAR_BY_SYMBOL.pop(symbol, None)

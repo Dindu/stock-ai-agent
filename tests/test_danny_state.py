@@ -15,12 +15,12 @@ def snapshot(**overrides):
         "resistance_level": {"level": 101.0},
         "bull_score": 70,
         "bear_score": 20,
-        "gainz_buy_breakout": False,
-        "gainz_sell_breakdown": False,
-        "gainz_buy_momentum_ok": True,
-        "gainz_sell_momentum_ok": False,
-        "gainz_volume_ratio": 1.0,
-        "gainz_trend_strength": 0.0,
+        "fresh_breakout": False,
+        "fresh_breakdown": False,
+        "momentum_pct": 0.5,
+        "vol_ratio": 1.0,
+        "market_regime_score_bull": 20.0,
+        "market_regime_score_bear": 0.0,
     }
     data.update(overrides)
     return data
@@ -38,14 +38,14 @@ def test_call_progresses_across_bars_to_ready():
 
     confirming = danny_state.update(
         "TEST",
-        snapshot(price=100.0, gainz_buy_breakout=True),
+        snapshot(price=100.0, fresh_breakout=True),
         start + timedelta(minutes=2),
     )
     assert confirming["call_stage"] == danny_state.CONFIRMING
 
     ready = danny_state.update(
         "TEST",
-        snapshot(price=100.0, gainz_buy_breakout=True, gainz_volume_ratio=1.2),
+        snapshot(price=100.0, fresh_breakout=True, vol_ratio=1.2),
         start + timedelta(minutes=3),
     )
     assert ready["call_stage"] == danny_state.READY
@@ -64,8 +64,7 @@ def test_put_uses_resistance_side():
             ema20=101.0,
             bull_score=20,
             bear_score=70,
-            gainz_buy_momentum_ok=False,
-            gainz_sell_momentum_ok=True,
+            momentum_pct=-0.5,
         ),
         start,
     )
@@ -86,8 +85,8 @@ def test_call_breakout_retest_progresses_to_ready():
             recent_low=100.0,
             recent_high=101.0,
             support_level={"level": 100.0},
-            gainz_buy_breakout=True,
-            gainz_volume_ratio=1.0,
+            fresh_breakout=True,
+            vol_ratio=1.0,
         ),
         start,
     )
@@ -103,8 +102,8 @@ def test_call_breakout_retest_progresses_to_ready():
             recent_low=100.0,
             recent_high=102.0,
             support_level={"level": 100.0},
-            gainz_buy_breakout=True,
-            gainz_volume_ratio=1.0,
+            fresh_breakout=True,
+            vol_ratio=1.0,
         ),
         start + timedelta(minutes=1),
     )
@@ -135,8 +134,8 @@ def test_call_breakout_retest_progresses_to_ready():
             recent_low=100.0,
             recent_high=102.0,
             support_level={"level": 100.0},
-            gainz_buy_breakout=True,
-            gainz_volume_ratio=1.2,
+            fresh_breakout=True,
+            vol_ratio=1.2,
         ),
         start + timedelta(minutes=3),
     )
