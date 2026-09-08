@@ -4553,16 +4553,18 @@ def fetch_bars(client, symbol):
 
 
 _danny_mtf_cache = {}
+# Keyed by symbol only so the cache stays bounded by universe size.
+DANNY_MTF_CACHE_SECONDS = int(os.getenv("DANNY_MTF_CACHE_SECONDS", "300"))
 
 
 def fetch_danny_mtf_context(client, symbol):
     """Fetch lightweight 5m/15m context for Danny's regime gate."""
-    cache_key = (str(symbol).upper(), datetime.now(timezone.utc).strftime("%Y-%m-%d-%H-%M"))
-    cached = _danny_mtf_cache.get(cache_key)
-    if cached is not None:
-        return cached
-
+    cache_key = str(symbol).upper()
     end = datetime.now(timezone.utc)
+    cached = _danny_mtf_cache.get(cache_key)
+    if cached is not None and (end - cached["fetched_at"]).total_seconds() < DANNY_MTF_CACHE_SECONDS:
+        return cached["context"]
+
     context = {"mtf_available": False, "mtf_5m": 0, "mtf_15m": 0, "mtf_score": None}
     try:
         votes = []
@@ -4593,7 +4595,7 @@ def fetch_danny_mtf_context(client, symbol):
             context["mtf_score"] = sum(votes)
     except Exception as exc:
         log(f"[{symbol}] Danny MTF context unavailable: {type(exc).__name__}: {exc}")
-    _danny_mtf_cache[cache_key] = context
+    _danny_mtf_cache[cache_key] = {"context": context, "fetched_at": end}
     return context
 
 
