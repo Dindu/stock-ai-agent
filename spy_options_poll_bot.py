@@ -32,6 +32,7 @@ import pytz
 import requests
 from dotenv import load_dotenv
 from engine.ai import analyze_briefing
+from engine.danny_state import mark_executed as mark_danny_executed
 from engine.danny_state import update as update_danny_state
 from engine.gainz_algo import evaluate as evaluate_gainz_algo
 from engine.honesty import build_honesty_overlay
@@ -336,9 +337,11 @@ GAINZ_ALGO_MIN_OPPOSING_LEVEL_ATR = float(os.getenv("GAINZ_ALGO_MIN_OPPOSING_LEV
 DANNY_PAPER_MODE = os.getenv("DANNY_PAPER_MODE", "1") == "1"
 if DANNY_PAPER_MODE:
     os.environ.setdefault("ENABLE_ALPACA_PAPER_TRADING", "1")
-    os.environ.setdefault("DANNY_ONLY_ENTRY_MODE", "1")
-    os.environ.setdefault("DANNY_STATE_MACHINE_ENABLED", "1")
-    os.environ.setdefault("DANNY_STATE_MACHINE_GATE_ENTRIES", "1")
+    # Danny is the sole strategy authority in paper mode; legacy environment
+    # overrides must not bypass its lifecycle gate.
+    os.environ["DANNY_ONLY_ENTRY_MODE"] = "1"
+    os.environ["DANNY_STATE_MACHINE_ENABLED"] = "1"
+    os.environ["DANNY_STATE_MACHINE_GATE_ENTRIES"] = "1"
     os.environ.setdefault("SWING_STRATEGY_ENABLED", "1")
     GAINZ_ALGO_ENTRY_ENABLED = False
     if SWING_STRATEGY_ENABLED:
@@ -4549,6 +4552,51 @@ def fetch_bars(client, symbol):
     return bars
 
 
+_danny_mtf_cache = {}
+
+
+def fetch_danny_mtf_context(client, symbol):
+    """Fetch lightweight 5m/15m context for Danny's regime gate."""
+    cache_key = (str(symbol).upper(), datetime.now(timezone.utc).strftime("%Y-%m-%d-%H-%M"))
+    cached = _danny_mtf_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    end = datetime.now(timezone.utc)
+    context = {"mtf_available": False, "mtf_5m": 0, "mtf_15m": 0, "mtf_score": None}
+    try:
+        votes = []
+        for minutes, key in ((5, "mtf_5m"), (15, "mtf_15m")):
+            request = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame(minutes, TimeFrameUnit.Minute),
+                start=end - timedelta(days=5),
+                end=end,
+                feed=DataFeed(FEED),
+            )
+            bars = client.get_stock_bars(request).df
+            if bars is None or bars.empty:
+                continue
+            if isinstance(bars.index, pd.MultiIndex):
+                bars = bars.xs(symbol, level=0)
+            bars = bars[["open", "high", "low", "close", "volume"]].tail(80)
+            if len(bars) < 20:
+                continue
+            ema20 = bars["close"].ewm(span=20, adjust=False).mean()
+            vwap = (bars["close"] * bars["volume"]).cumsum() / bars["volume"].replace(0, pd.NA).cumsum()
+            close = float(bars["close"].iloc[-1])
+            vote = 1 if close >= float(ema20.iloc[-1]) and close >= float(vwap.iloc[-1]) else -1 if close < float(ema20.iloc[-1]) and close < float(vwap.iloc[-1]) else 0
+            context[key] = vote
+            votes.append(vote)
+        if votes:
+            context["mtf_available"] = True
+            context["mtf_score"] = sum(votes)
+    except Exception as exc:
+        log(f"[{symbol}] Danny MTF context unavailable: {type(exc).__name__}: {exc}")
+    _danny_mtf_cache[cache_key] = context
+    return context
+
+
 def fetch_1m_bars(client, symbol):
     """Fetch recent 1-minute bars for entry timing only.
 
@@ -6492,6 +6540,12 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "underlying_plan_target": underlying_plan["target"],
         "underlying_thesis_level": underlying_plan["thesis_level"],
         "underlying_playbook": underlying_plan["playbook"],
+        "danny_playbook": str((data or {}).get("entry_playbook", "UNKNOWN") or "UNKNOWN"),
+        "danny_thesis_id": str((data or {}).get("danny_state", {}).get("call_thesis_id" if side == "CALL" else "put_thesis_id", "") or ""),
+        "danny_setup_state": str((data or {}).get("danny_stage", "UNKNOWN") or "UNKNOWN"),
+        "danny_anchor_price": _safe_float_num((data or {}).get("danny_state", {}).get("call_anchor_price" if side == "CALL" else "put_anchor_price"), 0.0),
+        "danny_mtf_score": (data or {}).get("mtf_score"),
+        "danny_candidate_count": int((data or {}).get("danny_state", {}).get("call_candidate_count" if side == "CALL" else "put_candidate_count", 0) or 0),
         "entry_bull_score": int((data or {}).get("bull_score", 0) or 0),
         "entry_bear_score": int((data or {}).get("bear_score", 0) or 0),
         "entry_delta_5m": delta_5m,
@@ -7933,6 +7987,7 @@ def try_open_paper_trade(symbol, side, option, data):
 
     trade = open_trade_record(symbol, signal_label, option, score, fill_price, qty, data=data)
     _open_trades[trade["contract"]] = trade
+    mark_danny_executed(symbol, side, trade.get("danny_thesis_id"))
     _record_trade_open_for_perf(datetime.now(central))
 
     # Persist both ALERTS and TRADES records as part of the same entry flow.
@@ -8285,6 +8340,8 @@ def run_symbol(client, symbol, prefetched_bars=None):
     max_ext_from_vwap = float(profile["max_ext_from_vwap"])
 
     side, data = analyze(bars, client, symbol)
+    if data is not None:
+        data.update(fetch_danny_mtf_context(client, symbol))
     if GAINZ_ALGO_ENTRY_ENABLED:
         gainz_bars = bars if SWING_STRATEGY_ENABLED else fetch_1m_bars(client, symbol)
         gainz_side, gainz_metrics = evaluate_gainz_algo(
@@ -8405,15 +8462,22 @@ def run_symbol(client, symbol, prefetched_bars=None):
             if danny_state.get("ready_side") in {"CALL", "PUT"}:
                 side = danny_state["ready_side"]
                 data["signal"] = side
+                playbook_key = "call_playbook" if side == "CALL" else "put_playbook"
+                danny_playbook = str(danny_state.get(playbook_key) or "REVERSAL").upper()
+                data["entry_playbook"] = danny_playbook
+                data["setup_type"] = danny_playbook
             log(
                 f"[{symbol}] Danny lifecycle: CALL={danny_state.get('call_stage', 'IDLE')} "
                 f"PUT={danny_state.get('put_stage', 'IDLE')} "
-                f"ready={danny_state.get('ready_side') or 'NONE'}"
+                f"ready={danny_state.get('ready_side') or 'NONE'} "
+                f"mtf={data.get('mtf_score', 'NA')}"
             )
 
     if side == "NO TRADE":
         return
 
+    # This is the sole strategy-to-execution boundary. Everything below this
+    # point is option selection, risk, broker, or position management.
     if DANNY_STATE_MACHINE_ENABLED and DANNY_STATE_MACHINE_GATE_ENTRIES:
         ready_side = str((data or {}).get("danny_ready_side") or "").upper()
         if ready_side != str(side or "").upper():
@@ -9089,6 +9153,13 @@ Playbook: `{underlying_plan['playbook']}`
 Entry: `{underlying_plan['entry']:.2f}` | Thesis Level: `{underlying_plan['thesis_level']:.2f}`
 Stop: `{underlying_plan['stop']:.2f}` | T1: `{underlying_plan['target']:.2f}`
 Option target/stop remain separate: `{option['contract']}` premium risk management.
+
+**Danny Strategy Telemetry**
+State: `{data.get('danny_stage', 'UNKNOWN')}` | Playbook: `{data.get('entry_playbook', 'UNKNOWN')}`
+Thesis ID: `{(data.get('danny_state') or {}).get('call_thesis_id' if side == 'CALL' else 'put_thesis_id', '')}`
+Anchor: `{((data.get('danny_state') or {}).get('call_anchor_price' if side == 'CALL' else 'put_anchor_price') or 0):.2f}`
+MTF 5m/15m: `{data.get('mtf_5m', 'NA')}` / `{data.get('mtf_15m', 'NA')}` | MTF score: `{data.get('mtf_score', 'NA')}`
+Candidate count: `{(data.get('danny_state') or {}).get('call_candidate_count' if side == 'CALL' else 'put_candidate_count', 0)}`
 
 **Score Components**
 {checklist}

@@ -13,6 +13,7 @@ HOLDING = "HOLDING"
 CONFIRMING = "CONFIRMING"
 READY = "READY"
 IDLE = "IDLE"
+LEVEL_BOUNCE = "LEVEL_BOUNCE"
 
 
 @dataclass
@@ -25,6 +26,11 @@ class SetupState:
     ready_at: datetime | None = None
     ready_bar: Any = None
     ready_retest_seen: bool = False
+    thesis_id: str = ""
+    anchor_bar: Any = None
+    anchor_price: float | None = None
+    executed: bool = False
+    candidate_count: int = 0
 
 
 _STATES: dict[tuple[str, str], SetupState] = {}
@@ -79,6 +85,11 @@ def _reset(state: SetupState) -> None:
     state.ready_at = None
     state.ready_bar = None
     state.ready_retest_seen = False
+    state.thesis_id = ""
+    state.anchor_bar = None
+    state.anchor_price = None
+    state.executed = False
+    state.candidate_count = 0
 
 
 def _transition(state: SetupState, stage: str, now: datetime) -> None:
@@ -104,11 +115,21 @@ def _state_result(symbol: str) -> dict[str, Any]:
         "call_level": call.level,
         "call_volume_confirmed": call.volume_confirmed,
         "call_ready_retest_seen": call.ready_retest_seen,
+        "call_thesis_id": call.thesis_id,
+        "call_anchor_bar": call.anchor_bar,
+        "call_anchor_price": call.anchor_price,
+        "call_executed": call.executed,
+        "call_candidate_count": call.candidate_count,
         "put_stage": put.stage,
         "put_playbook": put.playbook,
         "put_level": put.level,
         "put_volume_confirmed": put.volume_confirmed,
         "put_ready_retest_seen": put.ready_retest_seen,
+        "put_thesis_id": put.thesis_id,
+        "put_anchor_bar": put.anchor_bar,
+        "put_anchor_price": put.anchor_price,
+        "put_executed": put.executed,
+        "put_candidate_count": put.candidate_count,
         "ready_side": ready_sides[0] if len(ready_sides) == 1 else None,
         "reason": (
             f"{ready_sides[0]} sequential setup READY"
@@ -179,6 +200,14 @@ def update(symbol: str, data: dict[str, Any], now: datetime | None = None, *,
                 0.0,
             )
             trend_established = aligned and trend_strength >= 16.0
+            mtf_5m = _number(data.get("mtf_5m"), 0.0)
+            mtf_15m = _number(data.get("mtf_15m"), 0.0)
+            mtf_available = bool(data.get("mtf_available", False))
+            mtf_aligned = not mtf_available or (
+                mtf_5m >= 0 and mtf_15m >= 0 and (mtf_5m > 0 or mtf_15m > 0)
+                if side == "CALL" else
+                mtf_5m <= 0 and mtf_15m <= 0 and (mtf_5m < 0 or mtf_15m < 0)
+            )
             continuation_level = level
             breakout = bool(data.get("fresh_breakout" if side == "CALL" else "fresh_breakdown"))
             if not breakout:
@@ -205,25 +234,32 @@ def update(symbol: str, data: dict[str, Any], now: datetime | None = None, *,
                 )
                 state.ready_retest_seen = state.ready_retest_seen or retest
 
-            if state.stage == IDLE and authorized and trend_established and continuation_level is not None and location_ok and near:
+            if state.stage == IDLE and not state.executed and authorized and trend_established and mtf_aligned and continuation_level is not None and location_ok and near:
                 state.level = continuation_level
                 state.playbook = "TREND_PULLBACK"
                 _transition(state, WATCHING, now)
-            elif state.stage == IDLE and authorized and breakout and location_ok:
+            elif state.stage == IDLE and authorized and mtf_aligned and breakout and location_ok:
                 state.level = level if level is not None else price
                 state.playbook = "BREAKOUT_RETEST"
                 _transition(state, WATCHING, now)
             elif state.stage == IDLE and near and authorized:
                 state.level = level
-                state.playbook = "REVERSAL"
+                state.playbook = LEVEL_BOUNCE
                 _transition(state, WATCHING, now)
-            elif state.stage == WATCHING and hold:
+            if state.stage == WATCHING and state.thesis_id == "":
+                state.anchor_bar = bar_key
+                state.anchor_price = state.level
+                state.thesis_id = f"{symbol}:{side}:{state.playbook}:{state.level:.4f}"
+            if state.stage in {WATCHING, HOLDING, CONFIRMING, READY}:
+                state.candidate_count += 1
+
+            if state.stage == WATCHING and hold:
                 _transition(state, HOLDING, now)
             elif state.stage == HOLDING and (structure or (aligned and momentum)):
                 _transition(state, CONFIRMING, now)
             elif state.stage == CONFIRMING:
                 state.volume_confirmed = state.volume_confirmed or volume
-                if state.volume_confirmed and authorized and (aligned or structure) and momentum:
+                if state.volume_confirmed and authorized and mtf_aligned and (aligned or structure) and momentum:
                     state.ready_bar = bar_key
                     _transition(state, READY, now)
 
@@ -232,10 +268,17 @@ def update(symbol: str, data: dict[str, Any], now: datetime | None = None, *,
             results[f"{side.lower()}_level"] = state.level
             results[f"{side.lower()}_volume_confirmed"] = state.volume_confirmed
             results[f"{side.lower()}_ready_retest_seen"] = state.ready_retest_seen
+            results[f"{side.lower()}_thesis_id"] = state.thesis_id
+            results[f"{side.lower()}_anchor_bar"] = state.anchor_bar
+            results[f"{side.lower()}_anchor_price"] = state.anchor_price
+            results[f"{side.lower()}_executed"] = state.executed
+            results[f"{side.lower()}_candidate_count"] = state.candidate_count
+            results[f"{side.lower()}_mtf_aligned"] = mtf_aligned
 
         ready_sides = [
             side for side in ("CALL", "PUT")
             if results.get(f"{side.lower()}_stage") == READY
+            and not results.get(f"{side.lower()}_executed", False)
             and (results.get(f"{side.lower()}_playbook") != "REVERSAL" or results.get(f"{side.lower()}_ready_retest_seen"))
         ]
         if len(ready_sides) == 1:
@@ -245,6 +288,17 @@ def update(symbol: str, data: dict[str, Any], now: datetime | None = None, *,
             results["ready_side"] = None
             results["reason"] = "no unique READY setup" if not ready_sides else "conflicting READY setups"
         return results
+
+
+def mark_executed(symbol: str, side: str, thesis_id: str | None = None) -> bool:
+    """Mark one Danny thesis as executed so repeated scans cannot re-enter it."""
+    key = (str(symbol or "").upper(), str(side or "").upper())
+    with _LOCK:
+        state = _STATES.get(key)
+        if state is None or (thesis_id and state.thesis_id != thesis_id):
+            return False
+        state.executed = True
+        return True
 
 
 def reset(symbol: str | None = None) -> None:
