@@ -359,6 +359,11 @@ DANNY_STATE_READY_WINDOW_MINUTES = int(os.getenv("DANNY_STATE_READY_WINDOW_MINUT
 ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "1"
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))  # take-profit at +20%
 STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.25"))  # emergency option-premium stop; thesis invalidation exits earlier
+# Pine-compatible underlying trade-plan levels. These are informational and
+# separate from the option-premium target/stop used by execution.
+UNDERLYING_TARGET_ATR = float(os.getenv("UNDERLYING_TARGET_ATR", "1.50"))
+UNDERLYING_STOP_ATR = float(os.getenv("UNDERLYING_STOP_ATR", "0.90"))
+UNDERLYING_THESIS_BUFFER_ATR = float(os.getenv("UNDERLYING_THESIS_BUFFER_ATR", "0.25"))
 # Adaptive exit profile (expectancy-focused, not trade-count suppression).
 PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "0.12"))
 PARTIAL_CLOSE_FRACTION = float(os.getenv("PARTIAL_CLOSE_FRACTION", "0.70"))
@@ -1983,6 +1988,43 @@ def adaptive_target_stop_pcts(data, score=None):
             stop = min(stop, max(0.01, MARGINAL_STOP_PCT))
 
     return target, stop
+
+
+def underlying_trade_plan(side, data):
+    """Return Pine-style underlying entry, thesis stop, and ATR target levels."""
+    data = data or {}
+    side = str(side or "").upper()
+    entry = _safe_float_num(data.get("price"), 0.0)
+    atr = _safe_float_num(data.get("atr14"), 0.0)
+    if side not in {"CALL", "PUT"} or entry <= 0 or atr <= 0:
+        return {"entry": entry, "stop": 0.0, "target": 0.0, "thesis_level": 0.0, "playbook": "UNKNOWN"}
+
+    danny_state = data.get("danny_state") or {}
+    level_key = "call_level" if side == "CALL" else "put_level"
+    playbook_key = "call_playbook" if side == "CALL" else "put_playbook"
+    thesis_level = _safe_float_num(danny_state.get(level_key), 0.0)
+    if thesis_level <= 0:
+        level_data = data.get("support_level") if side == "CALL" else data.get("resistance_level")
+        thesis_level = _safe_float_num((level_data or {}).get("level"), 0.0) if isinstance(level_data, dict) else 0.0
+
+    direction = 1.0 if side == "CALL" else -1.0
+    fallback_stop = entry - direction * atr * UNDERLYING_STOP_ATR
+    if side == "CALL" and 0 < thesis_level < entry:
+        thesis_stop = thesis_level - atr * UNDERLYING_THESIS_BUFFER_ATR
+        stop = max(thesis_stop, fallback_stop)
+    elif side == "PUT" and thesis_level > entry:
+        thesis_stop = thesis_level + atr * UNDERLYING_THESIS_BUFFER_ATR
+        stop = min(thesis_stop, fallback_stop)
+    else:
+        stop = fallback_stop
+
+    return {
+        "entry": entry,
+        "stop": stop,
+        "target": entry + direction * atr * UNDERLYING_TARGET_ATR,
+        "thesis_level": thesis_level,
+        "playbook": str(danny_state.get(playbook_key) or data.get("entry_playbook") or "UNKNOWN"),
+    }
 
 
 def runner_exit_profile_for_trade(signal, score, data, base_target_pct):
@@ -6410,6 +6452,7 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
     setup_type = str((data or {}).get("entry_playbook") or (data or {}).get("setup_type") or entry_timing or "UNKNOWN")
     ignition_delta = _safe_int_num((data or {}).get("ignition_delta", 0), 0)
     option_oi = _safe_int_num((option or {}).get("open_interest", 0), 0)
+    underlying_plan = underlying_trade_plan(side, data)
     return {
         "underlying": symbol,
         "signal":     signal,
@@ -6444,6 +6487,11 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "entry_momentum_quality": _safe_float_num((data or {}).get("momentum_quality", 0.0), 0.0),
         "entry_vol_ratio": _safe_float_num((data or {}).get("vol_ratio", 1.0), 1.0),
         "underlying_entry_price": underlying_entry_price,
+        "underlying_plan_entry": underlying_plan["entry"],
+        "underlying_plan_stop": underlying_plan["stop"],
+        "underlying_plan_target": underlying_plan["target"],
+        "underlying_thesis_level": underlying_plan["thesis_level"],
+        "underlying_playbook": underlying_plan["playbook"],
         "entry_bull_score": int((data or {}).get("bull_score", 0) or 0),
         "entry_bear_score": int((data or {}).get("bear_score", 0) or 0),
         "entry_delta_5m": delta_5m,
@@ -8994,6 +9042,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
 
     emoji = "\U0001f7e2" if side == "CALL" else "\U0001f534"
     header = f"\U0001f6a8 {emoji} **{symbol} {data['signal']}**"
+    underlying_plan = underlying_trade_plan(side, data)
 
     breakdown = data["bull_breakdown"] if side == "CALL" else data["bear_breakdown"]
     checklist = "\n".join(f"\u2705 {k} (+{v})" for k, v in breakdown.items()) or "(no positive components)"
@@ -9034,6 +9083,12 @@ Expiry: `{option['expiry']}` (DTE {option['dte']})
 Strike: `{option['strike']}`
 Bid/Ask/Last: `{option['bid']}` / `{option['ask']}` / `{option['last']}`
 Volume / OI: `{option['volume']}` / `{option['open_interest']}`
+
+**Underlying Trade Plan**
+Playbook: `{underlying_plan['playbook']}`
+Entry: `{underlying_plan['entry']:.2f}` | Thesis Level: `{underlying_plan['thesis_level']:.2f}`
+Stop: `{underlying_plan['stop']:.2f}` | T1: `{underlying_plan['target']:.2f}`
+Option target/stop remain separate: `{option['contract']}` premium risk management.
 
 **Score Components**
 {checklist}
