@@ -320,7 +320,10 @@ ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
 FORCE_MARKET_OPEN = os.getenv("FORCE_MARKET_OPEN", "0") == "1"
 GAINZ_ALGO_ENTRY_ENABLED = os.getenv("GAINZ_ALGO_ENTRY_ENABLED", "1") == "1"
 GAINZ_ALGO_PRE_ORDER_REVALIDATION_ENABLED = os.getenv("GAINZ_ALGO_PRE_ORDER_REVALIDATION_ENABLED", "1") == "1"
-GAINZ_ALGO_MAX_BAR_AGE_SECONDS = float(os.getenv("GAINZ_ALGO_MAX_BAR_AGE_SECONDS", "180"))
+GAINZ_ALGO_MAX_BAR_AGE_SECONDS = float(os.getenv(
+    "GAINZ_ALGO_MAX_BAR_AGE_SECONDS",
+    str(max(180, (BAR_MINUTES * 60) + POLL_SECONDS)) if SWING_STRATEGY_ENABLED else "180",
+))
 GAINZ_ALGO_PIVOT_LENGTH = int(os.getenv("GAINZ_ALGO_PIVOT_LENGTH", "5"))
 GAINZ_ALGO_MOMENTUM_THRESHOLD_PCT = float(os.getenv("GAINZ_ALGO_MOMENTUM_THRESHOLD_PCT", "0.01"))
 GAINZ_ALGO_MIN_OPPOSING_LEVEL_ATR = float(os.getenv("GAINZ_ALGO_MIN_OPPOSING_LEVEL_ATR", "0.50"))
@@ -7707,7 +7710,13 @@ def try_open_paper_trade(symbol, side, option, data):
         return False
 
     if GAINZ_ALGO_ENTRY_ENABLED and GAINZ_ALGO_PRE_ORDER_REVALIDATION_ENABLED:
-        latest_bars = fetch_1m_bars(_market_data_client, symbol) if _market_data_client is not None else None
+        latest_bars = (
+            fetch_bars(_market_data_client, symbol)
+            if SWING_STRATEGY_ENABLED and _market_data_client is not None
+            else fetch_1m_bars(_market_data_client, symbol)
+            if _market_data_client is not None
+            else None
+        )
         latest_side, latest_metrics = evaluate_gainz_algo(
             latest_bars,
             data.get("_gainz_bars_5m"),
@@ -8187,7 +8196,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
 
     side, data = analyze(bars, client, symbol)
     if GAINZ_ALGO_ENTRY_ENABLED:
-        gainz_bars = fetch_1m_bars(client, symbol)
+        gainz_bars = bars if SWING_STRATEGY_ENABLED else fetch_1m_bars(client, symbol)
         gainz_side, gainz_metrics = evaluate_gainz_algo(
             gainz_bars,
             bars,
