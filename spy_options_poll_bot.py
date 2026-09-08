@@ -140,6 +140,7 @@ OPENING_EXCEPTION_MIN_SIDE_DELTA_5M = int(os.getenv("OPENING_EXCEPTION_MIN_SIDE_
 OPENING_EXCEPTION_MIN_VOL_RATIO = float(os.getenv("OPENING_EXCEPTION_MIN_VOL_RATIO", "1.20"))
 CLOSING_NO_TRADE_MINUTES = max(0, int(os.getenv("CLOSING_NO_TRADE_MINUTES", "0" if SWING_STRATEGY_ENABLED else "60")))
 LOOKBACK_BARS = 120
+BAR_HISTORY_DAYS = int(os.getenv("BAR_HISTORY_DAYS", "20"))
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
 MIN_DTE = int(os.getenv("MIN_DTE", "7" if SWING_STRATEGY_ENABLED else "1"))
 MAX_DTE = int(os.getenv("MAX_DTE", "45" if SWING_STRATEGY_ENABLED else "3"))
@@ -4473,8 +4474,9 @@ def _alpaca_bar_timeframe():
 def fetch_bars(client, symbol):
     """Pull the most recent bars for ``symbol`` from Alpaca using a valid timeframe."""
     end = datetime.now(timezone.utc)
-    # 5 days back so a Monday start always captures the previous Friday's bars.
-    start = end - timedelta(days=5)
+    # Request enough calendar days to cover 55 regular-session hourly bars,
+    # including weekends and market holidays.
+    start = end - timedelta(days=BAR_HISTORY_DAYS)
 
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
