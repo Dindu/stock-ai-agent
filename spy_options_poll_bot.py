@@ -330,6 +330,16 @@ GAINZ_ALGO_MIN_OPPOSING_LEVEL_ATR = float(os.getenv("GAINZ_ALGO_MIN_OPPOSING_LEV
 # Danny-style sequential lifecycle. Danny READY is the sole setup authority;
 # the existing execution path remains responsible for contract, quote, sizing,
 # and risk validation after the staged evidence is ready.
+# DANNY_PAPER_MODE keeps the bot in paper/shadow execution by default while
+# leaving the original strategy available as a comparison mode.
+DANNY_PAPER_MODE = os.getenv("DANNY_PAPER_MODE", "1") == "1"
+if DANNY_PAPER_MODE:
+    os.environ.setdefault("ENABLE_ALPACA_PAPER_TRADING", "1")
+    os.environ.setdefault("DANNY_ONLY_ENTRY_MODE", "1")
+    os.environ.setdefault("DANNY_STATE_MACHINE_ENABLED", "1")
+    os.environ.setdefault("DANNY_STATE_MACHINE_GATE_ENTRIES", "1")
+    os.environ.setdefault("SWING_STRATEGY_ENABLED", "1")
+
 DANNY_STATE_MACHINE_ENABLED = os.getenv("DANNY_STATE_MACHINE_ENABLED", "1") == "1"
 DANNY_STATE_MACHINE_GATE_ENTRIES = os.getenv("DANNY_STATE_MACHINE_GATE_ENTRIES", "1") == "1"
 DANNY_ONLY_ENTRY_MODE = os.getenv("DANNY_ONLY_ENTRY_MODE", "1") == "1"
@@ -9046,6 +9056,8 @@ def main():
     # Always init TradingClient — needed for GetOptionContractsRequest even when paper
     # trading is disabled.  Order submission is gated separately by ENABLE_ALPACA_PAPER_TRADING.
     _trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+    if DANNY_PAPER_MODE:
+        log("Danny paper mode ENABLED — swing-only Danny strategy is running in shadow/paper execution by default.")
     if ENABLE_ALPACA_PAPER_TRADING:
         log("Paper trading ENABLED — Alpaca paper TradingClient initialized.")
     else:
