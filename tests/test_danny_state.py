@@ -70,3 +70,41 @@ def test_put_uses_resistance_side():
     )
     assert state["put_stage"] == danny_state.WATCHING
     assert state["put_level"] == 101.0
+
+
+def test_call_continuation_breakout_can_confirm_without_retest():
+    danny_state.reset("TEST_CONTINUATION")
+    start = datetime(2026, 9, 7, 14, 0, tzinfo=timezone.utc)
+
+    confirming = danny_state.update(
+        "TEST_CONTINUATION",
+        snapshot(
+            price=102.0,
+            vwap=100.0,
+            ema20=100.5,
+            recent_low=100.0,
+            recent_high=101.0,
+            support_level={"level": 100.0},
+            gainz_buy_breakout=True,
+            gainz_volume_ratio=1.0,
+        ),
+        start,
+    )
+    assert confirming["call_stage"] == danny_state.CONFIRMING
+
+    ready = danny_state.update(
+        "TEST_CONTINUATION",
+        snapshot(
+            price=102.2,
+            vwap=100.0,
+            ema20=100.5,
+            recent_low=100.0,
+            recent_high=102.0,
+            support_level={"level": 100.0},
+            gainz_buy_breakout=True,
+            gainz_volume_ratio=1.2,
+        ),
+        start + timedelta(minutes=1),
+    )
+    assert ready["call_stage"] == danny_state.READY
+    assert ready["ready_side"] == "CALL"

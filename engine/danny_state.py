@@ -141,6 +141,13 @@ def update(symbol: str, data: dict[str, Any], now: datetime | None = None, *,
             if state.stage == IDLE and near and authorized:
                 state.level = level
                 _transition(state, WATCHING, now)
+            elif state.stage == IDLE and authorized and aligned and structure and momentum:
+                # A continuation breakout can be valid even when price has already
+                # moved away from the nearest pullback level. Start confirmation
+                # without requiring a new support retest, while retaining the
+                # closed-bar volume confirmation on the next update.
+                state.level = price
+                _transition(state, CONFIRMING, now)
             elif state.stage == WATCHING and hold:
                 _transition(state, HOLDING, now)
             elif state.stage == HOLDING and (structure or (aligned and momentum)):
