@@ -4453,15 +4453,32 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
 # ---------------------------------------------------------------------------
 # Alpaca REST
 # ---------------------------------------------------------------------------
+def _alpaca_bar_timeframe():
+    """Return an Alpaca timeframe that respects API limits.
+
+    Alpaca allows minute bars only for 1-59 minutes; 60-minute bars must be
+    requested as 1-hour bars. Swing mode defaults to 60-minute bars, so we
+    translate them here instead of letting the bot crash on startup.
+    """
+    if BAR_MINUTES <= 0:
+        return TimeFrame(5, TimeFrameUnit.Minute)
+    if BAR_MINUTES < 60:
+        return TimeFrame(BAR_MINUTES, TimeFrameUnit.Minute)
+    hours, remainder = divmod(BAR_MINUTES, 60)
+    if remainder == 0:
+        return TimeFrame(hours, TimeFrameUnit.Hour)
+    return TimeFrame(1, TimeFrameUnit.Hour)
+
+
 def fetch_bars(client, symbol):
-    """Pull the most recent ~LOOKBACK_BARS 5-minute bars for ``symbol`` from Alpaca."""
+    """Pull the most recent bars for ``symbol`` from Alpaca using a valid timeframe."""
     end = datetime.now(timezone.utc)
     # 5 days back so a Monday start always captures the previous Friday's bars.
     start = end - timedelta(days=5)
 
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
-        timeframe=TimeFrame(BAR_MINUTES, TimeFrameUnit.Minute),
+        timeframe=_alpaca_bar_timeframe(),
         start=start,
         end=end,
         feed=DataFeed(FEED),
@@ -7059,7 +7076,7 @@ def _render_trade_candlestick_chart(trade, exit_price, closed_at):
         client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
         request = StockBarsRequest(
             symbol_or_symbols=symbol,
-            timeframe=TimeFrame(BAR_MINUTES, TimeFrameUnit.Minute),
+            timeframe=_alpaca_bar_timeframe(),
             start=opened_at.astimezone(timezone.utc) - timedelta(minutes=45),
             end=closed_at.astimezone(timezone.utc) + timedelta(minutes=5),
             feed=DataFeed(FEED),
