@@ -18,6 +18,7 @@ IDLE = "IDLE"
 @dataclass
 class SetupState:
     stage: str = IDLE
+    playbook: str = "REVERSAL"
     level: float | None = None
     started_at: datetime | None = None
     volume_confirmed: bool = False
@@ -68,6 +69,7 @@ def _resistance_level(data: dict[str, Any]) -> float | None:
 
 def _reset(state: SetupState) -> None:
     state.stage = IDLE
+    state.playbook = "REVERSAL"
     state.level = None
     state.started_at = None
     state.volume_confirmed = False
@@ -85,7 +87,7 @@ def _transition(state: SetupState, stage: str, now: datetime) -> None:
 
 
 def update(symbol: str, data: dict[str, Any], now: datetime | None = None, *,
-           watch_distance_atr: float = 0.75, invalidation_atr: float = 0.35,
+           watch_distance_atr: float = 1.25, invalidation_atr: float = 0.35,
            max_age_minutes: int = 30, ready_window_minutes: int = 8,
            min_score: float = 55.0, min_dominance: float = 8.0,
            min_structure: float = 8.0, min_momentum: float = 5.0,
@@ -134,20 +136,34 @@ def update(symbol: str, data: dict[str, Any], now: datetime | None = None, *,
                 else _number(data.get("gainz_price_change_pct")) < 0
             )
             volume = _number(data.get(volume_key), _number(data.get("vol_ratio"), 0.0)) >= min_volume_ratio
+            trend_strength = _number(
+                data.get("market_regime_score_bull" if side == "CALL" else "market_regime_score_bear"),
+                abs(_number(data.get("gainz_trend_strength"))),
+            )
+            trend_established = aligned and trend_strength >= 16.0
+            continuation_level = level
+            breakout = bool(data.get("fresh_breakout" if side == "CALL" else "fresh_breakdown"))
+            if not breakout:
+                breakout = bool(data.get(structure_key)) or bool(
+                    data.get("gainz_breakout" if side == "CALL" else "gainz_breakdown")
+                )
+            location_ok = not bool(data.get("bull_extended" if side == "CALL" else "bear_extended", False))
 
             if invalidated or age_expired or (state.stage == READY and ready_expired):
                 _reset(state)
 
-            if state.stage == IDLE and near and authorized:
-                state.level = level
+            if state.stage == IDLE and authorized and trend_established and continuation_level is not None and location_ok and near:
+                state.level = continuation_level
+                state.playbook = "TREND_PULLBACK"
                 _transition(state, WATCHING, now)
-            elif state.stage == IDLE and authorized and aligned and structure and momentum:
-                # A continuation breakout can be valid even when price has already
-                # moved away from the nearest pullback level. Start confirmation
-                # without requiring a new support retest, while retaining the
-                # closed-bar volume confirmation on the next update.
-                state.level = price
-                _transition(state, CONFIRMING, now)
+            elif state.stage == IDLE and authorized and breakout and location_ok:
+                state.level = level if level is not None else price
+                state.playbook = "BREAKOUT_RETEST"
+                _transition(state, WATCHING, now)
+            elif state.stage == IDLE and near and authorized:
+                state.level = level
+                state.playbook = "REVERSAL"
+                _transition(state, WATCHING, now)
             elif state.stage == WATCHING and hold:
                 _transition(state, HOLDING, now)
             elif state.stage == HOLDING and (structure or (aligned and momentum)):
@@ -158,6 +174,7 @@ def update(symbol: str, data: dict[str, Any], now: datetime | None = None, *,
                     _transition(state, READY, now)
 
             results[f"{side.lower()}_stage"] = state.stage
+            results[f"{side.lower()}_playbook"] = state.playbook
             results[f"{side.lower()}_level"] = state.level
             results[f"{side.lower()}_volume_confirmed"] = state.volume_confirmed
 

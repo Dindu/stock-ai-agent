@@ -20,6 +20,7 @@ def snapshot(**overrides):
         "gainz_buy_momentum_ok": True,
         "gainz_sell_momentum_ok": False,
         "gainz_volume_ratio": 1.0,
+        "gainz_trend_strength": 0.0,
     }
     data.update(overrides)
     return data
@@ -72,11 +73,11 @@ def test_put_uses_resistance_side():
     assert state["put_level"] == 101.0
 
 
-def test_call_continuation_breakout_can_confirm_without_retest():
+def test_call_breakout_retest_progresses_to_ready():
     danny_state.reset("TEST_CONTINUATION")
     start = datetime(2026, 9, 7, 14, 0, tzinfo=timezone.utc)
 
-    confirming = danny_state.update(
+    watching = danny_state.update(
         "TEST_CONTINUATION",
         snapshot(
             price=102.0,
@@ -89,6 +90,39 @@ def test_call_continuation_breakout_can_confirm_without_retest():
             gainz_volume_ratio=1.0,
         ),
         start,
+    )
+    assert watching["call_stage"] == danny_state.WATCHING
+    assert watching["call_playbook"] == "BREAKOUT_RETEST"
+
+    holding = danny_state.update(
+        "TEST_CONTINUATION",
+        snapshot(
+            price=101.0,
+            vwap=100.0,
+            ema20=100.5,
+            recent_low=100.0,
+            recent_high=102.0,
+            support_level={"level": 100.0},
+            gainz_buy_breakout=True,
+            gainz_volume_ratio=1.0,
+        ),
+        start + timedelta(minutes=1),
+    )
+    assert holding["call_stage"] == danny_state.HOLDING
+
+    confirming = danny_state.update(
+        "TEST_CONTINUATION",
+        snapshot(
+            price=102.0,
+            vwap=100.0,
+            ema20=100.5,
+            recent_low=100.0,
+            recent_high=102.0,
+            support_level={"level": 100.0},
+            gainz_buy_breakout=True,
+            gainz_volume_ratio=1.0,
+        ),
+        start + timedelta(minutes=2),
     )
     assert confirming["call_stage"] == danny_state.CONFIRMING
 
@@ -104,7 +138,7 @@ def test_call_continuation_breakout_can_confirm_without_retest():
             gainz_buy_breakout=True,
             gainz_volume_ratio=1.2,
         ),
-        start + timedelta(minutes=1),
+        start + timedelta(minutes=3),
     )
     assert ready["call_stage"] == danny_state.READY
     assert ready["ready_side"] == "CALL"
