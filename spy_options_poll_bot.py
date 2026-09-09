@@ -139,6 +139,37 @@ MAX_DTE = int(os.getenv("MAX_DTE", "3"))  # Primary DTE window (normally 1-3)
 FALLBACK_MAX_DTE = int(os.getenv("FALLBACK_MAX_DTE", "5"))  # If primary window has no tradeable contract, extend to 4-5 DTE
 VOLUME_MULTIPLIER = 1.5
 
+# ---------------------------------------------------------------------------
+# Swing strategy (multi-day holds, daily bars). Runs alongside the intraday
+# 5m scalping engine above — separate score/playbook/exit path entirely,
+# since VWAP and delta_5m are meaningless once a position is held overnight.
+# ---------------------------------------------------------------------------
+SWING_MODE = os.getenv("SWING_MODE", "1") == "1"
+SWING_MIN_DTE = int(os.getenv("SWING_MIN_DTE", "25"))    # ~monthly options
+SWING_MAX_DTE = int(os.getenv("SWING_MAX_DTE", "45"))
+SWING_FALLBACK_MAX_DTE = int(os.getenv("SWING_FALLBACK_MAX_DTE", "60"))
+SWING_SCAN_HOUR_CT = int(os.getenv("SWING_SCAN_HOUR_CT", "8"))     # once/day after open
+SWING_SCAN_MINUTE_CT = int(os.getenv("SWING_SCAN_MINUTE_CT", "45"))
+SWING_RECENT_HIGH_LOOKBACK_DAYS = int(os.getenv("SWING_RECENT_HIGH_LOOKBACK_DAYS", "20"))
+SWING_MIN_SCORE = int(os.getenv("SWING_MIN_SCORE", "65"))
+SWING_MIN_DOMINANCE = int(os.getenv("SWING_MIN_DOMINANCE", "15"))
+SWING_RSI_OVERBOUGHT = int(os.getenv("SWING_RSI_OVERBOUGHT", "75"))
+SWING_RSI_OVERSOLD = int(os.getenv("SWING_RSI_OVERSOLD", "25"))
+SWING_MAX_EXT_FROM_SMA20_ATR = float(os.getenv("SWING_MAX_EXT_FROM_SMA20_ATR", "2.5"))
+SWING_STRUCTURE_TOLERANCE_PCT = float(os.getenv("SWING_STRUCTURE_TOLERANCE_PCT", "0.01"))
+# Swing exits: wider target/stop than the intraday 20%/25% option-premium profile,
+# since a multi-day hold needs room for daily noise without stopping out early.
+SWING_PROFIT_TARGET_PCT = float(os.getenv("SWING_PROFIT_TARGET_PCT", "0.35"))
+SWING_STOP_LOSS_PCT = float(os.getenv("SWING_STOP_LOSS_PCT", "0.20"))
+SWING_PARTIAL_TP_PCT = float(os.getenv("SWING_PARTIAL_TP_PCT", "0.20"))
+SWING_PARTIAL_CLOSE_FRACTION = float(os.getenv("SWING_PARTIAL_CLOSE_FRACTION", "0.50"))
+SWING_TRAILING_STOP_GIVEBACK_PCT = float(os.getenv("SWING_TRAILING_STOP_GIVEBACK_PCT", "0.15"))
+# Target hold window is 7-14 days; MIN is advisory (other exits can still fire
+# earlier), MAX is the hard time-stop enforced in track_open_trades().
+SWING_MIN_HOLD_DAYS = int(os.getenv("SWING_MIN_HOLD_DAYS", "7"))
+SWING_MAX_HOLD_DAYS = int(os.getenv("SWING_MAX_HOLD_DAYS", "14"))
+SWING_MAX_OPEN_TRADES = int(os.getenv("SWING_MAX_OPEN_TRADES", "5"))
+
 # Scoring thresholds (0-100)
 SCORE_STRONG = int(os.getenv("SCORE_STRONG", "80"))   # STRONG CALL/PUT alert
 SCORE_SIGNAL = int(os.getenv("SCORE_SIGNAL", "65"))   # CALL/PUT alert
@@ -4033,20 +4064,247 @@ def _log_contract_data_quality(symbol, candidate):
         log(f"[{symbol}] Contract data quality logging failed (non-blocking): {e}")
 
 
-def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_from_vwap=None):
+# ---------------------------------------------------------------------------
+# Swing engine: daily-bar analysis, playbook, and exit thesis for multi-day
+# holds. Deliberately independent of the 5m intraday engine above — no VWAP
+# (session-reset is meaningless across an overnight gap) and no delta_5m
+# (score history isn't kept across days). Wired into the live loop via
+# run_symbol_swing() / maybe_run_swing_scan().
+# ---------------------------------------------------------------------------
+def fetch_daily_bars(client, symbol, lookback_days=280):
+    """Fetch daily bars for swing-timeframe analysis."""
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=int(lookback_days * 1.6) + 10)  # buffer for weekends/holidays
+    req = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame(1, TimeFrameUnit.Day),
+        start=start,
+        end=end,
+        feed=DataFeed(FEED),
+    )
+    daily = client.get_stock_bars(req).df
+    if daily is None or daily.empty:
+        return pd.DataFrame()
+    if isinstance(daily.index, pd.MultiIndex):
+        daily = daily.xs(symbol, level=0)
+    return daily.dropna()
+
+
+def calculate_swing_indicators(df):
+    """Daily-bar indicators for swing trading. No VWAP — see module note above."""
+    df = df.copy()
+    df["SMA20"] = df["close"].rolling(20).mean()
+    df["SMA50"] = df["close"].rolling(50).mean()
+    df["SMA200"] = df["close"].rolling(200).mean()
+    df["VOL_AVG20"] = df["volume"].rolling(20).mean()
+    df["RSI14"] = calculate_rsi(df["close"], period=14)
+    prev_close = df["close"].shift(1)
+    true_range = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    df["ATR14"] = true_range.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    return df
+
+
+def analyze_swing(df, symbol):
+    """Daily-bar swing score + playbook (breakout / pullback). Multi-day holds only.
+
+    Mirrors analyze()'s bull/bear scoring shape, but on daily bars with trend
+    (SMA20/50/200) replacing VWAP/EMA20/EMA50 as the structure reference.
+    """
+    if df is None or len(df) < 55:
+        return "NO TRADE", None
+
+    df = calculate_swing_indicators(df)
+    latest = df.iloc[-1]
+    previous = df.iloc[-2]
+
+    price = float(latest["close"])
+    open_ = float(latest["open"])
+    sma20 = float(latest["SMA20"]) if not pd.isna(latest["SMA20"]) else price
+    sma50 = float(latest["SMA50"]) if not pd.isna(latest["SMA50"]) else price
+    sma200 = float(latest["SMA200"]) if not pd.isna(latest["SMA200"]) else price
+    vol_avg = float(latest["VOL_AVG20"]) if not pd.isna(latest["VOL_AVG20"]) else 0.0
+    volume = float(latest["volume"])
+    rsi = float(latest["RSI14"]) if not pd.isna(latest["RSI14"]) else 50.0
+    atr14 = float(latest["ATR14"]) if not pd.isna(latest["ATR14"]) else 0.0
+    prev_close = float(previous["close"])
+
+    if vol_avg <= 0:
+        return "NO TRADE", None
+
+    bullish_candle = price > open_
+    bearish_candle = price < open_
+    vol_ratio = (volume / vol_avg) if vol_avg > 0 else 1.0
+
+    sma20_back = float(df["SMA20"].iloc[-6]) if len(df) >= 6 and not pd.isna(df["SMA20"].iloc[-6]) else sma20
+    sma20_rising = sma20 > sma20_back
+    sma20_falling = sma20 < sma20_back
+
+    lookback = min(SWING_RECENT_HIGH_LOOKBACK_DAYS, len(df) - 1)
+    recent_window = df.iloc[-(lookback + 1):-1]
+    recent_high = float(recent_window["high"].max()) if len(recent_window) else price
+    recent_low = float(recent_window["low"].min()) if len(recent_window) else price
+
+    fresh_breakout = prev_close <= recent_high and price > recent_high
+    fresh_breakdown = prev_close >= recent_low and price < recent_low
+
+    uptrend = price > sma20 > sma50
+    downtrend = price < sma20 < sma50
+
+    # Pullback: trend intact, price dipped to SMA20 in the last few sessions, reclaimed today.
+    pullback_window = df.iloc[-4:-1]
+    pullback_low = float(pullback_window["low"].min()) if len(pullback_window) else price
+    pullback_high = float(pullback_window["high"].max()) if len(pullback_window) else price
+    pullback_reclaim_call = uptrend and pullback_low <= sma20 * 1.01 and price > sma20 and bullish_candle
+    pullback_reclaim_put = downtrend and pullback_high >= sma20 * 0.99 and price < sma20 and bearish_candle
+
+    def _clamp01(x):
+        return max(0.0, min(1.0, float(x)))
+
+    trend_bull = (
+        (0.4 if price > sma20 else 0.0)
+        + (0.3 if price > sma50 else 0.0)
+        + (0.2 if sma20_rising else 0.0)
+        + (0.1 if price > sma200 else 0.0)
+    ) * 100.0
+    trend_bear = (
+        (0.4 if price < sma20 else 0.0)
+        + (0.3 if price < sma50 else 0.0)
+        + (0.2 if sma20_falling else 0.0)
+        + (0.1 if price < sma200 else 0.0)
+    ) * 100.0
+
+    momentum_bull = _clamp01((rsi - 50.0) / 25.0) * 100.0
+    momentum_bear = _clamp01((50.0 - rsi) / 25.0) * 100.0
+
+    volume_bull = _clamp01(vol_ratio / 1.5) * (100.0 if bullish_candle else 50.0)
+    volume_bear = _clamp01(vol_ratio / 1.5) * (100.0 if bearish_candle else 50.0)
+
+    pattern_bull = 100.0 if (fresh_breakout or pullback_reclaim_call) else (60.0 if uptrend else 0.0)
+    pattern_bear = 100.0 if (fresh_breakdown or pullback_reclaim_put) else (60.0 if downtrend else 0.0)
+
+    bull_score = max(0, min(100, int(round(trend_bull * 0.40 + momentum_bull * 0.20 + volume_bull * 0.15 + pattern_bull * 0.25))))
+    bear_score = max(0, min(100, int(round(trend_bear * 0.40 + momentum_bear * 0.20 + volume_bear * 0.15 + pattern_bear * 0.25))))
+    dominance = abs(bull_score - bear_score)
+
+    if bull_score >= bear_score:
+        side, side_score = "CALL", bull_score
+        playbook = "SWING_BREAKOUT" if fresh_breakout else ("SWING_PULLBACK" if pullback_reclaim_call else None)
+    else:
+        side, side_score = "PUT", bear_score
+        playbook = "SWING_BREAKOUT" if fresh_breakdown else ("SWING_PULLBACK" if pullback_reclaim_put else None)
+
+    if playbook is None or side_score < SWING_MIN_SCORE or dominance < SWING_MIN_DOMINANCE:
+        return "NO TRADE", None
+    if side == "CALL" and rsi >= SWING_RSI_OVERBOUGHT:
+        return "NO TRADE", None
+    if side == "PUT" and rsi <= SWING_RSI_OVERSOLD:
+        return "NO TRADE", None
+    if atr14 > 0 and (abs(price - sma20) / atr14) > SWING_MAX_EXT_FROM_SMA20_ATR:
+        return "NO TRADE", None
+
+    data = {
+        "symbol": symbol,
+        "price": price,
+        "side": side,
+        "signal": f"SWING {side}",
+        "entry_playbook": playbook,
+        "setup_type": playbook,
+        "bull_score": bull_score,
+        "bear_score": bear_score,
+        "dominance": dominance,
+        "sma20": sma20,
+        "sma50": sma50,
+        "sma200": sma200,
+        "rsi": rsi,
+        "atr14": atr14,
+        "recent_high": recent_high,
+        "recent_low": recent_low,
+        "vol_ratio": vol_ratio,
+        "strategy_mode": "SWING",
+    }
+    return side, data
+
+
+def _swing_thesis_state(trade):
+    """Daily-bar structure thesis for swing (multi-day) trades.
+
+    Wider tolerance than the intraday VWAP/EMA20 check — daily noise should not
+    invalidate a multi-day hold. Invalid only when price breaks both SMA50 AND
+    the recent swing high/low (structure + momentum both gone).
+    """
+    try:
+        symbol = str(trade.get("underlying", "") or "").upper()
+        side = str(trade.get("side", "") or "").upper()
+        if not symbol or side not in ("CALL", "PUT"):
+            return {"ready": False, "invalid": False, "reason": "MISSING TRADE CONTEXT", "price": 0.0}
+
+        client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        daily = fetch_daily_bars(client, symbol)
+        if daily is None or daily.empty or len(daily) < 55:
+            return {"ready": False, "invalid": False, "reason": "NO DAILY BARS", "price": 0.0}
+
+        df = calculate_swing_indicators(daily)
+        latest = df.iloc[-1]
+        price = _safe_float_num(latest.get("close"), 0.0)
+        sma50 = _safe_float_num(latest.get("SMA50"), price)
+        if price <= 0 or sma50 <= 0:
+            return {"ready": False, "invalid": False, "reason": "INVALID INDICATOR VALUES", "price": price}
+
+        lookback = min(SWING_RECENT_HIGH_LOOKBACK_DAYS, len(df) - 1)
+        swing_low = _safe_float_num(df["low"].iloc[-(lookback + 1):-1].min(), price)
+        swing_high = _safe_float_num(df["high"].iloc[-(lookback + 1):-1].max(), price)
+        tol = max(0.0, SWING_STRUCTURE_TOLERANCE_PCT)
+        base_state = {"ready": True, "price": price, "sma50": sma50}
+
+        if side == "CALL":
+            below_structure = price < (sma50 * (1.0 - tol))
+            swing_low_broken = price < (swing_low * (1.0 - tol))
+            if below_structure and swing_low_broken:
+                return {**base_state, "invalid": True, "reason": "SWING STRUCTURE BROKE (below SMA50 + swing low)"}
+            return {**base_state, "invalid": False, "reason": "SWING CALL THESIS INTACT"}
+
+        above_structure = price > (sma50 * (1.0 + tol))
+        swing_high_broken = price > (swing_high * (1.0 + tol))
+        if above_structure and swing_high_broken:
+            return {**base_state, "invalid": True, "reason": "SWING STRUCTURE BROKE (above SMA50 + swing high)"}
+        return {**base_state, "invalid": False, "reason": "SWING PUT THESIS INTACT"}
+    except Exception as e:
+        return {"ready": False, "invalid": False, "reason": f"SWING THESIS CHECK ERROR: {e}", "price": 0.0}
+
+
+def _intraday_target_expiry_dte(now=None):
+    """Weekly-options expiry rule for intraday entries: Mon/Tue -> this Friday,
+    Wed/Thu/Fri -> next Friday (avoids opening a position into a same-week
+    Wed-Fri expiry with too little time value left)."""
+    now = now or datetime.now(central)
+    today = now.date()
+    weekday = today.weekday()  # Mon=0 .. Sun=6
+    this_friday = today + timedelta(days=(4 - weekday) % 7)
+    target_friday = this_friday if weekday in (0, 1) else this_friday + timedelta(days=7)
+    return max(0, (target_friday - today).days)
+
+
+def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_from_vwap=None, min_dte=None, max_dte=None, fallback_max_dte=None):
     """Cached wrapper around ``_get_option_contract_uncached``.
 
     Short-lived cache only — never changes which contract is selected or rejected,
     it just avoids re-running the same expensive Alpaca chain/snapshot query within
     a few seconds of an identical prior search.
     """
+    primary_min_dte = MIN_DTE if min_dte is None else int(min_dte)
+    primary_max_dte = MAX_DTE if max_dte is None else int(max_dte)
+    effective_fallback_max_dte = FALLBACK_MAX_DTE if fallback_max_dte is None else int(fallback_max_dte)
     if not OPTION_SEARCH_CACHE_ENABLED:
-        primary = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=MIN_DTE, search_max_dte=MAX_DTE)
-        if primary is not None or FALLBACK_MAX_DTE <= MAX_DTE:
+        primary = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=primary_min_dte, search_max_dte=primary_max_dte)
+        if primary is not None or effective_fallback_max_dte <= primary_max_dte:
             return primary
-        fallback_min = max(MIN_DTE, MAX_DTE + 1)
-        log(f"[{symbol}] No tradeable contract in {MIN_DTE}-{MAX_DTE} DTE; extending search to {fallback_min}-{FALLBACK_MAX_DTE} DTE.")
-        return _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=fallback_min, search_max_dte=FALLBACK_MAX_DTE)
+        fallback_min = max(primary_min_dte, primary_max_dte + 1)
+        log(f"[{symbol}] No tradeable contract in {primary_min_dte}-{primary_max_dte} DTE; extending search to {fallback_min}-{effective_fallback_max_dte} DTE.")
+        return _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=fallback_min, search_max_dte=effective_fallback_max_dte)
 
     setup_type = str((data or {}).get("entry_playbook", "") or (data or {}).get("setup_type", "") or "")
     bar_time = (data or {}).get("bar_time")
@@ -4060,11 +4318,11 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
         log(f"[{symbol}] Contract search cache hit ({signal}) — reusing result from {(now - cached['cached_at']).total_seconds():.0f}s ago.")
         return cached["result"]
 
-    result = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=MIN_DTE, search_max_dte=MAX_DTE)
-    if result is None and FALLBACK_MAX_DTE > MAX_DTE:
-        fallback_min = max(MIN_DTE, MAX_DTE + 1)
-        log(f"[{symbol}] No tradeable contract in {MIN_DTE}-{MAX_DTE} DTE; extending search to {fallback_min}-{FALLBACK_MAX_DTE} DTE.")
-        result = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=fallback_min, search_max_dte=FALLBACK_MAX_DTE)
+    result = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=primary_min_dte, search_max_dte=primary_max_dte)
+    if result is None and effective_fallback_max_dte > primary_max_dte:
+        fallback_min = max(primary_min_dte, primary_max_dte + 1)
+        log(f"[{symbol}] No tradeable contract in {primary_min_dte}-{primary_max_dte} DTE; extending search to {fallback_min}-{effective_fallback_max_dte} DTE.")
+        result = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=fallback_min, search_max_dte=effective_fallback_max_dte)
     is_negative = result is None
     ttl_seconds = OPTION_SEARCH_NEGATIVE_CACHE_TTL_SECONDS if is_negative else OPTION_SEARCH_CACHE_TTL_SECONDS
     if is_negative:
@@ -6364,15 +6622,26 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
     """Build a trade record using the actual Alpaca fill price (never a yfinance estimate)."""
     entry_price = fill_price
     side = option.get("side", signal.split()[-1])  # "CALL" or "PUT"
-    target_pct, stop_pct = adaptive_target_stop_pcts(data or {}, score=score)
-    runner_profile = runner_exit_profile_for_trade(signal, score, data or {}, target_pct)
-    target_pct = float(runner_profile.get("target_pct", target_pct))
-    partial_tp_pct = float(runner_profile.get("partial_tp_pct", PARTIAL_TP_PCT))
-    partial_close_fraction = float(runner_profile.get("partial_close_fraction", PARTIAL_CLOSE_FRACTION))
-    trailing_giveback_pct = float(runner_profile.get("trailing_giveback_pct", TRAILING_STOP_GIVEBACK_PCT))
+    is_swing = str((data or {}).get("strategy_mode", "") or "").upper() == "SWING"
+    if is_swing:
+        target_pct = SWING_PROFIT_TARGET_PCT
+        stop_pct = SWING_STOP_LOSS_PCT
+        partial_tp_pct = SWING_PARTIAL_TP_PCT
+        partial_close_fraction = SWING_PARTIAL_CLOSE_FRACTION
+        trailing_giveback_pct = SWING_TRAILING_STOP_GIVEBACK_PCT
+        max_hold_minutes = SWING_MAX_HOLD_DAYS * 1440
+        runner_profile = {}
+    else:
+        target_pct, stop_pct = adaptive_target_stop_pcts(data or {}, score=score)
+        runner_profile = runner_exit_profile_for_trade(signal, score, data or {}, target_pct)
+        target_pct = float(runner_profile.get("target_pct", target_pct))
+        partial_tp_pct = float(runner_profile.get("partial_tp_pct", PARTIAL_TP_PCT))
+        partial_close_fraction = float(runner_profile.get("partial_close_fraction", PARTIAL_CLOSE_FRACTION))
+        trailing_giveback_pct = float(runner_profile.get("trailing_giveback_pct", TRAILING_STOP_GIVEBACK_PCT))
+        max_hold_minutes = MAX_TRADE_HOLD_MINUTES
     underlying_entry_price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
-    delta_5m, delta_10m = _score_trend_deltas(data or {}, side)
-    entry_timing = _classify_entry_timing(data or {}, side)
+    delta_5m, delta_10m = (None, None) if is_swing else _score_trend_deltas(data or {}, side)
+    entry_timing = (str((data or {}).get("entry_playbook", "") or "SWING")) if is_swing else _classify_entry_timing(data or {}, side)
     setup_type = str((data or {}).get("entry_playbook") or (data or {}).get("setup_type") or entry_timing or "UNKNOWN")
     ignition_delta = _safe_int_num((data or {}).get("ignition_delta", 0), 0)
     option_oi = _safe_int_num((option or {}).get("open_interest", 0), 0)
@@ -6389,6 +6658,8 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "stop":       entry_price * (1 - stop_pct),
         "target_pct": target_pct,
         "stop_pct":   stop_pct,
+        "strategy_mode": "SWING" if is_swing else "INTRADAY",
+        "max_hold_minutes": max_hold_minutes,
         "score":      score,
         "max_pnl_pct": 0.0,
         "min_pnl_pct": 0.0,
@@ -6904,7 +7175,8 @@ def track_open_trades():
         held_minutes = max(1, int((datetime.now(central) - trade.get("opened_at", datetime.now(central))).total_seconds() // 60))
 
         # 1) Primary exit: underlying thesis invalidation (not option PnL).
-        thesis_state = _underlying_thesis_state(trade)
+        is_swing_trade = str(trade.get("strategy_mode", "") or "").upper() == "SWING"
+        thesis_state = _swing_thesis_state(trade) if is_swing_trade else _underlying_thesis_state(trade)
         if thesis_state.get("ready"):
             trade["thesis_data_fail_count"] = 0
             # Track underlying MFE/MAE independently of option premium.
@@ -7001,7 +7273,8 @@ def track_open_trades():
             continue
 
         # 5) Time stop: if the trade has sat too long, exit to avoid prolonged theta decay.
-        if MAX_TRADE_HOLD_MINUTES > 0 and held_minutes >= MAX_TRADE_HOLD_MINUTES:
+        effective_max_hold_minutes = float(trade.get("max_hold_minutes", MAX_TRADE_HOLD_MINUTES) or MAX_TRADE_HOLD_MINUTES)
+        if effective_max_hold_minutes > 0 and held_minutes >= effective_max_hold_minutes:
             close_trade(trade, current_price, f"TIME EXIT ({held_minutes}m)", pnl_pct)
             continue
 
@@ -7871,6 +8144,85 @@ def try_open_paper_trade(symbol, side, option, data):
 
 
 # ---------------------------------------------------------------------------
+# Swing scan orchestration: runs once/day (see SWING_SCAN_HOUR_CT/MINUTE_CT),
+# independent of the 5m intraday scan loop below.
+# ---------------------------------------------------------------------------
+_swing_scan_state = {"date": None}
+
+
+def run_symbol_swing(client, symbol):
+    """Evaluate one symbol for a swing (multi-day) entry using daily bars."""
+    try:
+        daily = fetch_daily_bars(client, symbol)
+    except Exception as e:
+        log(f"[{symbol}] Swing scan: daily bar fetch failed: {e}")
+        return
+    side, data = analyze_swing(daily, symbol)
+    if side == "NO TRADE" or not data:
+        return
+
+    swing_open_count = sum(
+        1 for t in _open_trades.values()
+        if str(t.get("strategy_mode", "") or "").upper() == "SWING"
+    )
+    if swing_open_count >= SWING_MAX_OPEN_TRADES:
+        log(f"[{symbol}] Swing capacity full ({swing_open_count}/{SWING_MAX_OPEN_TRADES}) — skipping.")
+        return
+    if SINGLE_POSITION_PER_SYMBOL:
+        already_open, detail = has_open_underlying_position(symbol, side)
+        if already_open:
+            log(f"[{symbol}] Swing: existing {side} position detected ({detail}) — skipping.")
+            return
+
+    log(
+        f"[{symbol}] SWING {side} candidate | {data.get('entry_playbook')} "
+        f"BULL {data['bull_score']} BEAR {data['bear_score']} price ${data['price']:.2f}"
+    )
+
+    option = get_option_contract(
+        symbol, f"SWING {side}", data["price"], data=None, max_ext_from_vwap=None,
+        min_dte=SWING_MIN_DTE, max_dte=SWING_MAX_DTE, fallback_max_dte=SWING_FALLBACK_MAX_DTE,
+    )
+    if option is None:
+        log(f"[{symbol}] Swing: no tradeable option contract found in {SWING_MIN_DTE}-{SWING_MAX_DTE} DTE window.")
+        return
+
+    try:
+        try_open_paper_trade(symbol, side, option, data)
+    except Exception:
+        log(f"[{symbol}] Swing entry execution error:")
+        traceback.print_exc()
+        sys.stdout.flush()
+
+
+def maybe_run_swing_scan(client, now_ct=None):
+    """Run the swing scan at most once per trading day, near market open."""
+    if not SWING_MODE:
+        return
+    now_ct = now_ct or datetime.now(central)
+    today = now_ct.date()
+    if _swing_scan_state["date"] == today:
+        return
+    target_time = now_ct.replace(
+        hour=max(0, min(23, SWING_SCAN_HOUR_CT)),
+        minute=max(0, min(59, SWING_SCAN_MINUTE_CT)),
+        second=0, microsecond=0,
+    )
+    if now_ct < target_time:
+        return
+    _swing_scan_state["date"] = today
+    log(f"[SWING] Daily scan starting for {len(SYMBOLS)} symbol(s).")
+    for symbol in list(SYMBOLS):
+        try:
+            run_symbol_swing(client, symbol)
+        except Exception:
+            log(f"[{symbol}] Swing scan error:")
+            traceback.print_exc()
+            sys.stdout.flush()
+    log("[SWING] Daily scan complete.")
+
+
+# ---------------------------------------------------------------------------
 # main loop
 # ---------------------------------------------------------------------------
 def run_cycle(client):
@@ -7945,6 +8297,11 @@ def run_cycle(client):
         maybe_send_midday_briefing(client, datetime.now(central))
     except Exception as e:
         log(f"Midday briefing error: {e}")
+
+    try:
+        maybe_run_swing_scan(client, datetime.now(central))
+    except Exception as e:
+        log(f"Swing scan error: {e}")
 
     if ENABLE_SCAN_TIMING_LOGS:
         total_ms = (time.perf_counter() - cycle_started_at) * 1000.0
@@ -8120,6 +8477,11 @@ def run_websocket_cycle(client):
             maybe_send_midday_briefing(client, datetime.now(central))
         except Exception as e:
             log(f"Midday briefing error: {e}")
+
+        try:
+            maybe_run_swing_scan(client, now_ct)
+        except Exception as e:
+            log(f"Swing scan error: {e}")
 
         time.sleep(loop_sleep)
 
@@ -8677,17 +9039,21 @@ def run_symbol(client, symbol, prefetched_bars=None):
 
     log_v2_pre_contract_components(symbol, side, data)
 
+    weekly_expiry_dte = _intraday_target_expiry_dte(now_ct)
     option = get_option_contract(
         symbol,
         side,
         data["price"],
         data=data,
         max_ext_from_vwap=max_ext_from_vwap,
+        min_dte=weekly_expiry_dte,
+        max_dte=weekly_expiry_dte,
+        fallback_max_dte=weekly_expiry_dte + 3,
     )
     if not option:
         if (not NO_GATING_MODE) and ALERT_ONLY_COOLDOWN_MINUTES > 0:
             _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
-        log(f"[{symbol}] {data['signal']} setup detected, but no valid 1DTE+ option found — skipping (real trades only).")
+        log(f"[{symbol}] {data['signal']} setup detected, but no valid weekly-expiry ({weekly_expiry_dte} DTE) option found — skipping (real trades only).")
         return
 
     if str((option or {}).get("_selection_mode", "")).upper() == "RELAXED_FALLBACK":
