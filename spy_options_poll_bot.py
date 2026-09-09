@@ -9133,7 +9133,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     # Same bypass rationale as the TradingView path: old score/playbook/ignition/
     # V2 thesis gates are deliberately skipped here, only execution-safety checks apply.
     if ULTI_ENTRY_ENABLED and data:
-        ulti_event = _ulti_entry_signal_for_symbol(client, symbol, prefetched_bars if prefetched_bars is not None else bars)
+        ulti_event = _ulti_entry_signal_for_symbol(client, symbol, bars)
         if ulti_event is not None:
             ulti_candidate = _ulti_build_entry_candidate(symbol, data, ulti_event, max_ext_from_vwap)
             if ulti_candidate is None:
