@@ -6543,6 +6543,7 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "underlying_thesis_level": underlying_plan["thesis_level"],
         "underlying_playbook": underlying_plan["playbook"],
         "danny_playbook": str((data or {}).get("entry_playbook", "UNKNOWN") or "UNKNOWN"),
+        "danny_entry_path": str((data or {}).get("danny_entry_path", "") or ""),
         "danny_thesis_id": str((data or {}).get("danny_state", {}).get("call_thesis_id" if side == "CALL" else "put_thesis_id", "") or ""),
         "danny_setup_state": str((data or {}).get("danny_stage", "UNKNOWN") or "UNKNOWN"),
         "danny_anchor_price": _safe_float_num((data or {}).get("danny_state", {}).get("call_anchor_price" if side == "CALL" else "put_anchor_price"), 0.0),
@@ -8460,18 +8461,23 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 else danny_state.get("put_stage") if side == "PUT"
                 else danny_state.get("call_stage") or danny_state.get("put_stage")
             )
-            data["danny_ready_side"] = danny_state.get("ready_side")
-            if danny_state.get("ready_side") in {"CALL", "PUT"}:
-                side = danny_state["ready_side"]
+            data["danny_ready_side"] = danny_state.get("entry_side") or danny_state.get("ready_side")
+            data["danny_entry_path"] = danny_state.get("entry_path", "")
+            if data["danny_ready_side"] in {"CALL", "PUT"}:
+                side = data["danny_ready_side"]
                 data["signal"] = side
                 playbook_key = "call_playbook" if side == "CALL" else "put_playbook"
-                danny_playbook = str(danny_state.get(playbook_key) or "REVERSAL").upper()
+                danny_playbook = str(
+                    danny_state.get("entry_playbook") or danny_state.get(playbook_key) or "REVERSAL"
+                ).upper()
                 data["entry_playbook"] = danny_playbook
                 data["setup_type"] = danny_playbook
             log(
                 f"[{symbol}] Danny lifecycle: CALL={danny_state.get('call_stage', 'IDLE')} "
                 f"PUT={danny_state.get('put_stage', 'IDLE')} "
-                f"ready={danny_state.get('ready_side') or 'NONE'} "
+                f"LB={danny_state.get('call_lb_stage', 'IDLE')}/{danny_state.get('put_lb_stage', 'IDLE')} "
+                f"entry={data['danny_ready_side'] or 'NONE'} "
+                f"path={danny_state.get('entry_path') or 'NONE'} "
                 f"mtf={data.get('mtf_score', 'NA')}"
             )
 
@@ -8484,8 +8490,8 @@ def run_symbol(client, symbol, prefetched_bars=None):
         ready_side = str((data or {}).get("danny_ready_side") or "").upper()
         if ready_side != str(side or "").upper():
             log(
-                f"[{symbol}] Danny sequential gate: {side} is not READY "
-                f"(current={ready_side or 'NONE'}); entry blocked until READY."
+                f"[{symbol}] Danny sequential gate: {side} has no executable setup "
+                f"(current={ready_side or 'NONE'}); entry blocked."
             )
             _record_entry_block("danny_state")
             return
