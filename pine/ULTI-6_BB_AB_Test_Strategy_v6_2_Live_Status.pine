@@ -1,0 +1,927 @@
+//@version=6
+strategy("ULTI-6 | BB A-B-C Test v5", shorttitle="ULTI6 BB TEST v5", overlay=true, max_labels_count=200, max_lines_count=80, max_boxes_count=60, calc_bars_count=2000, pyramiding=0, process_orders_on_close=true)
+
+// ============================================================================
+// VISUAL-ONLY MERGE: no unified/confluence trading decision is intended.
+// Each component is displayed independently. Flux/PAT remains a public-feature
+// approximation because the invite-only proprietary source is unavailable.
+// ============================================================================
+// ULTI-6 CLEAN TRADING MODE
+// Components:
+// 1 EMA + smoothing/BB
+// 2 VWAP + bands
+// 3 Smart Money / Gainz-style MTF structure, momentum, volume, breakout
+// 4 Poki: SAR, regression, BB levels, Renko-style direction, Hull/WMA
+// 5 Basic volume
+// 6 Flux Charts PAT public-feature approximation: FVG/IFVG, OB/Breaker,
+//   BOS/CHoCH/CHoCH+, EQH/EQL, liquidity, premium/discount, MTF levels,
+//   volume imbalance, sessions, trendlines.
+// IMPORTANT: Flux Charts PAT is invite-only/proprietary. This section is a
+// native approximation of publicly documented concepts, not proprietary code.
+// ============================================================================
+
+// -----------------------------------------------------------------------------
+// 0. MASTER / DISPLAY
+// -----------------------------------------------------------------------------
+grpMaster = "0. Master Controls"
+displayMode = input.string("FULL ANALYSIS", "Display Mode", options=["TRADING MODE", "FULL ANALYSIS"], group=grpMaster)
+showDashboard = input.bool(false, "Show compact dashboard", group=grpMaster)
+cleanTradeView = input.bool(true, "Clean trade view (Entry/Exit/Forming/Ready only)", group=grpMaster)
+showEMA = input.bool(false, "Show EMA", group=grpMaster)
+showVWAP = input.bool(false, "Show VWAP", group=grpMaster)
+showKeyLevels = input.bool(false, "Show key price levels", group=grpMaster)
+useConfluence = input.bool(false, "Require confluence", group=grpMaster)
+minConfluence = input.int(70, "Minimum confluence score", minval=0, maxval=100, group=grpMaster)
+confirmedOnly = input.bool(true, "Confirmed bars only", group=grpMaster)
+signalOnChangeOnly = input.bool(true, "One unified signal per score transition", group=grpMaster)
+showSignalScore = input.bool(false, "Show score on unified signal", group=grpMaster)
+
+// -----------------------------------------------------------------------------
+// 0B. TRADINGVIEW WEBHOOK
+// -----------------------------------------------------------------------------
+grpWebhook = "0B. TradingView Webhook"
+webhookEnabled = input.bool(false, "Enable lifecycle webhook alerts", group=grpWebhook)
+// SECURITY: keep this default empty in committed source. Set the secret only in
+// the TradingView strategy settings for the chart that owns the alert.
+webhookSecret = input.string("", "Webhook secret", group=grpWebhook)
+webhookStrategy = input.string("ULTI6", "Strategy name", group=grpWebhook)
+webhookStrategyVersion = input.string("6.2", "Strategy version", group=grpWebhook)
+
+f_webhook(eventName, sideName, px, setupType, reasonCode, reasonText) =>
+    if webhookEnabled and str.length(webhookSecret) > 0
+        barIso = str.format_time(time_close, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
+        signalId = webhookStrategy + "-" + syminfo.ticker + "-" + timeframe.period + "-" + str.tostring(time_close) + "-" + sideName + "-" + eventName
+        msg = "{\"schema_version\":1,\"strategy\":\"" + webhookStrategy + "\",\"strategy_version\":\"" + webhookStrategyVersion + "\",\"strategy_mode\":\"INTRADAY\",\"event\":\"" + eventName + "\",\"side\":\"" + sideName + "\",\"symbol\":\"" + syminfo.ticker + "\",\"timeframe\":\"" + timeframe.period + "\",\"bar_time\":\"" + barIso + "\",\"underlying_price\":" + str.tostring(px) + ",\"setup_type\":\"" + setupType + "\",\"reason_code\":\"" + reasonCode + "\",\"reason\":\"" + reasonText + "\",\"signal_id\":\"" + signalId + "\",\"secret\":\"" + webhookSecret + "\"}"
+        alert(msg, alert.freq_all)
+
+isFull = displayMode == "FULL ANALYSIS" and not cleanTradeView
+analysisRecentBars = input.int(500, "Full-analysis object lookback (bars)", minval=100, maxval=2000, group=grpMaster)
+allowObjects = isFull and bar_index >= math.max(0, last_bar_index - analysisRecentBars)
+
+// -----------------------------------------------------------------------------
+// 1. EMA
+// -----------------------------------------------------------------------------
+grpEMA = "1. EMA"
+emaLen = input.int(9, minval=1, title="Length", group=grpEMA)
+emaSrc = input.source(close, "Source", group=grpEMA)
+emaOffset = input.int(0, "Offset", minval=-500, maxval=500, group=grpEMA)
+emaSmoothType = input.string("None", "Smoothing Type", options=["None", "SMA", "SMA + Bollinger Bands", "EMA", "SMMA (RMA)", "WMA", "VWMA"], group=grpEMA)
+emaSmoothLen = input.int(14, "Smoothing Length", minval=1, group=grpEMA)
+emaBBMult = input.float(2.0, "Smoothing BB StdDev", minval=0.001, maxval=50, step=0.5, group=grpEMA)
+emaValue = ta.ema(emaSrc, emaLen)
+emaSmooth = switch emaSmoothType
+    "SMA" => ta.sma(emaValue, emaSmoothLen)
+    "SMA + Bollinger Bands" => ta.sma(emaValue, emaSmoothLen)
+    "EMA" => ta.ema(emaValue, emaSmoothLen)
+    "SMMA (RMA)" => ta.rma(emaValue, emaSmoothLen)
+    "WMA" => ta.wma(emaValue, emaSmoothLen)
+    "VWMA" => ta.vwma(emaValue, emaSmoothLen)
+    => na
+emaBBDev = emaSmoothType == "SMA + Bollinger Bands" ? ta.stdev(emaValue, emaSmoothLen) * emaBBMult : na
+plot(showEMA ? emaValue : na, "EMA", color=color.blue, offset=emaOffset, linewidth=2)
+plot(isFull and showEMA and emaSmoothType != "None" ? emaSmooth : na, "EMA Smoothing", color=color.yellow)
+emaBBU = plot(isFull and showEMA and emaSmoothType == "SMA + Bollinger Bands" ? emaSmooth + emaBBDev : na, "EMA BB Upper", color=color.green)
+emaBBL = plot(isFull and showEMA and emaSmoothType == "SMA + Bollinger Bands" ? emaSmooth - emaBBDev : na, "EMA BB Lower", color=color.green)
+fill(emaBBU, emaBBL, color=isFull ? color.new(color.green, 90) : na)
+
+// -----------------------------------------------------------------------------
+// 2. VWAP
+// -----------------------------------------------------------------------------
+grpVWAP = "2. VWAP"
+hideVWAPDWM = input.bool(false, "Hide VWAP on 1D or above", group=grpVWAP)
+vwapAnchor = input.string("Session", "Anchor Period", options=["Session", "Week", "Month", "Quarter", "Year", "Decade", "Century", "Earnings", "Dividends", "Splits"], group=grpVWAP)
+vwapSrc = input.source(hlc3, "Source", group=grpVWAP)
+vwapOffset = input.int(0, "Offset", group=grpVWAP)
+vwapCalcMode = input.string("Standard Deviation", "Bands Calculation Mode", options=["Standard Deviation", "Percentage"], group=grpVWAP)
+vwapShow1 = input.bool(true, "Band #1", group=grpVWAP)
+vwapMult1 = input.float(1.0, "Band #1 Multiplier", minval=0, step=0.5, group=grpVWAP)
+vwapShow2 = input.bool(false, "Band #2", group=grpVWAP)
+vwapMult2 = input.float(2.0, "Band #2 Multiplier", minval=0, step=0.5, group=grpVWAP)
+vwapShow3 = input.bool(false, "Band #3", group=grpVWAP)
+vwapMult3 = input.float(3.0, "Band #3 Multiplier", minval=0, step=0.5, group=grpVWAP)
+
+cumVolume = ta.cum(nz(volume, 0))
+isNewVWAPPeriod = switch vwapAnchor
+    "Session" => timeframe.change("D")
+    "Week" => timeframe.change("W")
+    "Month" => timeframe.change("M")
+    "Quarter" => timeframe.change("3M")
+    "Year" => timeframe.change("12M")
+    "Decade" => timeframe.change("12M") and year % 10 == 0
+    "Century" => timeframe.change("12M") and year % 100 == 0
+    "Earnings" => not na(request.earnings(syminfo.tickerid, earnings.actual, barmerge.gaps_on, barmerge.lookahead_on, ignore_invalid_symbol=true)) or not na(request.earnings(syminfo.tickerid, earnings.standardized, barmerge.gaps_on, barmerge.lookahead_on, ignore_invalid_symbol=true))
+    "Dividends" => not na(request.dividends(syminfo.tickerid, dividends.gross, barmerge.gaps_on, barmerge.lookahead_on, ignore_invalid_symbol=true))
+    "Splits" => not na(request.splits(syminfo.tickerid, splits.denominator, barmerge.gaps_on, barmerge.lookahead_on, ignore_invalid_symbol=true))
+    => false
+isEventAnchor = vwapAnchor == "Earnings" or vwapAnchor == "Dividends" or vwapAnchor == "Splits"
+if na(vwapSrc[1]) and not isEventAnchor
+    isNewVWAPPeriod := true
+
+float vwapValue = na
+float vwapUpper1 = na
+float vwapLower1 = na
+float vwapUpper2 = na
+float vwapLower2 = na
+float vwapUpper3 = na
+float vwapLower3 = na
+if not (hideVWAPDWM and timeframe.isdwm)
+    [vwapCalc, vwapStdevUpper, _] = ta.vwap(vwapSrc, isNewVWAPPeriod, 1)
+    vwapValue := vwapCalc
+    vwapStdevAbs = vwapStdevUpper - vwapCalc
+    vwapBasis = vwapCalcMode == "Standard Deviation" ? vwapStdevAbs : vwapCalc * 0.01
+    vwapUpper1 := vwapCalc + vwapBasis * vwapMult1
+    vwapLower1 := vwapCalc - vwapBasis * vwapMult1
+    vwapUpper2 := vwapCalc + vwapBasis * vwapMult2
+    vwapLower2 := vwapCalc - vwapBasis * vwapMult2
+    vwapUpper3 := vwapCalc + vwapBasis * vwapMult3
+    vwapLower3 := vwapCalc - vwapBasis * vwapMult3
+
+plot(showVWAP ? vwapValue : na, "VWAP", color=#2962FF, offset=vwapOffset, linewidth=2)
+vwU1 = plot(isFull and showVWAP and vwapShow1 ? vwapUpper1 : na, "VWAP Upper 1", color=color.green, offset=vwapOffset)
+vwL1 = plot(isFull and showVWAP and vwapShow1 ? vwapLower1 : na, "VWAP Lower 1", color=color.green, offset=vwapOffset)
+fill(vwU1, vwL1, color=isFull ? color.new(color.green, 95) : na)
+vwU2 = plot(isFull and showVWAP and vwapShow2 ? vwapUpper2 : na, "VWAP Upper 2", color=color.olive, offset=vwapOffset)
+vwL2 = plot(isFull and showVWAP and vwapShow2 ? vwapLower2 : na, "VWAP Lower 2", color=color.olive, offset=vwapOffset)
+fill(vwU2, vwL2, color=isFull ? color.new(color.olive, 95) : na)
+vwU3 = plot(isFull and showVWAP and vwapShow3 ? vwapUpper3 : na, "VWAP Upper 3", color=color.teal, offset=vwapOffset)
+vwL3 = plot(isFull and showVWAP and vwapShow3 ? vwapLower3 : na, "VWAP Lower 3", color=color.teal, offset=vwapOffset)
+fill(vwU3, vwL3, color=isFull ? color.new(color.teal, 95) : na)
+
+// -----------------------------------------------------------------------------
+// 3. SMART MONEY / GAINZ
+// -----------------------------------------------------------------------------
+grpSMC = "3. Smart Money / Gainz"
+smcPivotLen = input.int(5, "Pivot Length", minval=1, maxval=20, group=grpSMC)
+smcMomentumBase = input.float(0.01, "Base Momentum Threshold (%)", minval=0.001, maxval=1.0, step=0.001, group=grpSMC)
+smcMinSignalDistance = input.int(5, "Min Signal Distance", minval=1, maxval=50, group=grpSMC)
+smcShortPeriod = input.int(30, "Short Trend Period", minval=10, maxval=100, group=grpSMC)
+smcLongPeriod = input.int(100, "Long Trend Period", minval=50, maxval=200, group=grpSMC)
+smcUseMomentum = input.bool(true, "Use Momentum Filter", group=grpSMC)
+smcUseTrend = input.bool(true, "Use Higher TF Trend Filter", group=grpSMC)
+smcHigherTF = input.string("5M", "Higher Timeframe", options=["1M", "5M", "15M", "30M", "1H", "4H", "D"], group=grpSMC)
+smcUseLower = input.bool(true, "Use Lower TF Filter", group=grpSMC)
+smcLowerTF = input.string("5M", "Lower Timeframe", options=["1M", "5M", "15M", "30M", "1H", "4H", "D"], group=grpSMC)
+smcUseVolume = input.bool(true, "Use Volume Filter", group=grpSMC)
+smcUseBreakout = input.bool(true, "Use Breakout Filter", group=grpSMC)
+smcBreakoutPeriod = input.int(5, "Breakout Period", minval=1, maxval=50, group=grpSMC)
+smcRestrictRepeated = input.bool(true, "Restrict Repeated Signals", group=grpSMC)
+smcRestrictTF = input.string("5M", "Restrict Trend Timeframe", options=["1M", "5M", "15M", "30M", "1H", "4H", "D"], group=grpSMC)
+smcEnableMarketProfile = input.bool(true, "Market Profile Flow", group=grpSMC)
+smcEnableDivergence = input.bool(true, "Divergence Scanner", group=grpSMC)
+smcVolumeLong = input.int(50, "Long Volume Period", minval=10, maxval=100, group=grpSMC)
+smcVolumeShort = input.int(5, "Short Volume Period", minval=1, maxval=20, group=grpSMC)
+smcShowAnalysis = input.bool(true, "Show SMC detail in Full Analysis", group=grpSMC)
+
+smcATR = ta.atr(14)
+smcVolFactor = close != 0 ? smcATR / close : 0.0
+smcMomentumThreshold = smcMomentumBase * (1 + smcVolFactor * 2)
+smcPreThreshold = smcMomentumThreshold * 0.5 * (1 - smcVolFactor * 0.5)
+smcPriceChange = close[1] != 0 ? ((close - close[1]) / close[1]) * 100 : 0.0
+smcPivotHigh = ta.pivothigh(high, smcPivotLen, smcPivotLen)
+smcPivotLow = ta.pivotlow(low, smcPivotLen, smcPivotLen)
+var float smcLastHigh = na
+var float smcLastLow = na
+if not na(smcPivotHigh)
+    smcLastHigh := smcPivotHigh
+if not na(smcPivotLow)
+    smcLastLow := smcPivotLow
+
+[smcE1, smcV1] = request.security(syminfo.tickerid, "1", [ta.ema(close, 20), ta.vwap(hlc3)], lookahead=barmerge.lookahead_off, calc_bars_count=2000)
+[smcE5, smcV5] = request.security(syminfo.tickerid, "5", [ta.ema(close, 20), ta.vwap(hlc3)], lookahead=barmerge.lookahead_off, calc_bars_count=2000)
+[smcE15, smcV15] = request.security(syminfo.tickerid, "15", [ta.ema(close, 20), ta.vwap(hlc3)], lookahead=barmerge.lookahead_off, calc_bars_count=2000)
+[smcE30, smcV30] = request.security(syminfo.tickerid, "30", [ta.ema(close, 20), ta.vwap(hlc3)], lookahead=barmerge.lookahead_off, calc_bars_count=2000)
+[smcE1H, smcV1H] = request.security(syminfo.tickerid, "60", [ta.ema(close, 20), ta.vwap(hlc3)], lookahead=barmerge.lookahead_off, calc_bars_count=2000)
+[smcE4H, smcV4H] = request.security(syminfo.tickerid, "240", [ta.ema(close, 20), ta.vwap(hlc3)], lookahead=barmerge.lookahead_off, calc_bars_count=2000)
+[smcED, smcVD] = request.security(syminfo.tickerid, "D", [ta.ema(close, 20), ta.vwap(hlc3)], lookahead=barmerge.lookahead_off, calc_bars_count=2000)
+
+smcTrend1 = close > smcE1 and close > smcV1 ? 1 : close < smcE1 and close < smcV1 ? -1 : 0
+smcTrend5 = close > smcE5 and close > smcV5 ? 1 : close < smcE5 and close < smcV5 ? -1 : 0
+smcTrend15 = close > smcE15 and close > smcV15 ? 1 : close < smcE15 and close < smcV15 ? -1 : 0
+smcTrend30 = close > smcE30 and close > smcV30 ? 1 : close < smcE30 and close < smcV30 ? -1 : 0
+smcTrend1H = close > smcE1H and close > smcV1H ? 1 : close < smcE1H and close < smcV1H ? -1 : 0
+smcTrend4H = close > smcE4H and close > smcV4H ? 1 : close < smcE4H and close < smcV4H ? -1 : 0
+smcTrendD = close > smcED and close > smcVD ? 1 : close < smcED and close < smcVD ? -1 : 0
+smcTrendRaw = smcTrend1 + smcTrend5 + smcTrend15 + smcTrend30 + smcTrend1H + smcTrend4H + smcTrendD
+smcTrendStrength = smcTrendRaw / 7.0 * 100.0
+smcConfidence = math.abs(smcTrendRaw) == 7 ? 90.0 : math.abs(smcTrendRaw) >= 4 ? 75.0 : math.abs(smcTrendRaw) >= 2 ? 60.0 : 50.0
+
+getTFTrend(tf) =>
+    switch tf
+        "1M" => smcTrend1
+        "5M" => smcTrend5
+        "15M" => smcTrend15
+        "30M" => smcTrend30
+        "1H" => smcTrend1H
+        "4H" => smcTrend4H
+        => smcTrendD
+
+smcHigherTrend = getTFTrend(smcHigherTF)
+smcLowerTrend = getTFTrend(smcLowerTF)
+smcRestrictTrend = getTFTrend(smcRestrictTF)
+smcVolAvg = ta.sma(volume, smcVolumeLong)
+smcVolShort = ta.sma(volume, smcVolumeShort)
+smcVolCondition = volume > smcVolAvg and ta.change(smcVolShort) > 0
+smcHighestBreakout = ta.highest(high, smcBreakoutPeriod)
+smcLowestBreakout = ta.lowest(low, smcBreakoutPeriod)
+smcBuyAllowed = (not smcUseMomentum or smcPriceChange > smcMomentumThreshold) and (not smcUseTrend or smcHigherTrend == 1) and (not smcUseLower or smcLowerTrend != -1) and (not smcUseVolume or smcVolCondition) and (not smcUseBreakout or close > smcHighestBreakout[1])
+smcSellAllowed = (not smcUseMomentum or smcPriceChange < -smcMomentumThreshold) and (not smcUseTrend or smcHigherTrend == -1) and (not smcUseLower or smcLowerTrend != 1) and (not smcUseVolume or smcVolCondition) and (not smcUseBreakout or close < smcLowestBreakout[1])
+var int smcLastSignalBar = -100000
+var string smcLastSignal = "Neutral"
+smcBuy = smcBuyAllowed and bar_index - smcLastSignalBar >= smcMinSignalDistance and (not smcRestrictRepeated or smcLastSignal != "Buy" or smcRestrictTrend != 1)
+smcSell = smcSellAllowed and bar_index - smcLastSignalBar >= smcMinSignalDistance and (not smcRestrictRepeated or smcLastSignal != "Sell" or smcRestrictTrend != -1)
+if smcBuy
+    smcLastSignalBar := bar_index
+    smcLastSignal := "Buy"
+if smcSell
+    smcLastSignalBar := bar_index
+    smcLastSignal := "Sell"
+
+smcChochSell = not na(smcLastHigh) and ta.crossunder(low, smcLastHigh) and close < open
+smcChochBuy = not na(smcLastLow) and ta.crossover(high, smcLastLow) and close > open
+smcBosSell = not na(smcLastLow[1]) and ta.crossunder(low, smcLastLow[1]) and low < smcLastLow[1] and close < open
+smcBosBuy = not na(smcLastHigh[1]) and ta.crossover(high, smcLastHigh[1]) and high > smcLastHigh[1] and close > open
+smcRawCVD = ta.cum(close > close[1] ? nz(volume, 0) : close < close[1] ? -nz(volume, 0) : 0)
+smcRecentBuyVol = close > open ? ta.sma(volume, 20) : 0.0
+smcRecentSellVol = close < open ? ta.sma(volume, 20) : 0.0
+smcVolRatio = smcRecentBuyVol > 0 and smcRecentSellVol > 0 ? smcRecentBuyVol / (smcRecentBuyVol + smcRecentSellVol) : 0.5
+smcStrongBuyFlow = smcEnableMarketProfile and smcVolRatio > 0.65 and volume > smcVolAvg * 1.5
+smcStrongSellFlow = smcEnableMarketProfile and smcVolRatio < 0.35 and volume > smcVolAvg * 1.5
+smcRSI = ta.rsi(close, 14)
+smcBullDiv = smcEnableDivergence and low < low[5] and low[5] < low[10] and smcRSI > smcRSI[5] and smcRSI[5] > smcRSI[10] and smcRSI < 40
+smcBearDiv = smcEnableDivergence and high > high[5] and high[5] > high[10] and smcRSI < smcRSI[5] and smcRSI[5] < smcRSI[10] and smcRSI > 60
+smcReadyBuy = smcUseMomentum and smcPriceChange > smcPreThreshold and smcPriceChange < smcMomentumThreshold and smcHigherTrend == 1
+smcReadySell = smcUseMomentum and smcPriceChange < -smcPreThreshold and smcPriceChange > -smcMomentumThreshold and smcHigherTrend == -1
+
+analysisSMC = isFull and smcShowAnalysis
+if analysisSMC and smcBuy
+    label.new(bar_index, low, "SMC BUY", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.tiny)
+if analysisSMC and smcSell
+    label.new(bar_index, high, "SMC SELL", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.tiny)
+if analysisSMC and smcChochBuy
+    label.new(bar_index, low, "CHoCH", style=label.style_circle, color=color.lime, textcolor=color.black, size=size.tiny)
+if analysisSMC and smcChochSell
+    label.new(bar_index, high, "CHoCH", style=label.style_circle, color=color.aqua, textcolor=color.black, size=size.tiny)
+if analysisSMC and smcBosBuy
+    label.new(bar_index, low, "BOS", style=label.style_circle, color=color.teal, textcolor=color.white, size=size.tiny)
+if analysisSMC and smcBosSell
+    label.new(bar_index, high, "BOS", style=label.style_circle, color=color.fuchsia, textcolor=color.white, size=size.tiny)
+if analysisSMC and smcReadyBuy
+    label.new(bar_index, low, "READY", style=label.style_label_up, color=color.orange, textcolor=color.white, size=size.tiny)
+if analysisSMC and smcReadySell
+    label.new(bar_index, high, "READY", style=label.style_label_down, color=color.orange, textcolor=color.white, size=size.tiny)
+if analysisSMC and smcStrongBuyFlow
+    label.new(bar_index, low, "FLOW", style=label.style_label_up, color=color.aqua, textcolor=color.black, size=size.tiny)
+if analysisSMC and smcStrongSellFlow
+    label.new(bar_index, high, "FLOW", style=label.style_label_down, color=color.fuchsia, textcolor=color.white, size=size.tiny)
+if analysisSMC and smcBullDiv
+    label.new(bar_index, low, "DIV", style=label.style_label_up, color=color.lime, textcolor=color.black, size=size.tiny)
+if analysisSMC and smcBearDiv
+    label.new(bar_index, high, "DIV", style=label.style_label_down, color=color.purple, textcolor=color.white, size=size.tiny)
+
+// -----------------------------------------------------------------------------
+// 4. POKI / SAR / REGRESSION / RENKO / HULL
+// -----------------------------------------------------------------------------
+grpPoki = "4. Poki"
+pokiStart = input.float(0.03, "SAR Start", minval=0, maxval=1, step=0.01, group=grpPoki)
+pokiStep = input.float(0.03, "SAR Step", minval=0, maxval=1, step=0.01, group=grpPoki)
+pokiMax = input.float(0.30, "SAR Maximum", minval=0.01, maxval=1, step=0.01, group=grpPoki)
+pokiRegLen = input.int(50, "Linear Regression Length", minval=1, group=grpPoki)
+pokiBBLen = input.int(20, "Bollinger Length", minval=1, group=grpPoki)
+pokiBBMult = input.float(2.0, "Bollinger Deviation", minval=1, step=0.1, group=grpPoki)
+pokiOverbought = input.float(1.0, "Resistance Trigger", minval=0.1, group=grpPoki)
+pokiOversold = input.float(0.0, "Support Trigger", minval=-1.0, group=grpPoki)
+pokiRenkoMethod = input.string("ATR", "Renko Method", options=["ATR", "Traditional", "Part of Price"], group=grpPoki)
+pokiRenkoValue = input.float(14.0, "Renko Value", minval=0, group=grpPoki)
+pokiPriceSource = input.string("Close", "Renko Price Source", options=["Close", "Open / Close", "High / Low"], group=grpPoki)
+pokiOscillating = input.bool(true, "Oscillating", group=grpPoki)
+pokiNormalize = input.bool(false, "Normalize", group=grpPoki)
+pokiHullLen = input.int(32, "WMA/Hull Length", minval=2, group=grpPoki)
+
+pokiSAR = ta.sar(pokiStart, pokiStep, pokiMax)
+pokiReg = ta.linreg(close, pokiRegLen, 0)
+pokiRegPrev = ta.linreg(close[1], pokiRegLen, 0)
+pokiSlope = pokiReg - pokiRegPrev
+pokiBBBasis = ta.sma(close, pokiBBLen)
+pokiBBDev = ta.stdev(close, pokiBBLen)
+pokiUpper = pokiBBBasis + pokiBBMult * pokiBBDev
+pokiLower = pokiBBBasis - pokiBBMult * pokiBBDev
+pokiBBR = (close - pokiLower) / math.max(pokiUpper - pokiLower, syminfo.mintick)
+var float pokiResistance = na
+var float pokiSupport = na
+pokiResistance := pokiBBR[1] > pokiOverbought and pokiBBR < pokiOverbought ? high[1] : nz(pokiResistance[1])
+pokiSupport := pokiBBR[1] < pokiOversold and pokiBBR > pokiOversold ? low[1] : nz(pokiSupport[1])
+pokiOp = pokiPriceSource == "Close" or pokiPriceSource == "Open / Close" ? close : open
+pokiHi = pokiPriceSource == "High / Low" ? high : math.max(close, pokiOp)
+pokiLo = pokiPriceSource == "High / Low" ? low : math.min(close, pokiOp)
+pokiRenkoSize = pokiRenkoMethod == "ATR" ? ta.atr(math.max(1, int(math.round(pokiRenkoValue)))) : pokiRenkoMethod == "Part of Price" ? close / math.max(pokiRenkoValue, 1) : pokiRenkoValue
+var float pokiCurrClose = na
+pokiPrevClose = nz(pokiCurrClose[1], close)
+pokiCurrClose := pokiHi > pokiPrevClose + pokiRenkoSize ? pokiHi : pokiLo < pokiPrevClose - pokiRenkoSize ? pokiLo : pokiPrevClose
+var int pokiDirection = 0
+pokiDirection := pokiCurrClose > pokiPrevClose ? 1 : pokiCurrClose < pokiPrevClose ? -1 : nz(pokiDirection[1])
+pokiDirChange = ta.change(pokiDirection) != 0
+var int pokiBarCount = 1
+pokiBarCount := not pokiDirChange and pokiNormalize ? nz(pokiBarCount[1]) + 1 : 1
+var float pokiAggVol = 0.0
+pokiBaseVol = pokiOscillating and pokiDirection < 0 ? -nz(volume, 0) : nz(volume, 0)
+pokiAggVol := not pokiDirChange ? nz(pokiAggVol[1]) + pokiBaseVol : pokiBaseVol
+pokiResVol = pokiBarCount > 1 ? pokiAggVol / pokiBarCount : pokiAggVol
+pokiW1 = 2.0 * ta.wma(close, math.max(1, int(math.round(pokiHullLen / 2.0))))
+pokiW2 = ta.wma(close, pokiHullLen)
+pokiDiff = pokiW1 - pokiW2
+pokiHull = ta.wma(pokiDiff, math.max(1, int(math.round(math.sqrt(pokiHullLen)))))
+pokiHullBull = pokiHull > pokiHull[1]
+pokiLongCond = ta.crossover(pokiResVol, 0)
+pokiShortCond = ta.crossunder(pokiResVol, 0)
+pokiBull = pokiHullBull and pokiSlope > 0 and close > pokiSAR and pokiDirection > 0
+pokiBear = not pokiHullBull and pokiSlope < 0 and close < pokiSAR and pokiDirection < 0
+analysisPoki = isFull
+plot(analysisPoki ? pokiSAR : na, "Poki SAR", style=plot.style_circles, color=close >= pokiSAR ? color.blue : color.red, linewidth=2)
+plot(analysisPoki ? pokiReg : na, "Poki Regression", color=pokiSlope >= 0 ? color.lime : color.red, linewidth=2)
+plot(analysisPoki ? pokiResistance : na, "Poki Resistance", color=color.red, style=plot.style_circles, linewidth=2)
+plot(analysisPoki ? pokiSupport : na, "Poki Support", color=color.blue, style=plot.style_circles, linewidth=2)
+plot(analysisPoki ? pokiHull : na, "Poki Hull", color=pokiHullBull ? color.green : color.red, linewidth=2)
+bgcolor(analysisPoki and pokiBull ? color.new(color.blue, 94) : analysisPoki and pokiBear ? color.new(color.red, 94) : na)
+if analysisPoki and pokiLongCond
+    label.new(bar_index, low, "P-B", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.tiny)
+if analysisPoki and pokiShortCond
+    label.new(bar_index, high, "P-S", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.tiny)
+
+// -----------------------------------------------------------------------------
+// 5. BASIC VOLUME
+// -----------------------------------------------------------------------------
+grpVOL = "5. Basic Volume"
+volMALen = input.int(20, "Volume MA Length", minval=1, group=grpVOL)
+volSpikeMult = input.float(1.5, "Spike Multiplier", minval=0.1, step=0.1, group=grpVOL)
+volumeMA = ta.sma(volume, volMALen)
+volumeRatio = volumeMA > 0 ? volume / volumeMA : 0.0
+volumeSpike = volumeRatio >= volSpikeMult
+volumeBull = close > open and volumeSpike
+volumeBear = close < open and volumeSpike
+if isFull and volumeBull
+    label.new(bar_index, low, "VOL+", style=label.style_circle, color=color.lime, textcolor=color.black, size=size.tiny)
+if isFull and volumeBear
+    label.new(bar_index, high, "VOL-", style=label.style_circle, color=color.red, textcolor=color.white, size=size.tiny)
+
+// -----------------------------------------------------------------------------
+// 6. PRICE ACTION TOOLKIT - PUBLIC FEATURE EQUIVALENT
+// -----------------------------------------------------------------------------
+grpPAT = "6. Price Action Toolkit"
+patFVGMinPct = input.float(0.10, "FVG Minimum Size %", minval=0, step=0.05, group=grpPAT)
+patMaxZones = input.int(8, "Max Active Zones", minval=1, maxval=15, group=grpPAT)
+patStructureLen = input.int(5, "Structure Swing Length", minval=1, maxval=30, group=grpPAT)
+patEqTolerance = input.float(0.15, "EQH/EQL Tolerance %", minval=0.01, step=0.01, group=grpPAT)
+patPDLookback = input.int(50, "Premium/Discount Lookback", minval=10, group=grpPAT)
+patVIThreshold = input.float(0.25, "Volume Imbalance %", minval=0.01, step=0.05, group=grpPAT)
+patShowSessions = input.bool(false, "Show Sessions in Full Analysis", group=grpPAT)
+patSessionNY = input.session("0830-1600", "New York", group=grpPAT)
+patSessionLondon = input.session("0200-1100", "London", group=grpPAT)
+patSessionFrankfurt = input.session("0100-1000", "Frankfurt", group=grpPAT)
+patSessionAsia = input.session("2000-0400", "Asia", group=grpPAT)
+patShowPrevDay = input.bool(true, "Previous Day High/Low", group=grpPAT)
+patShowPrevWeek = input.bool(true, "Previous Week High/Low", group=grpPAT)
+patShowPrevMonth = input.bool(true, "Previous Month High/Low", group=grpPAT)
+
+patPH = ta.pivothigh(high, patStructureLen, patStructureLen)
+patPL = ta.pivotlow(low, patStructureLen, patStructureLen)
+var float patLastSH = na
+var float patLastSL = na
+var float patPrevSH = na
+var float patPrevSL = na
+var int patTrend = 0
+if not na(patPH)
+    patPrevSH := patLastSH
+    patLastSH := patPH
+if not na(patPL)
+    patPrevSL := patLastSL
+    patLastSL := patPL
+patBOSBull = not na(patLastSH) and ta.crossover(close, patLastSH)
+patBOSBear = not na(patLastSL) and ta.crossunder(close, patLastSL)
+patCHBull = patBOSBull and patTrend == -1
+patCHBear = patBOSBear and patTrend == 1
+patCHPlusBull = patCHBull and close > open and volumeSpike
+patCHPlusBear = patCHBear and close < open and volumeSpike
+if patBOSBull
+    patTrend := 1
+if patBOSBear
+    patTrend := -1
+
+patFvgBull = bar_index >= 2 and low > high[2] and ((low - high[2]) / close * 100 >= patFVGMinPct)
+patFvgBear = bar_index >= 2 and high < low[2] and ((low[2] - high) / close * 100 >= patFVGMinPct)
+patVIBull = open > close[1] and close[1] != 0 and ((open - close[1]) / close[1] * 100 >= patVIThreshold)
+patVIBear = open < close[1] and close[1] != 0 and ((close[1] - open) / close[1] * 100 >= patVIThreshold)
+patNewBullOB = patBOSBull and close[1] < open[1]
+patNewBearOB = patBOSBear and close[1] > open[1]
+patEqHigh = not na(patPH) and not na(patPrevSH) and math.abs(patPH - patPrevSH) / close * 100 <= patEqTolerance
+patEqLow = not na(patPL) and not na(patPrevSL) and math.abs(patPL - patPrevSL) / close * 100 <= patEqTolerance
+patLiquidityGrabBull = not na(patLastSL) and low < patLastSL and close > patLastSL
+patLiquidityGrabBear = not na(patLastSH) and high > patLastSH and close < patLastSH
+pdHigh = ta.highest(high, patPDLookback)
+pdLow = ta.lowest(low, patPDLookback)
+pdMid = (pdHigh + pdLow) / 2.0
+pdPremium = close > pdMid
+pdDiscount = close < pdMid
+
+var float tradeDemandMid = na
+var float tradeSupplyMid = na
+var bool tradeDemandActive = false
+var bool tradeSupplyActive = false
+var box[] patFvgBoxes = array.new_box()
+var int[] patFvgDirs = array.new_int()
+var float[] patFvgTops = array.new_float()
+var float[] patFvgBots = array.new_float()
+if patFvgBull
+    tradeDemandMid := (low + high[2]) / 2.0
+    tradeDemandActive := true
+    if allowObjects
+        fbx = box.new(bar_index - 2, low, bar_index, high[2], bgcolor=color.new(color.green, 86), border_color=color.new(color.green, 40))
+        array.push(patFvgBoxes, fbx)
+        array.push(patFvgDirs, 1)
+        array.push(patFvgTops, low)
+        array.push(patFvgBots, high[2])
+if patFvgBear
+    tradeSupplyMid := (low[2] + high) / 2.0
+    tradeSupplyActive := true
+    if allowObjects
+        fbx = box.new(bar_index - 2, low[2], bar_index, high, bgcolor=color.new(color.red, 86), border_color=color.new(color.red, 40))
+        array.push(patFvgBoxes, fbx)
+        array.push(patFvgDirs, -1)
+        array.push(patFvgTops, low[2])
+        array.push(patFvgBots, high)
+if tradeDemandActive and not na(tradeDemandMid) and close < tradeDemandMid
+    tradeDemandActive := false
+if tradeSupplyActive and not na(tradeSupplyMid) and close > tradeSupplyMid
+    tradeSupplyActive := false
+
+if allowObjects and array.size(patFvgBoxes) > 0
+    for idx = array.size(patFvgBoxes) - 1 to 0
+        fb = array.get(patFvgBoxes, idx)
+        fd = array.get(patFvgDirs, idx)
+        ft = array.get(patFvgTops, idx)
+        fl = array.get(patFvgBots, idx)
+        box.set_right(fb, bar_index)
+        if fd == 1 and close < fl
+            box.set_bgcolor(fb, color.new(color.red, 88))
+            array.set(patFvgDirs, idx, -1)
+        else if fd == -1 and close > ft
+            box.set_bgcolor(fb, color.new(color.green, 88))
+            array.set(patFvgDirs, idx, 1)
+    while array.size(patFvgBoxes) > patMaxZones
+        oldF = array.shift(patFvgBoxes)
+        array.shift(patFvgDirs)
+        array.shift(patFvgTops)
+        array.shift(patFvgBots)
+        box.delete(oldF)
+
+var box[] patOBBoxes = array.new_box()
+var int[] patOBDirs = array.new_int()
+if allowObjects and patNewBullOB
+    obBull = box.new(bar_index - 1, high[1], bar_index + 10, low[1], bgcolor=color.new(color.green, 84), border_color=color.new(color.green, 40))
+    array.push(patOBBoxes, obBull)
+    array.push(patOBDirs, 1)
+if allowObjects and patNewBearOB
+    obBear = box.new(bar_index - 1, high[1], bar_index + 10, low[1], bgcolor=color.new(color.red, 84), border_color=color.new(color.red, 40))
+    array.push(patOBBoxes, obBear)
+    array.push(patOBDirs, -1)
+if allowObjects and array.size(patOBBoxes) > 0
+    for idx = array.size(patOBBoxes) - 1 to 0
+        obx = array.get(patOBBoxes, idx)
+        obd = array.get(patOBDirs, idx)
+        box.set_right(obx, bar_index + 10)
+        obBroken = obd == 1 ? close < box.get_bottom(obx) : close > box.get_top(obx)
+        if obBroken
+            box.set_bgcolor(obx, color.new(obd == 1 ? color.red : color.green, 87))
+            array.set(patOBDirs, idx, -obd)
+    while array.size(patOBBoxes) > patMaxZones
+        oldO = array.shift(patOBBoxes)
+        array.shift(patOBDirs)
+        box.delete(oldO)
+
+analysisPAT = isFull
+if analysisPAT and patBOSBull
+    label.new(bar_index, low, "BOS", style=label.style_label_up, color=color.teal, textcolor=color.white, size=size.tiny)
+if analysisPAT and patBOSBear
+    label.new(bar_index, high, "BOS", style=label.style_label_down, color=color.fuchsia, textcolor=color.white, size=size.tiny)
+if analysisPAT and patCHBull
+    label.new(bar_index, low, "CH+", style=label.style_label_up, color=color.lime, textcolor=color.black, size=size.tiny)
+if analysisPAT and patCHBear
+    label.new(bar_index, high, "CH+", style=label.style_label_down, color=color.orange, textcolor=color.black, size=size.tiny)
+if analysisPAT and patEqHigh
+    label.new(bar_index - patStructureLen, high[patStructureLen], "EQH", style=label.style_label_down, color=color.orange, textcolor=color.white, size=size.tiny)
+if analysisPAT and patEqLow
+    label.new(bar_index - patStructureLen, low[patStructureLen], "EQL", style=label.style_label_up, color=color.aqua, textcolor=color.black, size=size.tiny)
+if analysisPAT and patLiquidityGrabBull
+    label.new(bar_index, low, "LQG", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.tiny)
+if analysisPAT and patLiquidityGrabBear
+    label.new(bar_index, high, "LQG", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.tiny)
+if analysisPAT and patVIBull
+    label.new(bar_index, low, "VI+", style=label.style_label_up, color=color.lime, textcolor=color.black, size=size.tiny)
+if analysisPAT and patVIBear
+    label.new(bar_index, high, "VI-", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.tiny)
+plot(analysisPAT ? pdMid : na, "PAT Equilibrium", color=color.new(color.gray, 20), linewidth=1)
+
+pdHighVal = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off, calc_bars_count=2000)
+pdLowVal = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_off, calc_bars_count=2000)
+pwHighVal = request.security(syminfo.tickerid, "W", high[1], lookahead=barmerge.lookahead_off, calc_bars_count=2000)
+pwLowVal = request.security(syminfo.tickerid, "W", low[1], lookahead=barmerge.lookahead_off, calc_bars_count=2000)
+pmHighVal = request.security(syminfo.tickerid, "M", high[1], lookahead=barmerge.lookahead_off, calc_bars_count=2000)
+pmLowVal = request.security(syminfo.tickerid, "M", low[1], lookahead=barmerge.lookahead_off, calc_bars_count=2000)
+plot(analysisPAT and patShowPrevDay ? pdHighVal : na, "PDH", color=color.new(color.orange, 20), style=plot.style_linebr)
+plot(analysisPAT and patShowPrevDay ? pdLowVal : na, "PDL", color=color.new(color.orange, 20), style=plot.style_linebr)
+plot(analysisPAT and patShowPrevWeek ? pwHighVal : na, "PWH", color=color.new(color.purple, 20), style=plot.style_linebr)
+plot(analysisPAT and patShowPrevWeek ? pwLowVal : na, "PWL", color=color.new(color.purple, 20), style=plot.style_linebr)
+plot(analysisPAT and patShowPrevMonth ? pmHighVal : na, "PMH", color=color.new(color.blue, 20), style=plot.style_linebr)
+plot(analysisPAT and patShowPrevMonth ? pmLowVal : na, "PML", color=color.new(color.blue, 20), style=plot.style_linebr)
+
+var line patBullTL = na
+var line patBearTL = na
+var float patTLPL1 = na
+var float patTLPL2 = na
+var int patTLPLBar1 = na
+var int patTLPLBar2 = na
+var float patTPH1 = na
+var float patTPH2 = na
+var int patTPHBar1 = na
+var int patTPHBar2 = na
+if not na(patPL)
+    patTLPL1 := patTLPL2
+    patTLPLBar1 := patTLPLBar2
+    patTLPL2 := patPL
+    patTLPLBar2 := bar_index - patStructureLen
+if not na(patPH)
+    patTPH1 := patTPH2
+    patTPHBar1 := patTPHBar2
+    patTPH2 := patPH
+    patTPHBar2 := bar_index - patStructureLen
+if analysisPAT and barstate.islast and allowObjects
+    line.delete(patBullTL)
+    line.delete(patBearTL)
+    if not na(patTLPL1) and not na(patTLPL2) and patTLPLBar2 > patTLPLBar1
+        patBullTL := line.new(patTLPLBar1, patTLPL1, patTLPLBar2, patTLPL2, extend=extend.right, color=color.green, width=2)
+    if not na(patTPH1) and not na(patTPH2) and patTPHBar2 > patTPHBar1
+        patBearTL := line.new(patTPHBar1, patTPH1, patTPHBar2, patTPH2, extend=extend.right, color=color.red, width=2)
+
+patNY = not na(time(timeframe.period, patSessionNY))
+patLondon = not na(time(timeframe.period, patSessionLondon))
+patFrankfurt = not na(time(timeframe.period, patSessionFrankfurt))
+patAsia = not na(time(timeframe.period, patSessionAsia))
+bgcolor(analysisPAT and patShowSessions ? (patNY ? color.new(color.blue, 94) : patLondon ? color.new(color.green, 94) : patFrankfurt ? color.new(color.orange, 94) : patAsia ? color.new(color.purple, 94) : na) : na)
+
+// -----------------------------------------------------------------------------
+// 7. CLEAN KEY LEVELS FOR TRADING MODE
+// -----------------------------------------------------------------------------
+keyPDH = showKeyLevels and not isFull ? pdHighVal : na
+keyPDL = showKeyLevels and not isFull ? pdLowVal : na
+plot(keyPDH, "Key PDH", color=color.new(color.orange, 10), style=plot.style_linebr, linewidth=1)
+plot(keyPDL, "Key PDL", color=color.new(color.orange, 10), style=plot.style_linebr, linewidth=1)
+plot(not isFull and showKeyLevels ? pdMid : na, "Key Equilibrium", color=color.new(color.gray, 55), linewidth=1)
+
+// Clean mode shows only the nearest active demand/supply midpoints.
+plot(not isFull and showKeyLevels and tradeDemandActive ? tradeDemandMid : na, "Active Demand", color=color.new(color.green, 20), linewidth=2, style=plot.style_linebr)
+plot(not isFull and showKeyLevels and tradeSupplyActive ? tradeSupplyMid : na, "Active Supply", color=color.new(color.red, 20), linewidth=2, style=plot.style_linebr)
+
+// -----------------------------------------------------------------------------
+// 8. CONFLUENCE ENGINE
+// -----------------------------------------------------------------------------
+emaBull = close > emaValue and emaValue > emaValue[1]
+emaBear = close < emaValue and emaValue < emaValue[1]
+vwapBull = not na(vwapValue) and close > vwapValue
+vwapBear = not na(vwapValue) and close < vwapValue
+volumeBullScore = volumeBull
+volumeBearScore = volumeBear
+pokiBullScore = pokiBull or pokiLongCond
+pokiBearScore = pokiBear or pokiShortCond
+patBullScore = patBOSBull or patCHBull or patLiquidityGrabBull or patFvgBull or patNewBullOB or patVIBull
+patBearScore = patBOSBear or patCHBear or patLiquidityGrabBear or patFvgBear or patNewBearOB or patVIBear
+smcBullScore = smcBuy or smcChochBuy or smcBosBuy or smcStrongBuyFlow or smcBullDiv
+smcBearScore = smcSell or smcChochSell or smcBosSell or smcStrongSellFlow or smcBearDiv
+
+float bullScore = 0.0
+float bearScore = 0.0
+bullScore += emaBull ? 15 : 0
+bearScore += emaBear ? 15 : 0
+bullScore += vwapBull ? 15 : 0
+bearScore += vwapBear ? 15 : 0
+bullScore += smcBullScore ? 20 : 0
+bearScore += smcBearScore ? 20 : 0
+bullScore += pokiBullScore ? 15 : 0
+bearScore += pokiBearScore ? 15 : 0
+bullScore += volumeBullScore ? 10 : 0
+bearScore += volumeBearScore ? 10 : 0
+bullScore += patBullScore ? 25 : 0
+bearScore += patBearScore ? 25 : 0
+bullScore := math.min(bullScore, 100)
+bearScore := math.min(bearScore, 100)
+
+bullReady = useConfluence ? bullScore >= minConfluence and bullScore > bearScore : emaBull or vwapBull or smcBullScore or pokiBullScore or volumeBullScore or patBullScore
+bearReady = useConfluence ? bearScore >= minConfluence and bearScore > bullScore : emaBear or vwapBear or smcBearScore or pokiBearScore or volumeBearScore or patBearScore
+rawFinalBuy = bullReady and (not confirmedOnly or barstate.isconfirmed)
+rawFinalSell = bearReady and (not confirmedOnly or barstate.isconfirmed)
+finalBuy = rawFinalBuy and (not signalOnChangeOnly or not rawFinalBuy[1])
+finalSell = rawFinalSell and (not signalOnChangeOnly or not rawFinalSell[1])
+
+plotshape(not cleanTradeView and finalBuy and not showSignalScore, title="ULTI-6 BUY", text="BUY", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 0), textcolor=color.white, size=size.normal)
+plotshape(not cleanTradeView and finalSell and not showSignalScore, title="ULTI-6 SELL", text="SELL", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), textcolor=color.white, size=size.normal)
+
+if finalBuy and not webhookEnabled
+    alert("ULTI-6 BUY: confluence threshold reached", alert.freq_once_per_bar_close)
+if finalSell and not webhookEnabled
+    alert("ULTI-6 SELL: confluence threshold reached", alert.freq_once_per_bar_close)
+
+// One clean dynamic label is used when score display is enabled.
+if not cleanTradeView and showSignalScore and finalBuy
+    label.new(bar_index, low, "BUY " + str.tostring(math.round(bullScore)), style=label.style_label_up, color=color.green, textcolor=color.white, size=size.tiny)
+if not cleanTradeView and showSignalScore and finalSell
+    label.new(bar_index, high, "SELL " + str.tostring(math.round(bearScore)), style=label.style_label_down, color=color.red, textcolor=color.white, size=size.tiny)
+
+// -----------------------------------------------------------------------------
+// 8B. BB / ULTI A-B-C TEST ENGINE
+// -----------------------------------------------------------------------------
+grpTest = "8B. BB / ULTI A-B-C Test"
+testMode = input.string("BB BASELINE", "Test Mode", options=["BB BASELINE", "BB + ULTI VETO", "BB + ULTI MANAGEMENT", "BB + ULTI FULL"], group=grpTest)
+bbLength = input.int(20, "BB Length", minval=1, group=grpTest)
+bbMult = input.float(2.0, "BB StdDev", minval=0.001, maxval=50, group=grpTest)
+showTradePlan = input.bool(true, "Show CALL/PUT trade labels", group=grpTest)
+
+// Minimal veto: ULTI is NOT an approval gate. It may only reject a BB entry
+// when the opposite six-indicator score is exceptionally dominant or price is
+// already badly extended from both EMA and VWAP.
+vetoOppScore = input.int(60, "Veto: opposing score", minval=0, maxval=100, group=grpTest)
+vetoOppLead = input.int(25, "Veto: opposing score lead", minval=0, maxval=100, group=grpTest)
+vetoExtensionATR = input.float(2.0, "Veto: max EMA/VWAP extension (ATR)", minval=0.5, maxval=5.0, step=0.1, group=grpTest)
+
+// ULTI management is deliberately independent of entry timing.
+mgmtInitialStopATR = input.float(1.0, "Management: initial stop ATR", minval=0.25, maxval=5.0, step=0.05, group=grpTest)
+mgmtBETriggerATR = input.float(1.0, "Management: break-even trigger ATR", minval=0.25, maxval=5.0, step=0.05, group=grpTest)
+mgmtRunnerTriggerATR = input.float(1.5, "Management: runner trigger ATR", minval=0.5, maxval=10.0, step=0.1, group=grpTest)
+mgmtTrailATR = input.float(1.25, "Management: runner trail ATR", minval=0.25, maxval=5.0, step=0.05, group=grpTest)
+mgmtOppScore = input.int(60, "Management: opposite exit score", minval=0, maxval=100, group=grpTest)
+mgmtOppBars = input.int(2, "Management: opposite confirmation bars", minval=1, maxval=5, group=grpTest)
+
+useVeto = testMode == "BB + ULTI VETO" or testMode == "BB + ULTI FULL"
+useUltiManagement = testMode == "BB + ULTI MANAGEMENT" or testMode == "BB + ULTI FULL"
+
+// EXACT signal definitions from the standalone Bollinger strategy supplied by user.
+bbSource = close
+bbBasis = ta.sma(bbSource, bbLength)
+bbDev = bbMult * ta.stdev(bbSource, bbLength)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+bbLongSignal = ta.crossover(bbSource, bbLower)
+bbShortSignal = ta.crossunder(bbSource, bbUpper)
+
+sharedATRTest = ta.atr(14)
+testATRValid = not na(sharedATRTest) and sharedATRTest > syminfo.mintick
+distEMA = testATRValid ? math.abs(close - emaValue) / sharedATRTest : 0.0
+distVWAP = testATRValid and not na(vwapValue) ? math.abs(close - vwapValue) / sharedATRTest : 0.0
+longChase = close > emaValue and (na(vwapValue) or close > vwapValue) and math.max(distEMA, distVWAP) > vetoExtensionATR
+shortChase = close < emaValue and (na(vwapValue) or close < vwapValue) and math.max(distEMA, distVWAP) > vetoExtensionATR
+severeBearOpposition = bearScore >= vetoOppScore and bearScore - bullScore >= vetoOppLead
+severeBullOpposition = bullScore >= vetoOppScore and bullScore - bearScore >= vetoOppLead
+allowBBLong = not useVeto or (not severeBearOpposition and not longChase)
+allowBBShort = not useVeto or (not severeBullOpposition and not shortChase)
+
+// Clean trade-state display. Visual only; does not change strategy entries.
+formingATR = input.float(0.30, "Display: forming distance ATR", minval=0.05, maxval=1.0, step=0.05, group=grpTest)
+callForming = cleanTradeView and strategy.position_size == 0 and testATRValid and close <= bbLower + sharedATRTest * formingATR and close < bbBasis and not bbLongSignal
+putForming = cleanTradeView and strategy.position_size == 0 and testATRValid and close >= bbUpper - sharedATRTest * formingATR and close > bbBasis and not bbShortSignal
+callReady = cleanTradeView and strategy.position_size <= 0 and bbLongSignal and allowBBLong
+putReady = cleanTradeView and strategy.position_size >= 0 and bbShortSignal and allowBBShort
+newCallForming = callForming and not callForming[1]
+newPutForming = putForming and not putForming[1]
+if newCallForming
+    label.new(bar_index, low, "TRADE FORMING\nCALL", style=label.style_label_up, color=color.new(color.blue, 15), textcolor=color.white, size=size.small)
+if newPutForming
+    label.new(bar_index, high, "TRADE FORMING\nPUT", style=label.style_label_down, color=color.new(color.blue, 15), textcolor=color.white, size=size.small)
+if callReady
+    label.new(bar_index, low, "READY CALL", style=label.style_label_up, color=color.new(color.lime, 10), textcolor=color.black, size=size.small)
+if putReady
+    label.new(bar_index, high, "READY PUT", style=label.style_label_down, color=color.new(color.orange, 5), textcolor=color.white, size=size.small)
+
+// Informational lifecycle events. They never place/close an order by themselves.
+if newCallForming
+    f_webhook("FORMING", "CALL", close, "BB_MEAN_REVERSION", "BB_LOWER_APPROACH", "Price approaching lower Bollinger Band")
+if newPutForming
+    f_webhook("FORMING", "PUT", close, "BB_MEAN_REVERSION", "BB_UPPER_APPROACH", "Price approaching upper Bollinger Band")
+if callReady
+    f_webhook("READY", "CALL", close, "BB_MEAN_REVERSION", "BB_LOWER_CROSSOVER", "Lower-band mean-reversion trigger ready")
+if putReady
+    f_webhook("READY", "PUT", close, "BB_MEAN_REVERSION", "BB_UPPER_CROSSUNDER", "Upper-band mean-reversion trigger ready")
+
+// Management state for modes that use ULTI exits.
+var float testEntryPrice = na
+var float testEntryATR = na
+var float testBestPrice = na
+var bool testBE = false
+var bool testRunner = false
+var int bearExitCount = 0
+var int bullExitCount = 0
+
+if strategy.position_size > 0
+    testBestPrice := na(testBestPrice) ? high : math.max(testBestPrice, high)
+    bearExitCount := bearScore >= mgmtOppScore and bearScore > bullScore ? bearExitCount + 1 : 0
+    bullExitCount := 0
+else if strategy.position_size < 0
+    testBestPrice := na(testBestPrice) ? low : math.min(testBestPrice, low)
+    bullExitCount := bullScore >= mgmtOppScore and bullScore > bearScore ? bullExitCount + 1 : 0
+    bearExitCount := 0
+else
+    bearExitCount := 0
+    bullExitCount := 0
+
+if useUltiManagement and strategy.position_size > 0 and not na(testEntryPrice) and not na(testEntryATR)
+    if not testBE and high >= testEntryPrice + testEntryATR * mgmtBETriggerATR
+        testBE := true
+    if not testRunner and high >= testEntryPrice + testEntryATR * mgmtRunnerTriggerATR
+        testRunner := true
+    longStop = testBE ? testEntryPrice : testEntryPrice - testEntryATR * mgmtInitialStopATR
+    if testRunner and not na(testBestPrice)
+        longStop := math.max(longStop, testBestPrice - testEntryATR * mgmtTrailATR)
+    strategy.exit("BB CALL RISK", from_entry="BBandLE", stop=longStop, comment_loss="ULTI PROTECTIVE STOP")
+    if bearExitCount >= mgmtOppBars
+        strategy.close("BBandLE", comment="ULTI EXIT")
+        // Exit label is emitted by the universal closed-trade detector below.
+
+if useUltiManagement and strategy.position_size < 0 and not na(testEntryPrice) and not na(testEntryATR)
+    if not testBE and low <= testEntryPrice - testEntryATR * mgmtBETriggerATR
+        testBE := true
+    if not testRunner and low <= testEntryPrice - testEntryATR * mgmtRunnerTriggerATR
+        testRunner := true
+    shortStop = testBE ? testEntryPrice : testEntryPrice + testEntryATR * mgmtInitialStopATR
+    if testRunner and not na(testBestPrice)
+        shortStop := math.min(shortStop, testBestPrice + testEntryATR * mgmtTrailATR)
+    strategy.exit("BB PUT RISK", from_entry="BBandSE", stop=shortStop, comment_loss="ULTI PROTECTIVE STOP")
+    if bullExitCount >= mgmtOppBars
+        strategy.close("BBandSE", comment="ULTI EXIT")
+        // Exit label is emitted by the universal closed-trade detector below.
+
+// EXIT_WATCH is telemetry only. It warns when opposite pressure first appears or
+// runner protection becomes active; the Python bot does not close on EXIT_WATCH.
+newCallExitWatch = strategy.position_size > 0 and ((bearExitCount == 1 and bearExitCount[1] != 1) or (testRunner and not testRunner[1]))
+newPutExitWatch = strategy.position_size < 0 and ((bullExitCount == 1 and bullExitCount[1] != 1) or (testRunner and not testRunner[1]))
+if newCallExitWatch
+    callWatchCode = testRunner and not testRunner[1] ? "RUNNER_PROTECTION_ACTIVE" : "BEAR_PRESSURE_BUILDING"
+    callWatchReason = testRunner and not testRunner[1] ? "Runner protection activated" : "Opposite bearish pressure building"
+    f_webhook("EXIT_WATCH", "CALL", close, "BB_MEAN_REVERSION", callWatchCode, callWatchReason)
+if newPutExitWatch
+    putWatchCode = testRunner and not testRunner[1] ? "RUNNER_PROTECTION_ACTIVE" : "BULL_PRESSURE_BUILDING"
+    putWatchReason = testRunner and not testRunner[1] ? "Runner protection activated" : "Opposite bullish pressure building"
+    f_webhook("EXIT_WATCH", "PUT", close, "BB_MEAN_REVERSION", putWatchCode, putWatchReason)
+
+// Preserve original BB order semantics. In BASELINE mode these are intentionally
+// the same stop orders/cancellations as the user's standalone script.
+if bbLongSignal and allowBBLong
+    strategy.entry("BBandLE", strategy.long, stop=bbLower, oca_name="BollingerBands", oca_type=strategy.oca.cancel, comment="BBandLE")
+else
+    strategy.cancel(id="BBandLE")
+
+if bbShortSignal and allowBBShort
+    strategy.entry("BBandSE", strategy.short, stop=bbUpper, oca_name="BollingerBands", oca_type=strategy.oca.cancel, comment="BBandSE")
+else
+    strategy.cancel(id="BBandSE")
+
+// Detect a newly opened/reversed position and freeze management measurements.
+newLongPos = strategy.position_size > 0 and strategy.position_size[1] <= 0
+newShortPos = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+// UNIVERSAL CLEAN EXIT DISPLAY (visual only).
+// strategy.closedtrades increments whenever TradingView actually closes a trade,
+// including BB long->short / short->long reversals and strategy.exit risk exits.
+// This does NOT alter entries, exits, fills, or Strategy Tester results.
+newClosedTrade = ta.change(strategy.closedtrades) > 0
+
+// EXIT is emitted from the exact Strategy Tester closed-trade event. This block
+// intentionally appears before ENTRY emission so reversal bars send EXIT first.
+if newClosedTrade
+    webhookLastClosed = strategy.closedtrades - 1
+    webhookClosedEntryId = strategy.closedtrades.entry_id(webhookLastClosed)
+    webhookClosedWasCall = webhookClosedEntryId == "BBandLE"
+    webhookClosedSide = webhookClosedWasCall ? "CALL" : "PUT"
+    webhookClosedPrice = strategy.closedtrades.exit_price(webhookLastClosed)
+    webhookClosedComment = strategy.closedtrades.exit_comment(webhookLastClosed)
+    webhookClosedReason = str.length(webhookClosedComment) > 0 ? webhookClosedComment : (newLongPos or newShortPos ? "REVERSAL" : "CLOSE")
+    webhookClosedCode = webhookClosedReason == "ULTI PROTECTIVE STOP" ? "PROTECTIVE_STOP" : webhookClosedReason == "ULTI EXIT" ? "ULTI_EXIT" : webhookClosedReason == "REVERSAL" ? "REVERSAL" : "STRATEGY_CLOSE"
+    f_webhook("EXIT", webhookClosedSide, webhookClosedPrice, "BB_MEAN_REVERSION", webhookClosedCode, webhookClosedReason)
+if cleanTradeView and showTradePlan and newClosedTrade
+    lastClosed = strategy.closedtrades - 1
+    closedEntryId = strategy.closedtrades.entry_id(lastClosed)
+    closedExitPrice = strategy.closedtrades.exit_price(lastClosed)
+    closedExitComment = strategy.closedtrades.exit_comment(lastClosed)
+    closedWasCall = closedEntryId == "BBandLE"
+    closedReason = str.length(closedExitComment) > 0 ? closedExitComment : (newShortPos or newLongPos ? "REVERSAL" : "CLOSE")
+    closedText = (closedWasCall ? "CALL EXIT" : "PUT EXIT") + "\n" + str.tostring(closedExitPrice, format.mintick) + "\n" + closedReason
+    if closedWasCall
+        label.new(bar_index, high, closedText, style=label.style_label_down, color=color.orange, textcolor=color.white, size=size.small)
+    else
+        label.new(bar_index, low, closedText, style=label.style_label_up, color=color.orange, textcolor=color.white, size=size.small)
+
+if newLongPos
+    f_webhook("ENTRY", "CALL", strategy.position_avg_price, "BB_MEAN_REVERSION", "BB_LOWER_CROSSOVER", "Lower-band mean-reversion entry filled")
+    testEntryPrice := strategy.position_avg_price
+    testEntryATR := testATRValid ? sharedATRTest : syminfo.mintick * 10
+    testBestPrice := high
+    testBE := false
+    testRunner := false
+    if showTradePlan
+        label.new(bar_index, low, cleanTradeView ? "CALL ENTRY\n" + str.tostring(strategy.position_avg_price, format.mintick) : "CALL ENTRY\n" + testMode + "\n" + str.tostring(strategy.position_avg_price, format.mintick), style=label.style_label_up, color=color.green, textcolor=color.white, size=cleanTradeView ? size.small : size.tiny)
+if newShortPos
+    f_webhook("ENTRY", "PUT", strategy.position_avg_price, "BB_MEAN_REVERSION", "BB_UPPER_CROSSUNDER", "Upper-band mean-reversion entry filled")
+    testEntryPrice := strategy.position_avg_price
+    testEntryATR := testATRValid ? sharedATRTest : syminfo.mintick * 10
+    testBestPrice := low
+    testBE := false
+    testRunner := false
+    if showTradePlan
+        label.new(bar_index, high, cleanTradeView ? "PUT ENTRY\n" + str.tostring(strategy.position_avg_price, format.mintick) : "PUT ENTRY\n" + testMode + "\n" + str.tostring(strategy.position_avg_price, format.mintick), style=label.style_label_down, color=color.red, textcolor=color.white, size=cleanTradeView ? size.small : size.tiny)
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    testEntryPrice := na
+    testEntryATR := na
+    testBestPrice := na
+    testBE := false
+    testRunner := false
+
+// Alerts use actual BB candidates; veto modes only alert allowed candidates.
+alertcondition(bbLongSignal and allowBBLong, "BB/ULTI CALL candidate", "BB/ULTI CALL candidate on {{ticker}} @ {{close}}")
+alertcondition(bbShortSignal and allowBBShort, "BB/ULTI PUT candidate", "BB/ULTI PUT candidate on {{ticker}} @ {{close}}")
+
+// -----------------------------------------------------------------------------
+// 9. COMPACT DASHBOARD
+// -----------------------------------------------------------------------------
+var table dash = table.new(position.top_right, 3, 10, bgcolor=color.new(color.black, 15), border_width=1, border_color=color.new(color.gray, 55))
+if barstate.islast and showDashboard
+    table.cell(dash, 0, 0, "ULTI-6", text_color=color.white, bgcolor=color.new(color.blue, 20))
+    table.cell(dash, 1, 0, "BULL", text_color=color.lime, bgcolor=color.new(color.green, 85))
+    table.cell(dash, 2, 0, "BEAR", text_color=color.red, bgcolor=color.new(color.red, 85))
+    table.cell(dash, 0, 1, "EMA", text_color=color.white)
+    table.cell(dash, 1, 1, emaBull ? "ON" : "-", text_color=emaBull ? color.lime : color.gray)
+    table.cell(dash, 2, 1, emaBear ? "ON" : "-", text_color=emaBear ? color.red : color.gray)
+    table.cell(dash, 0, 2, "VWAP", text_color=color.white)
+    table.cell(dash, 1, 2, vwapBull ? "ON" : "-", text_color=vwapBull ? color.lime : color.gray)
+    table.cell(dash, 2, 2, vwapBear ? "ON" : "-", text_color=vwapBear ? color.red : color.gray)
+    table.cell(dash, 0, 3, "SMC", text_color=color.white)
+    table.cell(dash, 1, 3, smcBullScore ? "ON" : "-", text_color=smcBullScore ? color.lime : color.gray)
+    table.cell(dash, 2, 3, smcBearScore ? "ON" : "-", text_color=smcBearScore ? color.red : color.gray)
+    table.cell(dash, 0, 4, "Poki", text_color=color.white)
+    table.cell(dash, 1, 4, pokiBullScore ? "ON" : "-", text_color=pokiBullScore ? color.lime : color.gray)
+    table.cell(dash, 2, 4, pokiBearScore ? "ON" : "-", text_color=pokiBearScore ? color.red : color.gray)
+    table.cell(dash, 0, 5, "Volume", text_color=color.white)
+    table.cell(dash, 1, 5, volumeBullScore ? "ON" : "-", text_color=volumeBullScore ? color.lime : color.gray)
+    table.cell(dash, 2, 5, volumeBearScore ? "ON" : "-", text_color=volumeBearScore ? color.red : color.gray)
+    table.cell(dash, 0, 6, "PAT", text_color=color.white)
+    table.cell(dash, 1, 6, patBullScore ? "ON" : "-", text_color=patBullScore ? color.lime : color.gray)
+    table.cell(dash, 2, 6, patBearScore ? "ON" : "-", text_color=patBearScore ? color.red : color.gray)
+    table.cell(dash, 0, 7, "Score", text_color=color.white)
+    table.cell(dash, 1, 7, str.tostring(math.round(bullScore)), text_color=color.lime)
+    table.cell(dash, 2, 7, str.tostring(math.round(bearScore)), text_color=color.red)
+    table.cell(dash, 0, 8, "MTF", text_color=color.white)
+    table.cell(dash, 1, 8, str.tostring(math.round(smcTrendStrength)) + "%", text_color=smcTrendStrength >= 0 ? color.lime : color.orange)
+    table.cell(dash, 2, 8, str.tostring(math.round(smcConfidence)) + "%", text_color=color.aqua)
+    table.cell(dash, 0, 9, "Bias", text_color=color.white)
+    table.cell(dash, 1, 9, bullScore > bearScore ? "BULLISH" : "-", text_color=color.lime)
+    table.cell(dash, 2, 9, bearScore > bullScore ? "BEARISH" : "-", text_color=color.red)
+
+// -----------------------------------------------------------------------------
+// 10. ALERTS
+// -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// 11. COMPACT LIVE TRADE STATUS (DISPLAY ONLY)
+// -----------------------------------------------------------------------------
+showLiveStatus = input.bool(true, "Show live trade status", group=grpMaster)
+
+liveBias = bullScore > bearScore ? "BULLISH" : bearScore > bullScore ? "BEARISH" : "NEUTRAL"
+liveSetup = strategy.position_size > 0 ? "CALL" : strategy.position_size < 0 ? "PUT" : callReady ? "CALL READY" : putReady ? "PUT READY" : callForming ? "CALL FORMING" : putForming ? "PUT FORMING" : "WAIT"
+liveStatus = strategy.position_size != 0 ? "IN TRADE" : callReady or putReady ? "READY" : callForming or putForming ? "FORMING" : "WAIT"
+livePosition = strategy.position_size > 0 ? "CALL" : strategy.position_size < 0 ? "PUT" : "FLAT"
+liveEntry = strategy.position_size != 0 ? strategy.position_avg_price : na
+livePnlPct = strategy.position_size > 0 and strategy.position_avg_price != 0 ? (close - strategy.position_avg_price) / strategy.position_avg_price * 100.0 : strategy.position_size < 0 and strategy.position_avg_price != 0 ? (strategy.position_avg_price - close) / strategy.position_avg_price * 100.0 : na
+liveExitWatch = strategy.position_size > 0 ? (bearExitCount > 0 ? "PUT PRESSURE " + str.tostring(bearExitCount) + "/" + str.tostring(mgmtOppBars) : testRunner ? "RUNNER" : testBE ? "PROTECTED" : "HOLD") : strategy.position_size < 0 ? (bullExitCount > 0 ? "CALL PRESSURE " + str.tostring(bullExitCount) + "/" + str.tostring(mgmtOppBars) : testRunner ? "RUNNER" : testBE ? "PROTECTED" : "HOLD") : "-"
+liveNext = strategy.position_size != 0 ? liveExitWatch : callReady ? "CALL ENTRY" : putReady ? "PUT ENTRY" : callForming ? "WAIT CALL TRIGGER" : putForming ? "WAIT PUT TRIGGER" : "WAIT"
+
+var table liveDash = table.new(position.top_right, 2, 10, bgcolor=color.new(color.black, 12), border_width=1, border_color=color.new(color.gray, 55))
+if barstate.islast
+    if showLiveStatus
+        table.cell(liveDash, 0, 0, "LIVE STATUS", text_color=color.white, bgcolor=color.new(color.blue, 20))
+        table.cell(liveDash, 1, 0, syminfo.ticker, text_color=color.white, bgcolor=color.new(color.blue, 20))
+        table.cell(liveDash, 0, 1, "Bias", text_color=color.white)
+        table.cell(liveDash, 1, 1, liveBias, text_color=liveBias == "BULLISH" ? color.lime : liveBias == "BEARISH" ? color.red : color.silver)
+        table.cell(liveDash, 0, 2, "Setup", text_color=color.white)
+        table.cell(liveDash, 1, 2, liveSetup, text_color=str.contains(liveSetup, "CALL") ? color.lime : str.contains(liveSetup, "PUT") ? color.red : color.silver)
+        table.cell(liveDash, 0, 3, "Status", text_color=color.white)
+        table.cell(liveDash, 1, 3, liveStatus, text_color=liveStatus == "IN TRADE" ? color.aqua : liveStatus == "READY" ? color.lime : liveStatus == "FORMING" ? color.yellow : color.silver)
+        table.cell(liveDash, 0, 4, "Position", text_color=color.white)
+        table.cell(liveDash, 1, 4, livePosition, text_color=livePosition == "CALL" ? color.lime : livePosition == "PUT" ? color.red : color.silver)
+        table.cell(liveDash, 0, 5, "Entry", text_color=color.white)
+        table.cell(liveDash, 1, 5, na(liveEntry) ? "-" : str.tostring(liveEntry, format.mintick), text_color=color.white)
+        table.cell(liveDash, 0, 6, "Price", text_color=color.white)
+        table.cell(liveDash, 1, 6, str.tostring(close, format.mintick), text_color=color.white)
+        table.cell(liveDash, 0, 7, "P&L", text_color=color.white)
+        table.cell(liveDash, 1, 7, na(livePnlPct) ? "-" : str.tostring(livePnlPct, "#.##") + "%", text_color=na(livePnlPct) ? color.silver : livePnlPct >= 0 ? color.lime : color.red)
+        table.cell(liveDash, 0, 8, "Next", text_color=color.white)
+        table.cell(liveDash, 1, 8, liveNext, text_color=str.contains(liveNext, "CALL") ? color.lime : str.contains(liveNext, "PUT") ? color.red : liveNext == "RUNNER" or liveNext == "PROTECTED" ? color.aqua : color.silver)
+        table.cell(liveDash, 0, 9, "Mode", text_color=color.white)
+        table.cell(liveDash, 1, 9, testMode, text_color=color.aqua)
+    else
+        for r = 0 to 9
+            table.cell(liveDash, 0, r, "", bgcolor=color.new(color.black, 100))
+            table.cell(liveDash, 1, r, "", bgcolor=color.new(color.black, 100))

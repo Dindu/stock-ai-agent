@@ -170,6 +170,31 @@ SWING_MIN_HOLD_DAYS = int(os.getenv("SWING_MIN_HOLD_DAYS", "7"))
 SWING_MAX_HOLD_DAYS = int(os.getenv("SWING_MAX_HOLD_DAYS", "14"))
 SWING_MAX_OPEN_TRADES = int(os.getenv("SWING_MAX_OPEN_TRADES", "5"))
 
+# TradingView intraday signal integration. Webhook ingestion writes the latest
+# accepted signal per symbol/side to this shared state file. TradingView can be
+# enabled independently from the bot strategy and never controls SWING trades.
+TRADINGVIEW_ENTRY_ENABLED = os.getenv("TRADINGVIEW_ENTRY_ENABLED", "0") == "1"
+TRADINGVIEW_EXIT_ENABLED = os.getenv("TRADINGVIEW_EXIT_ENABLED", "0") == "1"
+# Resolve relative to this file's location, not the process CWD, so launching
+# the bot from outside the repo root can't silently disconnect it from the
+# webhook server's state directory (tradingview/webhook_server.py resolves the
+# same way, from its own __file__).
+_TRADINGVIEW_STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tradingview", "state")
+TRADINGVIEW_SIGNAL_STATE_FILE = os.getenv(
+    "TRADINGVIEW_SIGNAL_STATE_FILE", os.path.join(_TRADINGVIEW_STATE_DIR, "latest_signals.json")
+)
+TRADINGVIEW_ACTIONABLE_QUEUE_FILE = os.getenv(
+    "TRADINGVIEW_ACTIONABLE_QUEUE_FILE", os.path.join(_TRADINGVIEW_STATE_DIR, "actionable_signals.jsonl")
+)
+TRADINGVIEW_CONSUMED_STATE_FILE = os.getenv(
+    "TRADINGVIEW_CONSUMED_STATE_FILE", os.path.join(_TRADINGVIEW_STATE_DIR, "bot_consumed_signal_ids.json")
+)
+TRADINGVIEW_POSITION_OWNERSHIP_FILE = os.getenv(
+    "TRADINGVIEW_POSITION_OWNERSHIP_FILE", os.path.join(_TRADINGVIEW_STATE_DIR, "tv_position_ownership.json")
+)
+TRADINGVIEW_MAX_PRICE_DRIFT_PCT = float(os.getenv("TRADINGVIEW_MAX_PRICE_DRIFT_PCT", "0.008"))
+_tv_signal_lock = threading.Lock()
+
 # Scoring thresholds (0-100)
 SCORE_STRONG = int(os.getenv("SCORE_STRONG", "80"))   # STRONG CALL/PUT alert
 SCORE_SIGNAL = int(os.getenv("SCORE_SIGNAL", "65"))   # CALL/PUT alert
@@ -6659,6 +6684,10 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "target_pct": target_pct,
         "stop_pct":   stop_pct,
         "strategy_mode": "SWING" if is_swing else "INTRADAY",
+        "signal_source": str((data or {}).get("signal_source", "BOT") or "BOT").upper(),
+        "tv_signal_id": str((data or {}).get("tv_signal_id", "") or ""),
+        "tv_reason_code": str((data or {}).get("tv_reason_code", "") or ""),
+        "tv_reason": str((data or {}).get("tv_reason", "") or ""),
         "max_hold_minutes": max_hold_minutes,
         "score":      score,
         "max_pnl_pct": 0.0,
@@ -7272,7 +7301,27 @@ def track_open_trades():
             close_trade(trade, current_price, "EMERGENCY STOP LOSS", pnl_pct)
             continue
 
-        # 5) Time stop: if the trade has sat too long, exit to avoid prolonged theta decay.
+        # 5) TradingView technical exit (INTRADAY only). EXIT_WATCH is telemetry only;
+        # EXIT is an additional close authority after the bot's existing structural/runner/
+        # emergency protections. SWING trades can never reach this branch.
+        tv_exit = _tv_exit_signal_for_trade(trade)
+        if tv_exit is not None:
+            tv_event = str(tv_exit.get("event", "") or "").upper()
+            tv_reason = str(tv_exit.get("reason", "") or tv_exit.get("reason_code", "") or "technical exit")
+            if tv_event == "EXIT_WATCH":
+                trade["tv_exit_watch"] = {
+                    "signal_id": tv_exit.get("signal_id"),
+                    "reason": tv_reason,
+                    "received_at": datetime.now(timezone.utc).isoformat(),
+                }
+                _tv_mark_signal_consumed(tv_exit, "exit_watch_recorded")
+                log(f"[{trade['underlying']}] TV EXIT_WATCH recorded (no close): {tv_reason}.")
+            elif tv_event == "EXIT":
+                _tv_mark_signal_consumed(tv_exit, "exit_requested")
+                close_trade(trade, current_price, f"TRADINGVIEW TECHNICAL EXIT: {tv_reason}", pnl_pct)
+                continue
+
+        # 6) Time stop: if the trade has sat too long, exit to avoid prolonged theta decay.
         effective_max_hold_minutes = float(trade.get("max_hold_minutes", MAX_TRADE_HOLD_MINUTES) or MAX_TRADE_HOLD_MINUTES)
         if effective_max_hold_minutes > 0 and held_minutes >= effective_max_hold_minutes:
             close_trade(trade, current_price, f"TIME EXIT ({held_minutes}m)", pnl_pct)
@@ -7904,6 +7953,7 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         return
 
     _open_trades.pop(trade["contract"], None)
+    _tv_clear_position_owner(trade.get("contract", ""))
 
     with _auto_retrain_lock:
         _auto_retrain_state["closed_count"] = int(_auto_retrain_state.get("closed_count", 0)) + 1
@@ -8486,6 +8536,335 @@ def run_websocket_cycle(client):
         time.sleep(loop_sleep)
 
 
+def _tv_load_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            value = json.load(f)
+        return value
+    except Exception:
+        return default
+
+
+def _tv_save_json(path, value):
+    try:
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(value, f, indent=2, default=str)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        log(f"[TRADINGVIEW] Failed to persist consumed signal state: {e}")
+        return False
+
+
+def _tv_set_position_owner(contract, signal=None):
+    contract = str(contract or "").upper()
+    if not contract:
+        return
+    with _tv_signal_lock:
+        state = _tv_load_json(TRADINGVIEW_POSITION_OWNERSHIP_FILE, {})
+        state[contract] = {
+            "source": "TRADINGVIEW",
+            "signal_id": str((signal or {}).get("signal_id", "") or ""),
+            "symbol": str((signal or {}).get("symbol", "") or "").upper(),
+            "side": str((signal or {}).get("side", "") or "").upper(),
+            "opened_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _tv_save_json(TRADINGVIEW_POSITION_OWNERSHIP_FILE, state)
+
+
+def _tv_contract_owned(contract):
+    state = _tv_load_json(TRADINGVIEW_POSITION_OWNERSHIP_FILE, {})
+    return str(contract or "").upper() in state if isinstance(state, dict) else False
+
+
+def _tv_clear_position_owner(contract):
+    contract = str(contract or "").upper()
+    if not contract:
+        return
+    with _tv_signal_lock:
+        state = _tv_load_json(TRADINGVIEW_POSITION_OWNERSHIP_FILE, {})
+        if isinstance(state, dict) and contract in state:
+            state.pop(contract, None)
+            _tv_save_json(TRADINGVIEW_POSITION_OWNERSHIP_FILE, state)
+
+
+def _tv_signal_consumed(signal_id):
+    if not signal_id:
+        return True
+    with _tv_signal_lock:
+        consumed = _tv_load_json(TRADINGVIEW_CONSUMED_STATE_FILE, {})
+        return signal_id in consumed
+
+
+def _tv_mark_signal_consumed(signal, outcome="processed"):
+    signal_id = str((signal or {}).get("signal_id", "") or "").strip()
+    if not signal_id:
+        return
+    with _tv_signal_lock:
+        consumed = _tv_load_json(TRADINGVIEW_CONSUMED_STATE_FILE, {})
+        consumed[signal_id] = {
+            "consumed_at": datetime.now(timezone.utc).isoformat(),
+            "outcome": str(outcome),
+            "symbol": str((signal or {}).get("symbol", "") or "").upper(),
+            "side": str((signal or {}).get("side", "") or "").upper(),
+            "event": str((signal or {}).get("event", "") or "").upper(),
+        }
+        # Bound growth without making execution depend on parsing old timestamps.
+        if len(consumed) > 5000:
+            consumed = dict(list(consumed.items())[-3000:])
+        _tv_save_json(TRADINGVIEW_CONSUMED_STATE_FILE, consumed)
+
+
+def _tv_actionable_signals(symbol=None, side=None, events=None):
+    """Read queued actionable webhook events; consumed ids are filtered by callers."""
+    out = []
+    try:
+        with open(TRADINGVIEW_ACTIONABLE_QUEUE_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    sig = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(sig, dict):
+                    continue
+                if str(sig.get("strategy_mode", "") or "").upper() != "INTRADAY":
+                    continue
+                if symbol and str(sig.get("symbol", "") or "").upper() != str(symbol).upper():
+                    continue
+                if side and str(sig.get("side", "") or "").upper() != str(side).upper():
+                    continue
+                if events and str(sig.get("event", "") or "").upper() not in {str(e).upper() for e in events}:
+                    continue
+                out.append(sig)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log(f"[TRADINGVIEW] Failed reading actionable queue: {e}")
+        return []
+    return out
+
+
+def _tv_latest_signal(symbol, side, event=None):
+    """Return the latest accepted webhook state for symbol/side if it matches event."""
+    symbol = str(symbol or "").upper()
+    side = str(side or "").upper()
+    state = _tv_load_json(TRADINGVIEW_SIGNAL_STATE_FILE, {})
+    signal = state.get(f"{symbol}:{side}") if isinstance(state, dict) else None
+    if not isinstance(signal, dict):
+        return None
+    if str(signal.get("strategy_mode", "") or "").upper() != "INTRADAY":
+        return None
+    if event and str(signal.get("event", "") or "").upper() != str(event).upper():
+        return None
+    return signal
+
+
+def _tv_parse_signal_time(signal):
+    raw = str((signal or {}).get("bar_time", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _tv_entry_signal_for_symbol(symbol):
+    """Return one unconsumed ENTRY signal, preferring the newest CALL/PUT event."""
+    if not TRADINGVIEW_ENTRY_ENABLED:
+        return None
+    candidates = []
+    for sig in _tv_actionable_signals(symbol=symbol, events={"ENTRY"}):
+        if _tv_signal_consumed(str(sig.get("signal_id", ""))):
+            continue
+        ts = _tv_parse_signal_time(sig)
+        candidates.append((ts or datetime.min.replace(tzinfo=timezone.utc), sig))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _tv_apply_entry_context(data, signal):
+    """Overlay TradingView's authoritative direction/reason while retaining bot market context."""
+    side = str(signal.get("side", "") or "").upper()
+    data = dict(data or {})
+    data["side"] = side
+    data["signal"] = f"TRADINGVIEW {side}"
+    data["strategy_mode"] = "INTRADAY"
+    data["signal_source"] = "TRADINGVIEW"
+    data["tv_signal_id"] = str(signal.get("signal_id", "") or "")
+    data["tv_setup_type"] = str(signal.get("setup_type", "") or "")
+    data["tv_reason_code"] = str(signal.get("reason_code", "") or "")
+    data["tv_reason"] = str(signal.get("reason", "") or "")
+    data["setup_type"] = data["tv_setup_type"] or "TRADINGVIEW"
+    data["entry_playbook"] = data["setup_type"]
+    # Keep sizing deterministic even when the old bot's directional score disagrees.
+    side_score = int(data.get("bull_score", 0) if side == "CALL" else data.get("bear_score", 0))
+    data["effective_score"] = max(side_score, SCORE_SIGNAL)
+    data["raw_entry_score"] = side_score
+    return data
+
+
+def _tv_contract_safety_ok(symbol, side, option, expected_dte):
+    """Execution-only contract checks for a TV-authoritative entry (no old thesis gates)."""
+    if not option:
+        return False, "missing option contract"
+    dte = _safe_int_num(option.get("dte", -1), -1)
+    if dte < max(0, int(expected_dte)) or dte > max(0, int(expected_dte)) + 3:
+        return False, f"DTE {dte} outside TV weekly window {expected_dte}-{expected_dte + 3}"
+    bid = _safe_float_num(option.get("bid", 0), 0)
+    ask = _safe_float_num(option.get("ask", 0), 0)
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return False, "invalid live bid/ask"
+    mid = (bid + ask) / 2.0
+    spread = (ask - bid) / mid if mid > 0 else float("inf")
+    max_spread = ETF_MAX_OPTION_SPREAD_PCT if symbol in ETF_SYMBOLS else STOCK_MAX_OPTION_SPREAD_PCT
+    if spread > max_spread:
+        return False, f"spread {spread*100:.1f}% > {max_spread*100:.1f}%"
+    delta = abs(_safe_float_num(option.get("delta", 0), 0))
+    if not (OPTION_ACCEPTABLE_DELTA_MIN <= delta <= OPTION_ACCEPTABLE_DELTA_MAX):
+        fallback_ok = (
+            OPTION_FALLBACK_DELTA_MIN <= delta < OPTION_ACCEPTABLE_DELTA_MIN
+            and _safe_float_num(option.get("volume", 0), 0) >= OPTION_FALLBACK_MIN_VOLUME
+            and _safe_float_num(option.get("open_interest", 0), 0) >= OPTION_FALLBACK_MIN_OI
+            and spread <= OPTION_FALLBACK_MAX_SPREAD_PCT
+        )
+        if not fallback_ok:
+            return False, f"delta {delta:.2f} outside executable band"
+    return True, "TV contract safety passed"
+
+
+def _tv_build_entry_candidate(client, symbol, data, signal, max_ext_from_vwap):
+    """Build a paper-executable candidate from a fresh TradingView ENTRY."""
+    side = str(signal.get("side", "") or "").upper()
+    signal_id = str(signal.get("signal_id", "") or "")
+    if side not in ("CALL", "PUT"):
+        _tv_mark_signal_consumed(signal, "invalid_side")
+        return None
+
+    signal_time = _tv_parse_signal_time(signal)
+    timeframe_raw = str(signal.get("timeframe", "5") or "5").upper()
+    try:
+        timeframe_minutes = 1440 if timeframe_raw in {"D", "1D"} else max(1, int(timeframe_raw))
+    except Exception:
+        timeframe_minutes = 5
+    if signal_time is None or (datetime.now(timezone.utc) - signal_time).total_seconds() > (timeframe_minutes * 60 + 90):
+        _tv_mark_signal_consumed(signal, "stale_at_execution")
+        log(f"[{symbol}] TV ENTRY {signal_id} rejected: signal is stale at execution time.")
+        return None
+
+    # Session/opening/closing windows remain risk controls, not strategy rediscovery.
+    if not market_open_now():
+        _tv_mark_signal_consumed(signal, "market_closed")
+        log(f"[{symbol}] TV ENTRY {signal_id} rejected: market is not open.")
+        return None
+    opening_left = opening_no_trade_minutes_remaining()
+    if opening_left > 0:
+        _tv_mark_signal_consumed(signal, "opening_window")
+        log(f"[{symbol}] TV ENTRY {signal_id} rejected: opening no-trade window ({opening_left}m left).")
+        return None
+    closing_left = closing_no_trade_minutes_remaining()
+    if closing_left > 0:
+        _tv_mark_signal_consumed(signal, "closing_window")
+        log(f"[{symbol}] TV ENTRY {signal_id} rejected: closing no-trade window ({closing_left}m left).")
+        return None
+
+    tv_price = _safe_float_num(signal.get("underlying_price", 0), 0)
+    live_price = _safe_float_num(data.get("price", 0), 0)
+    if tv_price <= 0 or live_price <= 0:
+        _tv_mark_signal_consumed(signal, "invalid_price")
+        return None
+    drift = abs(live_price - tv_price) / tv_price
+    if drift > max(0.0, TRADINGVIEW_MAX_PRICE_DRIFT_PCT):
+        _tv_mark_signal_consumed(signal, "price_drift")
+        log(f"[{symbol}] TV ENTRY {signal_id} rejected: price drift {drift*100:.2f}% > {TRADINGVIEW_MAX_PRICE_DRIFT_PCT*100:.2f}%.")
+        return None
+
+    # Preserve duplicate/capacity checks before expensive option-chain discovery.
+    already_open, detail = has_open_underlying_position(symbol, side)
+    if SINGLE_POSITION_PER_SYMBOL and already_open:
+        _tv_mark_signal_consumed(signal, "existing_position")
+        log(f"[{symbol}] TV ENTRY {signal_id} rejected: existing {side} position ({detail}).")
+        return None
+    capacity_ok, capacity_reason = same_direction_position_capacity_ok(symbol, side)
+    if not capacity_ok:
+        _tv_mark_signal_consumed(signal, "exposure_cap")
+        log(f"[{symbol}] TV ENTRY {signal_id} rejected: {capacity_reason}.")
+        return None
+
+    # Anti-chase remains a safety check, but old score/playbook/ignition/RSI/V2 gates do not.
+    ext_pct = abs(_safe_float_num(data.get("vwap_extension_pct", 0), 0))
+    if ANTI_CHASE_FILTER and ext_pct > max_ext_from_vwap:
+        _tv_mark_signal_consumed(signal, "anti_chase")
+        log(f"[{symbol}] TV ENTRY {signal_id} rejected: VWAP extension {ext_pct*100:.2f}% > {max_ext_from_vwap*100:.2f}%.")
+        return None
+
+    data = _tv_apply_entry_context(data, signal)
+    weekly_dte = _intraday_target_expiry_dte(datetime.now(central))
+    # Do not pass bot-strategy data into discovery prechecks: those prechecks intentionally
+    # encode the old thesis. Contract discovery itself still enforces quote/spread/liquidity/delta.
+    option = get_option_contract(
+        symbol, side, live_price, data=None, max_ext_from_vwap=None,
+        min_dte=weekly_dte, max_dte=weekly_dte, fallback_max_dte=weekly_dte + 3,
+    )
+    if not option:
+        _tv_mark_signal_consumed(signal, "no_contract")
+        log(f"[{symbol}] TV ENTRY {signal_id}: no executable option contract found.")
+        return None
+    safe, reason = _tv_contract_safety_ok(symbol, side, option, weekly_dte)
+    if not safe:
+        _tv_mark_signal_consumed(signal, "contract_safety")
+        log(f"[{symbol}] TV ENTRY {signal_id} rejected: {reason}.")
+        return None
+
+    log(f"[{symbol}] TV ENTRY accepted for paper execution: {side} | {reason} | signal_id={signal_id}")
+    return {"symbol": symbol, "side": side, "data": data, "option": option, "signal": signal}
+
+
+def _tv_exit_signal_for_trade(trade):
+    if not TRADINGVIEW_EXIT_ENABLED:
+        return None
+    if str(trade.get("strategy_mode", "") or "").upper() != "INTRADAY":
+        return None
+    # TV exits own only TV-sourced intraday positions; legacy bot trades keep their
+    # original exit authority and cannot be closed by an unrelated chart signal.
+    if (
+        str(trade.get("signal_source", "BOT") or "BOT").upper() != "TRADINGVIEW"
+        and not _tv_contract_owned(trade.get("contract", ""))
+    ):
+        return None
+    symbol = str(trade.get("underlying", "") or "").upper()
+    side = str(trade.get("side", "") or "").upper()
+    pending = [
+        sig for sig in _tv_actionable_signals(symbol=symbol, side=side, events={"EXIT_WATCH", "EXIT"})
+        if not _tv_signal_consumed(str(sig.get("signal_id", "")))
+    ]
+    if not pending:
+        return None
+    # Process in lifecycle order, oldest first, so EXIT_WATCH telemetry is not skipped
+    # merely because EXIT arrived before the next monitor cycle.
+    pending.sort(key=lambda sig: _tv_parse_signal_time(sig) or datetime.min.replace(tzinfo=timezone.utc))
+    signal = pending[0]
+    signal_time = _tv_parse_signal_time(signal)
+    opened = trade.get("opened_at")
+    if isinstance(opened, datetime) and signal_time is not None:
+        opened_utc = opened.astimezone(timezone.utc) if opened.tzinfo else opened.replace(tzinfo=central).astimezone(timezone.utc)
+        if signal_time < opened_utc:
+            _tv_mark_signal_consumed(signal, "predates_trade")
+            return None
+    return signal
+
+
 def run_symbol(client, symbol, prefetched_bars=None):
     bars = prefetched_bars if prefetched_bars is not None else fetch_bars(client, symbol)
     log(f"[{symbol}] Fetched {len(bars)} bars.")
@@ -8522,6 +8901,33 @@ def run_symbol(client, symbol, prefetched_bars=None):
 
         _update_symbol_opportunity_cache(symbol, data)
         _maybe_send_transition_alert(symbol, data)
+
+    # TradingView is authoritative only for a fresh ENTRY event. analyze() still
+    # supplies live market context, but the old score/playbook/ignition/V2 thesis
+    # gates are deliberately bypassed on this path. Existing execution/risk checks remain.
+    tv_signal = _tv_entry_signal_for_symbol(symbol)
+    if tv_signal is not None:
+        if not data:
+            _tv_mark_signal_consumed(tv_signal, "missing_market_context")
+            log(f"[{symbol}] TV ENTRY rejected: analyze() did not produce market context.")
+            return
+        tv_candidate = _tv_build_entry_candidate(client, symbol, data, tv_signal, max_ext_from_vwap)
+        if tv_candidate is None:
+            return
+        try:
+            opened = try_open_paper_trade(
+                symbol, tv_candidate["side"], tv_candidate["option"], tv_candidate["data"]
+            )
+        except Exception:
+            log(f"[{symbol}] TradingView paper-entry execution error:")
+            traceback.print_exc()
+            sys.stdout.flush()
+            opened = False
+        if opened:
+            _tv_set_position_owner(tv_candidate["option"].get("contract"), tv_signal)
+        _tv_mark_signal_consumed(tv_signal, "opened" if opened else "execution_failed")
+        log(f"[{symbol}] TV ENTRY {tv_signal.get('signal_id')} outcome={'OPENED' if opened else 'NOT_OPENED'}.")
+        return
 
     if side == "NO TRADE":
         return

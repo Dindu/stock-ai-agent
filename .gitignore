@@ -23,3 +23,6 @@ env/
 # Bot artifacts
 trade_results.csv
 *.log
+
+# TradingView webhook runtime state (signal state/dedupe — not source)
+tradingview/state/
