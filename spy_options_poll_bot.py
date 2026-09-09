@@ -32,6 +32,7 @@ import pytz
 import requests
 from dotenv import load_dotenv
 from engine.ai import analyze_briefing
+from engine.ulti_python import simulate as ulti_simulate, align_mtf_trends as ulti_align_mtf_trends
 
 from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
 from alpaca.data.live import StockDataStream
@@ -194,6 +195,17 @@ TRADINGVIEW_POSITION_OWNERSHIP_FILE = os.getenv(
 )
 TRADINGVIEW_MAX_PRICE_DRIFT_PCT = float(os.getenv("TRADINGVIEW_MAX_PRICE_DRIFT_PCT", "0.008"))
 _tv_signal_lock = threading.Lock()
+
+# Python ULTI engine (engine/ulti_python.py) — a from-scratch port of the same
+# Pine strategy the TradingView webhook path reflects. OFF by default and NOT
+# to be enabled until a real-session parity run has been reviewed (see
+# tradingview/parity_check.py). Independent of TRADINGVIEW_*_ENABLED; never
+# touches SWING trades.
+ULTI_ENTRY_ENABLED = os.getenv("ULTI_ENTRY_ENABLED", "0") == "1"
+ULTI_EXIT_ENABLED = os.getenv("ULTI_EXIT_ENABLED", "0") == "1"
+ULTI_STRATEGY_VERSION = os.getenv("ULTI_STRATEGY_VERSION", "6.2")
+ULTI_MTF_CACHE_TTL_SECONDS = int(os.getenv("ULTI_MTF_CACHE_TTL_SECONDS", "300"))
+_ulti_mtf_cache = {}
 
 # Scoring thresholds (0-100)
 SCORE_STRONG = int(os.getenv("SCORE_STRONG", "80"))   # STRONG CALL/PUT alert
@@ -7321,6 +7333,22 @@ def track_open_trades():
                 close_trade(trade, current_price, f"TRADINGVIEW TECHNICAL EXIT: {tv_reason}", pnl_pct)
                 continue
 
+        # 5b) Python ULTI technical exit (INTRADAY, ULTI-sourced trades only).
+        # Same priority position as the TradingView exit above: after the bot's
+        # own structural/runner/emergency protections, before the time stop.
+        if ULTI_EXIT_ENABLED and str(trade.get("signal_source", "") or "").upper() == "ULTI":
+            ulti_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+            ulti_exit = _ulti_exit_signal_for_trade(ulti_client, trade)
+            if ulti_exit is not None:
+                ulti_event = str(ulti_exit.get("event", "") or "").upper()
+                ulti_reason = str(ulti_exit.get("reason", "") or ulti_exit.get("reason_code", "") or "technical exit")
+                if ulti_event == "EXIT_WATCH":
+                    trade["ulti_exit_watch_reason"] = ulti_reason
+                    log(f"[{trade['underlying']}] ULTI EXIT_WATCH recorded (no close): {ulti_reason}.")
+                elif ulti_event == "EXIT":
+                    close_trade(trade, current_price, f"ULTI TECHNICAL EXIT: {ulti_reason}", pnl_pct)
+                    continue
+
         # 6) Time stop: if the trade has sat too long, exit to avoid prolonged theta decay.
         effective_max_hold_minutes = float(trade.get("max_hold_minutes", MAX_TRADE_HOLD_MINUTES) or MAX_TRADE_HOLD_MINUTES)
         if effective_max_hold_minutes > 0 and held_minutes >= effective_max_hold_minutes:
@@ -8865,6 +8893,178 @@ def _tv_exit_signal_for_trade(trade):
     return signal
 
 
+# ---------------------------------------------------------------------------
+# Python ULTI engine wiring. Independent of the TradingView webhook path above
+# -- ULTI computes the same strategy directly from Alpaca bars instead of
+# consuming a chart alert. OFF by default (ULTI_ENTRY_ENABLED/ULTI_EXIT_ENABLED)
+# and not to be enabled before a real-session parity review; see
+# tradingview/parity_check.py and engine/ulti_python.py's module docstring.
+# ---------------------------------------------------------------------------
+_ULTI_MTF_TIMEFRAMES = {
+    "1M": TimeFrame(1, TimeFrameUnit.Minute),
+    "5M": TimeFrame(5, TimeFrameUnit.Minute),
+    "15M": TimeFrame(15, TimeFrameUnit.Minute),
+    "30M": TimeFrame(30, TimeFrameUnit.Minute),
+    "1H": TimeFrame(1, TimeFrameUnit.Hour),
+    "4H": TimeFrame(4, TimeFrameUnit.Hour),
+    "D": TimeFrame(1, TimeFrameUnit.Day),
+}
+_ULTI_MTF_LOOKBACK_MULT = {"1M": 1, "5M": 1, "15M": 3, "30M": 6, "1H": 12, "4H": 48, "D": 300}
+
+
+def _ulti_fetch_mtf_bars(client, symbol, base_minutes=240):
+    """Fetch each SMC timeframe's own native bars, cached per-symbol with a TTL
+    since higher timeframes change slowly and re-fetching all 7 every scan
+    cycle would multiply Alpaca API calls across the whole symbol universe."""
+    now = datetime.now(timezone.utc)
+    cached = _ulti_mtf_cache.get(symbol)
+    if cached and (now - cached["fetched_at"]).total_seconds() < ULTI_MTF_CACHE_TTL_SECONDS:
+        return cached["bars"]
+    bars = {}
+    for label, tf in _ULTI_MTF_TIMEFRAMES.items():
+        try:
+            minutes = base_minutes * _ULTI_MTF_LOOKBACK_MULT[label]
+            start = now - timedelta(minutes=minutes + 60)
+            req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf, start=start, end=now, feed=DataFeed(FEED))
+            df = client.get_stock_bars(req).df
+            if df is not None and not df.empty:
+                if hasattr(df.index, "nlevels") and df.index.nlevels > 1:
+                    df = df.xs(symbol, level=0)
+                df = df.dropna()
+            bars[label] = df
+        except Exception as e:
+            log(f"[{symbol}] ULTI MTF fetch failed for {label}: {e}")
+            bars[label] = None
+    _ulti_mtf_cache[symbol] = {"fetched_at": now, "bars": bars}
+    return bars
+
+
+def _ulti_events_for_symbol(client, symbol, bars_5m):
+    """Run the full ULTI engine and return its event lifecycle for this symbol."""
+    if bars_5m is None or len(bars_5m) < 55:
+        return []
+    try:
+        mtf_bars = _ulti_fetch_mtf_bars(client, symbol)
+        mtf_trends = ulti_align_mtf_trends(bars_5m, mtf_bars, base_tf_label="5M")
+        return ulti_simulate(bars_5m, mtf_trends=mtf_trends)
+    except Exception as e:
+        log(f"[{symbol}] ULTI engine error: {e}")
+        return []
+
+
+def _ulti_entry_signal_for_symbol(client, symbol, bars_5m):
+    """Only act on an ENTRY belonging to the LATEST bar -- never replay history."""
+    if not ULTI_ENTRY_ENABLED or bars_5m is None or len(bars_5m) == 0:
+        return None
+    events = _ulti_events_for_symbol(client, symbol, bars_5m)
+    latest_bar_time = bars_5m.index[-1]
+    for ev in reversed(events):
+        if ev["event"] == "ENTRY" and ev["time"] == latest_bar_time:
+            return ev
+    return None
+
+
+def _ulti_apply_entry_context(data, event):
+    """Overlay ULTI's authoritative direction/reason while retaining bot market context."""
+    side = str(event.get("side", "") or "").upper()
+    data = dict(data or {})
+    data["side"] = side
+    data["signal"] = f"ULTI {side}"
+    data["strategy_mode"] = "INTRADAY"
+    data["signal_source"] = "ULTI"
+    data["setup_type"] = str(event.get("reason_code", "") or "ULTI")
+    data["entry_playbook"] = data["setup_type"]
+    side_score = int(data.get("bull_score", 0) if side == "CALL" else data.get("bear_score", 0))
+    data["effective_score"] = max(side_score, SCORE_SIGNAL)
+    data["raw_entry_score"] = side_score
+    return data
+
+
+def _ulti_build_entry_candidate(symbol, data, event, max_ext_from_vwap):
+    """Execution-safety-only gate for a ULTI-authoritative entry (no old thesis gates)."""
+    side = str(event.get("side", "") or "").upper()
+    if side not in ("CALL", "PUT"):
+        return None
+    if not market_open_now():
+        log(f"[{symbol}] ULTI ENTRY rejected: market is not open.")
+        return None
+    if opening_no_trade_minutes_remaining() > 0 or closing_no_trade_minutes_remaining() > 0:
+        log(f"[{symbol}] ULTI ENTRY rejected: opening/closing no-trade window.")
+        return None
+    already_open, detail = has_open_underlying_position(symbol, side)
+    if SINGLE_POSITION_PER_SYMBOL and already_open:
+        log(f"[{symbol}] ULTI ENTRY rejected: existing {side} position ({detail}).")
+        return None
+    capacity_ok, capacity_reason = same_direction_position_capacity_ok(symbol, side)
+    if not capacity_ok:
+        log(f"[{symbol}] ULTI ENTRY rejected: {capacity_reason}.")
+        return None
+    ext_pct = abs(_safe_float_num(data.get("vwap_extension_pct", 0), 0))
+    if ANTI_CHASE_FILTER and ext_pct > max_ext_from_vwap:
+        log(f"[{symbol}] ULTI ENTRY rejected: VWAP extension {ext_pct*100:.2f}% > {max_ext_from_vwap*100:.2f}%.")
+        return None
+
+    data = _ulti_apply_entry_context(data, event)
+    price = _safe_float_num(data.get("price", event.get("price", 0)), 0)
+    weekly_dte = _intraday_target_expiry_dte(datetime.now(central))
+    option = get_option_contract(
+        symbol, side, price, data=None, max_ext_from_vwap=None,
+        min_dte=weekly_dte, max_dte=weekly_dte, fallback_max_dte=weekly_dte + 3,
+    )
+    if not option:
+        log(f"[{symbol}] ULTI ENTRY: no executable option contract found.")
+        return None
+    safe, reason = _tv_contract_safety_ok(symbol, side, option, weekly_dte)
+    if not safe:
+        log(f"[{symbol}] ULTI ENTRY rejected: {reason}.")
+        return None
+    log(f"[{symbol}] ULTI ENTRY accepted for paper execution: {side} | {reason} | reason_code={event.get('reason_code')}")
+    return {"symbol": symbol, "side": side, "data": data, "option": option}
+
+
+def _ulti_exit_signal_for_trade(client, trade):
+    if not ULTI_EXIT_ENABLED:
+        return None
+    if str(trade.get("signal_source", "") or "").upper() != "ULTI":
+        return None
+    symbol = str(trade.get("underlying", "") or "").upper()
+    side = str(trade.get("side", "") or "").upper()
+    try:
+        bars_5m = fetch_bars(client, symbol)
+    except Exception as e:
+        log(f"[{symbol}] ULTI exit check: bar fetch failed: {e}")
+        return None
+    events = _ulti_events_for_symbol(client, symbol, bars_5m)
+    if not events:
+        return None
+    opened = trade.get("opened_at")
+    opened_utc = None
+    if isinstance(opened, datetime):
+        opened_utc = opened.astimezone(timezone.utc) if opened.tzinfo else opened.replace(tzinfo=central).astimezone(timezone.utc)
+
+    def _event_time_utc(ev):
+        t = ev["time"]
+        return t.tz_convert("UTC") if t.tzinfo else t.tz_localize("UTC")
+
+    candidates = [
+        e for e in events
+        if str(e.get("side", "")).upper() == side and e.get("event") in ("EXIT_WATCH", "EXIT")
+        and (opened_utc is None or _event_time_utc(e) >= opened_utc)
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda e: e["time"])
+    exits = [e for e in candidates if e["event"] == "EXIT"]
+    if exits:
+        return exits[0]
+    watches = [e for e in candidates if e["event"] == "EXIT_WATCH"]
+    if watches:
+        latest = watches[-1]
+        if trade.get("ulti_exit_watch_reason") != latest.get("reason"):
+            return latest
+    return None
+
+
 def run_symbol(client, symbol, prefetched_bars=None):
     bars = prefetched_bars if prefetched_bars is not None else fetch_bars(client, symbol)
     log(f"[{symbol}] Fetched {len(bars)} bars.")
@@ -8928,6 +9128,27 @@ def run_symbol(client, symbol, prefetched_bars=None):
         _tv_mark_signal_consumed(tv_signal, "opened" if opened else "execution_failed")
         log(f"[{symbol}] TV ENTRY {tv_signal.get('signal_id')} outcome={'OPENED' if opened else 'NOT_OPENED'}.")
         return
+
+    # Python ULTI is authoritative only for a fresh ENTRY event on the LATEST bar.
+    # Same bypass rationale as the TradingView path: old score/playbook/ignition/
+    # V2 thesis gates are deliberately skipped here, only execution-safety checks apply.
+    if ULTI_ENTRY_ENABLED and data:
+        ulti_event = _ulti_entry_signal_for_symbol(client, symbol, prefetched_bars if prefetched_bars is not None else bars)
+        if ulti_event is not None:
+            ulti_candidate = _ulti_build_entry_candidate(symbol, data, ulti_event, max_ext_from_vwap)
+            if ulti_candidate is None:
+                return
+            try:
+                opened = try_open_paper_trade(
+                    symbol, ulti_candidate["side"], ulti_candidate["option"], ulti_candidate["data"]
+                )
+            except Exception:
+                log(f"[{symbol}] ULTI paper-entry execution error:")
+                traceback.print_exc()
+                sys.stdout.flush()
+                opened = False
+            log(f"[{symbol}] ULTI ENTRY outcome={'OPENED' if opened else 'NOT_OPENED'}.")
+            return
 
     if side == "NO TRADE":
         return
