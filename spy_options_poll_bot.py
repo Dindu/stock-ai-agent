@@ -3439,6 +3439,21 @@ def detect_horizontal_levels(df, price, atr14, lookback=60):
         "resistance": resistance,
     }
 
+def _drop_forming_bar(df):
+    """Signals evaluate on closed bars only, matching Pine's barstate.isconfirmed."""
+    if df is None or len(df) == 0:
+        return df
+    try:
+        last_ts = pd.Timestamp(df.index[-1])
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.tz_localize("UTC")
+        if last_ts + pd.Timedelta(minutes=BAR_MINUTES) > pd.Timestamp.now(tz="UTC"):
+            return df.iloc[:-1]
+    except Exception:
+        return df
+    return df
+
+
 def analyze(df, client, symbol):
     """Compute weighted Bull/Bear scores (0-100) from independent factor groups.
 
@@ -3451,6 +3466,7 @@ def analyze(df, client, symbol):
         Pattern Quality   : 15%
         Option Liquidity  : 5% (underlying liquidity proxy pre-contract)
     """
+    df = _drop_forming_bar(df)
     if len(df) < 55:
         return "NO TRADE", None
 
