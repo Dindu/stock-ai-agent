@@ -206,6 +206,10 @@ ULTI_EXIT_ENABLED = os.getenv("ULTI_EXIT_ENABLED", "0") == "1"
 ULTI_STRATEGY_VERSION = os.getenv("ULTI_STRATEGY_VERSION", "6.2")
 ULTI_MTF_CACHE_TTL_SECONDS = int(os.getenv("ULTI_MTF_CACHE_TTL_SECONDS", "300"))
 _ulti_mtf_cache = {}
+# ULTI is the intended intraday engine. Legacy strategy authority is explicit
+# rollback-only; hard option-risk exits remain independent of these flags.
+LEGACY_INTRADAY_ENTRY_ENABLED = os.getenv("LEGACY_INTRADAY_ENTRY_ENABLED", "0") == "1"
+LEGACY_INTRADAY_EXIT_ENABLED = os.getenv("LEGACY_INTRADAY_EXIT_ENABLED", "0") == "1"
 
 # Scoring thresholds (0-100)
 SCORE_STRONG = int(os.getenv("SCORE_STRONG", "80"))   # STRONG CALL/PUT alert
@@ -7217,7 +7221,19 @@ def track_open_trades():
 
         # 1) Primary exit: underlying thesis invalidation (not option PnL).
         is_swing_trade = str(trade.get("strategy_mode", "") or "").upper() == "SWING"
-        thesis_state = _swing_thesis_state(trade) if is_swing_trade else _underlying_thesis_state(trade)
+        is_ulti_trade = str(trade.get("signal_source", "") or "").upper() == "ULTI"
+        if is_swing_trade:
+            thesis_state = _swing_thesis_state(trade)
+        elif is_ulti_trade or not LEGACY_INTRADAY_EXIT_ENABLED:
+            thesis_state = {
+                "ready": True,
+                "invalid": False,
+                "score_deteriorated": False,
+                "price": 0.0,
+                "reason": "strategy-specific intraday thesis disabled",
+            }
+        else:
+            thesis_state = _underlying_thesis_state(trade)
         if thesis_state.get("ready"):
             trade["thesis_data_fail_count"] = 0
             # Track underlying MFE/MAE independently of option premium.
@@ -9180,6 +9196,10 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 opened = False
             log(f"[{symbol}] ULTI ENTRY outcome={'OPENED' if opened else 'NOT_OPENED'}.")
             return
+
+    if not LEGACY_INTRADAY_ENTRY_ENABLED:
+        log(f"[{symbol}] Legacy intraday entry path disabled; no ULTI entry on latest bar.")
+        return
 
     if side == "NO TRADE":
         return
