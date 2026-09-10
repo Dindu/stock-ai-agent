@@ -7860,6 +7860,10 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         short_reason = "RUNNER TRAILING STOP"
     elif short_reason.startswith("RUNNER PNL GIVEBACK STOP"):
         short_reason = "RUNNER PROFIT GIVEBACK"
+    elif short_reason.startswith("TRADINGVIEW TECHNICAL EXIT"):
+        short_reason = "TV TECHNICAL EXIT"
+    elif short_reason.startswith("ULTI TECHNICAL EXIT"):
+        short_reason = "ULTI TECHNICAL EXIT"
     elif short_reason.startswith("TIME EXIT"):
         short_reason = "TIME EXIT"
     is_partial = (not final_close and close_qty_int < current_qty)
@@ -7869,18 +7873,21 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     else:
         net_str = f"${shown_dollar:+.2f}"
 
+    exit_signal_source = str(trade.get("signal_source", "BOT") or "BOT").upper()
+    source_tag = {"ULTI": f" · ULTI {ULTI_STRATEGY_VERSION}", "TRADINGVIEW": " · TradingView"}.get(exit_signal_source, "")
+
     if is_partial:
         status_icon = "\U0001f4b0"
         net_icon = "\U0001f512" if shown_dollar >= 0 else "\U0001f534"
-        line1 = f"{status_icon} **{trade['underlying']} {trade['side']}** · {outcome_pnl_pct * 100:+.2f}% · PARTIAL"
+        line1 = f"{status_icon} **{trade['underlying']} {trade['side']}** · {outcome_pnl_pct * 100:+.2f}% · PARTIAL{source_tag}"
         line3 = f"{net_icon} {net_str}"
     elif outcome_pnl_pct >= 0:
         status_icon = "\u2705"
-        line1 = f"{status_icon} **{trade['underlying']} {trade['side']}** · {outcome_pnl_pct * 100:+.2f}%"
+        line1 = f"{status_icon} **{trade['underlying']} {trade['side']}** · {outcome_pnl_pct * 100:+.2f}%{source_tag}"
         line3 = f"\U0001f4b0 {net_str}"
     else:
         status_icon = "\U0001f6d1"
-        line1 = f"{status_icon} **{trade['underlying']} {trade['side']}** · {outcome_pnl_pct * 100:+.2f}%"
+        line1 = f"{status_icon} **{trade['underlying']} {trade['side']}** · {outcome_pnl_pct * 100:+.2f}%{source_tag}"
         line3 = f"\U0001f534 {net_str} · {short_reason}"
 
     exit_message = (
@@ -7996,7 +8003,7 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
 
     maybe_trigger_auto_retrain(trigger_reason=f"closed:{trade.get('underlying', 'UNKNOWN')}")
 
-    log(f"[{trade['underlying']}] Closed {trade['contract']} ({reason}, {pnl_pct * 100:+.2f}%)")
+    log(f"[{trade['underlying']}] Closed {trade['contract']} (source={exit_signal_source}, {reason}, {pnl_pct * 100:+.2f}%)")
 
 
 def _refresh_option_quote_before_execution(symbol, option):
@@ -8186,6 +8193,7 @@ def try_open_paper_trade(symbol, side, option, data):
 
     side_suffix = "C" if trade['side'] == 'CALL' else "P"
     strike_contract = f"{strike_text}{side_suffix}"
+    signal_source = str(trade.get("signal_source", "BOT") or "BOT").upper()
     primary_score = int(data.get("bull_score", score) if trade['side'] == 'CALL' else data.get("bear_score", score))
     setup_compact = "PULLBACK" if "PULLBACK" in setup.upper() else ("BREAKOUT" if "BREAKOUT" in setup.upper() else setup.upper())
     trigger_raw = str((trade.get("one_minute_trigger") or data.get("one_minute_trigger") or "") or "").upper()
@@ -8198,11 +8206,29 @@ def try_open_paper_trade(symbol, side, option, data):
     else:
         trigger_compact = "SNIPER CONFIRMED"
 
+    if signal_source == "ULTI":
+        source_line = f"\U0001f9e0 `ULTI {ULTI_STRATEGY_VERSION}` · {str(trade.get('tv_reason_code', '') or setup)}"
+        detail_line = f"\U0001f4dd {str(trade.get('tv_reason', '') or 'technical setup')}"
+    elif signal_source == "TRADINGVIEW":
+        source_line = f"\U0001f4ca `TradingView` · {str(trade.get('tv_reason_code', '') or setup)}"
+        detail_line = f"\U0001f4dd {str(trade.get('tv_reason', '') or 'technical setup')}"
+    else:
+        source_line = f"\U0001f525 {'Bull' if trade['side'] == 'CALL' else 'Bear'} `{primary_score}` · {setup_compact} · {trigger_compact}"
+        detail_line = None
+
+    entry_lines = [
+        f"\U0001f3af **{trade['underlying']} {trade['side']}** · {expiry_mmdd} · {strike_contract}",
+        f"\U0001f4b5 `${trade['entry']:.2f}` · Spot `${underlying_entry_price:.2f}` · Qty `{trade['qty']}`",
+        source_line,
+    ]
+    if detail_line:
+        entry_lines.append(detail_line)
+    entry_lines.append(
+        f"\U0001f3af `${target_1:.2f}` / `${target_2:.2f}` · \U0001f6e1\ufe0f `-{stop_pct:.0f}%` · `{trade['opened_at']:%H:%M CT}`"
+    )
+
     entry_msg = send_discord(
-        f"\U0001f3af **{trade['underlying']} {trade['side']}** · {expiry_mmdd} · {strike_contract}\n"
-        f"\U0001f4b5 `${trade['entry']:.2f}` · Spot `${underlying_entry_price:.2f}` · Qty `{trade['qty']}`\n"
-        f"\U0001f525 {'Bull' if trade['side'] == 'CALL' else 'Bear'} `{primary_score}` · {setup_compact} · {trigger_compact}\n"
-        f"\U0001f3af `${target_1:.2f}` / `${target_2:.2f}` · \U0001f6e1\ufe0f `-{stop_pct:.0f}%` · `{trade['opened_at']:%H:%M CT}`",
+        "\n".join(entry_lines),
         color=DISCORD_COLOR_CALL if trade['side'] == 'CALL' else DISCORD_COLOR_PUT,
         wait_for_response=True,
         webhook_url=DISCORD_WEBHOOK_LIVE_TRADES_URL,
@@ -8215,7 +8241,7 @@ def try_open_paper_trade(symbol, side, option, data):
         pass
 
     log(f"[{symbol}] Paper trade opened: {trade['contract']} fill ${trade['entry']:.2f} "
-        f"underlying ${underlying_entry_price:.2f} timing={entry_timing} "
+        f"underlying ${underlying_entry_price:.2f} source={signal_source} timing={entry_timing} "
         f"ignition={entry_ignition_delta:+d} OI={entry_option_oi:,} "
         f"target ${trade['target']:.2f} stop ${trade['stop']:.2f}")
     return True
@@ -8974,6 +9000,11 @@ def _ulti_apply_entry_context(data, event):
     data["signal_source"] = "ULTI"
     data["setup_type"] = str(event.get("reason_code", "") or "ULTI")
     data["entry_playbook"] = data["setup_type"]
+    # Reuse the same generic reason-text slots the TradingView path populates
+    # (open_trade_record()/Discord/logs read these regardless of source) so the
+    # actual human-readable technical reason isn't lost for ULTI trades either.
+    data["tv_reason_code"] = str(event.get("reason_code", "") or "")
+    data["tv_reason"] = str(event.get("reason", "") or "")
     side_score = int(data.get("bull_score", 0) if side == "CALL" else data.get("bear_score", 0))
     data["effective_score"] = max(side_score, SCORE_SIGNAL)
     data["raw_entry_score"] = side_score
