@@ -194,6 +194,13 @@ TRADINGVIEW_POSITION_OWNERSHIP_FILE = os.getenv(
     "TRADINGVIEW_POSITION_OWNERSHIP_FILE", os.path.join(_TRADINGVIEW_STATE_DIR, "tv_position_ownership.json")
 )
 TRADINGVIEW_MAX_PRICE_DRIFT_PCT = float(os.getenv("TRADINGVIEW_MAX_PRICE_DRIFT_PCT", "0.008"))
+# When enabled, a TradingView strategy fill is the sole signal authority for
+# that trade.  This is intentionally opt-in: it bypasses the bot's opening/
+# closing window, VWAP-extension, price-drift, score and portfolio gates, and
+# suppresses the bot's independent exits.  Broker feasibility checks (market
+# open, a valid option quote, buying power and duplicate contract protection)
+# remain because a live option order cannot be placed without them.
+TRADINGVIEW_EXACT_STRATEGY_MODE = os.getenv("TRADINGVIEW_EXACT_STRATEGY_MODE", "0") == "1"
 _tv_signal_lock = threading.Lock()
 
 # Python ULTI engine (engine/ulti_python.py) — a from-scratch port of the same
@@ -6701,6 +6708,7 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "stop_pct":   stop_pct,
         "strategy_mode": "SWING" if is_swing else "INTRADAY",
         "signal_source": str((data or {}).get("signal_source", "BOT") or "BOT").upper(),
+        "tradingview_exact_strategy": bool((data or {}).get("tradingview_exact_strategy", False)),
         "tv_signal_id": str((data or {}).get("tv_signal_id", "") or ""),
         "tv_reason_code": str((data or {}).get("tv_reason_code", "") or ""),
         "tv_reason": str((data or {}).get("tv_reason", "") or ""),
@@ -7210,6 +7218,28 @@ def track_open_trades():
             f"PnL {pnl_pct * 100:+.2f}%")
 
         maybe_send_trade_progress_alert(trade, current_price, pnl_pct)
+
+        # Exact TradingView mode intentionally leaves the position open until
+        # the chart strategy itself reports an EXIT.  In particular, do not let
+        # option-premium targets/stops, score deterioration, runner logic or a
+        # time stop make the bot appear to disagree with Strategy Tester.
+        if bool(trade.get("tradingview_exact_strategy", False)):
+            tv_exit = _tv_exit_signal_for_trade(trade)
+            if tv_exit is not None:
+                tv_event = str(tv_exit.get("event", "") or "").upper()
+                tv_reason = str(tv_exit.get("reason", "") or tv_exit.get("reason_code", "") or "technical exit")
+                if tv_event == "EXIT_WATCH":
+                    trade["tv_exit_watch"] = {
+                        "signal_id": tv_exit.get("signal_id"),
+                        "reason": tv_reason,
+                        "received_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    _tv_mark_signal_consumed(tv_exit, "exit_watch_recorded")
+                    log(f"[{trade['underlying']}] TV exact-mode EXIT_WATCH recorded (no close): {tv_reason}.")
+                elif tv_event == "EXIT":
+                    _tv_mark_signal_consumed(tv_exit, "exact_strategy_exit")
+                    close_trade(trade, current_price, f"TRADINGVIEW EXACT STRATEGY EXIT: {tv_reason}", pnl_pct)
+            continue
 
         target_pct = float(trade.get("target_pct", PROFIT_TARGET_PCT) or PROFIT_TARGET_PCT)
         stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT)
@@ -8069,7 +8099,8 @@ def try_open_paper_trade(symbol, side, option, data):
     # Refresh from Alpaca first so capacity/duplicate checks use broker truth.
     sync_open_trades_from_alpaca()
 
-    if len(_open_trades) >= MAX_OPEN_TRADES:
+    exact_tv_trade = bool((data or {}).get("tradingview_exact_strategy", False))
+    if not exact_tv_trade and len(_open_trades) >= MAX_OPEN_TRADES:
         log(f"[{symbol}] Paper-trade capacity full ({len(_open_trades)}/{MAX_OPEN_TRADES}) — skipping.")
         return False
     if SINGLE_POSITION_PER_SYMBOL:
@@ -8081,7 +8112,7 @@ def try_open_paper_trade(symbol, side, option, data):
         log(f"[{symbol}] Already long {option['contract']} — not stacking.")
         return False
     direction_capacity_ok, direction_capacity_reason = same_direction_position_capacity_ok(symbol, side)
-    if not direction_capacity_ok:
+    if not exact_tv_trade and not direction_capacity_ok:
         log(f"[{symbol}] Correlated-entry guard: {direction_capacity_reason} — skipping.")
         _record_entry_block("exposure_cap")
         return False
@@ -8772,6 +8803,7 @@ def _tv_apply_entry_context(data, signal):
     data["signal"] = f"TRADINGVIEW {side}"
     data["strategy_mode"] = "INTRADAY"
     data["signal_source"] = "TRADINGVIEW"
+    data["tradingview_exact_strategy"] = TRADINGVIEW_EXACT_STRATEGY_MODE
     data["tv_signal_id"] = str(signal.get("signal_id", "") or "")
     data["tv_setup_type"] = str(signal.get("setup_type", "") or "")
     data["tv_reason_code"] = str(signal.get("reason_code", "") or "")
@@ -8833,21 +8865,23 @@ def _tv_build_entry_candidate(client, symbol, data, signal, max_ext_from_vwap):
         log(f"[{symbol}] TV ENTRY {signal_id} rejected: signal is stale at execution time.")
         return None
 
-    # Session/opening/closing windows remain risk controls, not strategy rediscovery.
+    # A strategy cannot fill outside the exchange session.  Exact mode otherwise
+    # deliberately does not impose the bot's time-of-day entry windows.
     if not market_open_now():
         _tv_mark_signal_consumed(signal, "market_closed")
         log(f"[{symbol}] TV ENTRY {signal_id} rejected: market is not open.")
         return None
-    opening_left = opening_no_trade_minutes_remaining()
-    if opening_left > 0:
-        _tv_mark_signal_consumed(signal, "opening_window")
-        log(f"[{symbol}] TV ENTRY {signal_id} rejected: opening no-trade window ({opening_left}m left).")
-        return None
-    closing_left = closing_no_trade_minutes_remaining()
-    if closing_left > 0:
-        _tv_mark_signal_consumed(signal, "closing_window")
-        log(f"[{symbol}] TV ENTRY {signal_id} rejected: closing no-trade window ({closing_left}m left).")
-        return None
+    if not TRADINGVIEW_EXACT_STRATEGY_MODE:
+        opening_left = opening_no_trade_minutes_remaining()
+        if opening_left > 0:
+            _tv_mark_signal_consumed(signal, "opening_window")
+            log(f"[{symbol}] TV ENTRY {signal_id} rejected: opening no-trade window ({opening_left}m left).")
+            return None
+        closing_left = closing_no_trade_minutes_remaining()
+        if closing_left > 0:
+            _tv_mark_signal_consumed(signal, "closing_window")
+            log(f"[{symbol}] TV ENTRY {signal_id} rejected: closing no-trade window ({closing_left}m left).")
+            return None
 
     tv_price = _safe_float_num(signal.get("underlying_price", 0), 0)
     live_price = _safe_float_num(data.get("price", 0), 0)
@@ -8855,7 +8889,7 @@ def _tv_build_entry_candidate(client, symbol, data, signal, max_ext_from_vwap):
         _tv_mark_signal_consumed(signal, "invalid_price")
         return None
     drift = abs(live_price - tv_price) / tv_price
-    if drift > max(0.0, TRADINGVIEW_MAX_PRICE_DRIFT_PCT):
+    if not TRADINGVIEW_EXACT_STRATEGY_MODE and drift > max(0.0, TRADINGVIEW_MAX_PRICE_DRIFT_PCT):
         _tv_mark_signal_consumed(signal, "price_drift")
         log(f"[{symbol}] TV ENTRY {signal_id} rejected: price drift {drift*100:.2f}% > {TRADINGVIEW_MAX_PRICE_DRIFT_PCT*100:.2f}%.")
         return None
@@ -8867,14 +8901,14 @@ def _tv_build_entry_candidate(client, symbol, data, signal, max_ext_from_vwap):
         log(f"[{symbol}] TV ENTRY {signal_id} rejected: existing {side} position ({detail}).")
         return None
     capacity_ok, capacity_reason = same_direction_position_capacity_ok(symbol, side)
-    if not capacity_ok:
+    if not TRADINGVIEW_EXACT_STRATEGY_MODE and not capacity_ok:
         _tv_mark_signal_consumed(signal, "exposure_cap")
         log(f"[{symbol}] TV ENTRY {signal_id} rejected: {capacity_reason}.")
         return None
 
     # Anti-chase remains a safety check, but old score/playbook/ignition/RSI/V2 gates do not.
     ext_pct = abs(_safe_float_num(data.get("vwap_extension_pct", 0), 0))
-    if ANTI_CHASE_FILTER and ext_pct > max_ext_from_vwap:
+    if not TRADINGVIEW_EXACT_STRATEGY_MODE and ANTI_CHASE_FILTER and ext_pct > max_ext_from_vwap:
         _tv_mark_signal_consumed(signal, "anti_chase")
         log(f"[{symbol}] TV ENTRY {signal_id} rejected: VWAP extension {ext_pct*100:.2f}% > {max_ext_from_vwap*100:.2f}%.")
         return None
