@@ -419,6 +419,9 @@ THESIS_SCORE_CONFIRM_CYCLES = int(os.getenv("THESIS_SCORE_CONFIRM_CYCLES", "2"))
 THESIS_SCORE_CONFIRM_SECONDS = float(os.getenv("THESIS_SCORE_CONFIRM_SECONDS", "10"))
 EMERGENCY_DATA_FAIL_EXIT_ENABLED = os.getenv("EMERGENCY_DATA_FAIL_EXIT_ENABLED", "1") == "1"
 EMERGENCY_DATA_FAIL_CYCLES = int(os.getenv("EMERGENCY_DATA_FAIL_CYCLES", "3"))
+PINE_EMERGENCY_STOP_PCT = float(os.getenv("PINE_EMERGENCY_STOP_PCT", str(STOP_LOSS_PCT)))
+PINE_DATA_FAIL_EXIT_ENABLED = os.getenv("PINE_DATA_FAIL_EXIT_ENABLED", "1") == "1"
+PINE_DATA_FAIL_CYCLES = int(os.getenv("PINE_DATA_FAIL_CYCLES", "3"))
 RUNNER_UNDERLYING_TRAIL_PCT = float(os.getenv("RUNNER_UNDERLYING_TRAIL_PCT", "0.0035"))
 # Second, independent guard alongside the underlying runner trail: protects the
 # option's own P&L peak once a runner has shown strong gains, since delta/gamma/IV
@@ -7242,6 +7245,15 @@ def track_open_trades():
                     log(f"[{trade['underlying']}] Local Pine BB EXIT_WATCH recorded (no close): {reason}.")
                 elif event_name == "EXIT":
                     close_trade(trade, current_price, f"LOCAL PINE BB EXIT: {reason}", pnl_pct)
+            elif pnl_pct <= -abs(PINE_EMERGENCY_STOP_PCT):
+                close_trade(trade, current_price, "LOCAL PINE EMERGENCY OPTION STOP", pnl_pct)
+            elif trade.get("pine_exit_last_status") == "error":
+                failures = int(trade.get("pine_data_fail_count", 0) or 0) + 1
+                trade["pine_data_fail_count"] = failures
+                if PINE_DATA_FAIL_EXIT_ENABLED and failures >= max(1, PINE_DATA_FAIL_CYCLES):
+                    close_trade(trade, current_price, "LOCAL PINE EMERGENCY DATA EXIT", pnl_pct)
+            else:
+                trade["pine_data_fail_count"] = 0
             continue
 
         # Exact TradingView mode intentionally leaves the position open until
@@ -9158,6 +9170,7 @@ def _ulti_build_entry_candidate(symbol, data, event, max_ext_from_vwap):
 
 
 def _ulti_exit_signal_for_trade(client, trade):
+    trade["pine_exit_last_status"] = "error"
     if not ULTI_EXIT_ENABLED and not PINE_BB_LOCAL_MODE:
         return None
     if str(trade.get("signal_source", "") or "").upper() != "ULTI":
@@ -9169,7 +9182,11 @@ def _ulti_exit_signal_for_trade(client, trade):
     except Exception as e:
         log(f"[{symbol}] ULTI exit check: bar fetch failed: {e}")
         return None
+    if bars_5m is None or len(bars_5m) < 55:
+        log(f"[{symbol}] ULTI exit check: insufficient bars ({0 if bars_5m is None else len(bars_5m)}/55).")
+        return None
     events = _ulti_events_for_symbol(client, symbol, bars_5m)
+    trade["pine_exit_last_status"] = "ok"
     if not events:
         return None
     opened = trade.get("opened_at")
@@ -9267,10 +9284,18 @@ def run_symbol(client, symbol, prefetched_bars=None):
     # Python ULTI is authoritative only for a fresh ENTRY event on the LATEST bar.
     # Same bypass rationale as the TradingView path: old score/playbook/ignition/
     # V2 thesis gates are deliberately skipped here, only execution-safety checks apply.
-    if (ULTI_ENTRY_ENABLED or PINE_BB_LOCAL_MODE) and data:
+    if (ULTI_ENTRY_ENABLED or PINE_BB_LOCAL_MODE):
+        pine_data = data or {
+            "symbol": symbol,
+            "price": float(bars["close"].iloc[-1]),
+            "bull_score": 0,
+            "bear_score": 0,
+            "signal": "PINE BB",
+            "sentiment": "NEUTRAL",
+        }
         ulti_event = _ulti_entry_signal_for_symbol(client, symbol, bars)
         if ulti_event is not None:
-            ulti_candidate = _ulti_build_entry_candidate(symbol, data, ulti_event, max_ext_from_vwap)
+            ulti_candidate = _ulti_build_entry_candidate(symbol, pine_data, ulti_event, max_ext_from_vwap)
             if ulti_candidate is None:
                 return
             try:
