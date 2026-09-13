@@ -114,6 +114,7 @@ ENABLE_SYMBOL_NEWS_CONTEXT = os.getenv("ENABLE_SYMBOL_NEWS_CONTEXT", "1") == "1"
 SYMBOL_NEWS_HEADLINES = int(os.getenv("SYMBOL_NEWS_HEADLINES", "2"))
 SYMBOL_NEWS_REFRESH_SECONDS = int(os.getenv("SYMBOL_NEWS_REFRESH_SECONDS", "300"))
 BAR_MINUTES = 5
+RTH_ONLY = os.getenv("PINE_RTH_ONLY", "1") == "1"
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))  # 30 seconds for index options
 WS_SYMBOL_MIN_EVAL_SECONDS = int(os.getenv("WS_SYMBOL_MIN_EVAL_SECONDS", "5"))
 WS_EXIT_CHECK_SECONDS = int(os.getenv("WS_EXIT_CHECK_SECONDS", "5"))
@@ -212,6 +213,11 @@ ULTI_ENTRY_ENABLED = os.getenv("ULTI_ENTRY_ENABLED", "0") == "1"
 ULTI_EXIT_ENABLED = os.getenv("ULTI_EXIT_ENABLED", "0") == "1"
 ULTI_STRATEGY_VERSION = os.getenv("ULTI_STRATEGY_VERSION", "6.2")
 ULTI_MTF_CACHE_TTL_SECONDS = int(os.getenv("ULTI_MTF_CACHE_TTL_SECONDS", "300"))
+# Local Pine BB authority.  This uses the native Python port on completed
+# Alpaca 5-minute bars rather than a TradingView webhook.  Match this to the
+# Pine script's "Test Mode" input; its default is BB BASELINE.
+PINE_BB_LOCAL_MODE = os.getenv("PINE_BB_LOCAL_MODE", "0") == "1"
+PINE_BB_TEST_MODE = os.getenv("PINE_BB_TEST_MODE", "BB BASELINE").strip().upper()
 _ulti_mtf_cache = {}
 # ULTI is the intended intraday engine. Legacy strategy authority is explicit
 # rollback-only; hard option-risk exits remain independent of these flags.
@@ -4782,7 +4788,8 @@ def fetch_bars(client, symbol):
     if isinstance(bars.index, pd.MultiIndex):
         bars = bars.xs(symbol, level=0)
 
-    bars = bars[["open", "high", "low", "close", "volume"]].tail(LOOKBACK_BARS)
+    bars = bars[["open", "high", "low", "close", "volume"]]
+    bars = _rth_bars(bars, BAR_MINUTES).tail(LOOKBACK_BARS)
     return bars
 
 
@@ -4806,7 +4813,8 @@ def fetch_1m_bars(client, symbol):
         return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
     if isinstance(bars.index, pd.MultiIndex):
         bars = bars.xs(symbol, level=0)
-    bars = bars[["open", "high", "low", "close", "volume"]].tail(ONE_MINUTE_LOOKBACK_BARS + 5)
+    bars = bars[["open", "high", "low", "close", "volume"]]
+    bars = _rth_bars(bars, 1).tail(ONE_MINUTE_LOOKBACK_BARS + 5)
 
     # Never use a still-forming 1-minute candle for the trigger when requested.
     if ONE_MINUTE_REQUIRE_CLOSED_BAR and len(bars):
@@ -6709,6 +6717,7 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "strategy_mode": "SWING" if is_swing else "INTRADAY",
         "signal_source": str((data or {}).get("signal_source", "BOT") or "BOT").upper(),
         "tradingview_exact_strategy": bool((data or {}).get("tradingview_exact_strategy", False)),
+        "pine_bb_local_strategy": bool((data or {}).get("pine_bb_local_strategy", False)),
         "tv_signal_id": str((data or {}).get("tv_signal_id", "") or ""),
         "tv_reason_code": str((data or {}).get("tv_reason_code", "") or ""),
         "tv_reason": str((data or {}).get("tv_reason", "") or ""),
@@ -7218,6 +7227,22 @@ def track_open_trades():
             f"PnL {pnl_pct * 100:+.2f}%")
 
         maybe_send_trade_progress_alert(trade, current_price, pnl_pct)
+
+        # Local Pine BB mode mirrors the strategy's own management/reversal
+        # events.  Do not mix it with the legacy option-P&L, thesis or time
+        # exits, which are not present in the Pine script.
+        if bool(trade.get("pine_bb_local_strategy", False)):
+            ulti_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+            pine_exit = _ulti_exit_signal_for_trade(ulti_client, trade)
+            if pine_exit is not None:
+                event_name = str(pine_exit.get("event", "") or "").upper()
+                reason = str(pine_exit.get("reason", "") or pine_exit.get("reason_code", "") or "Pine BB exit")
+                if event_name == "EXIT_WATCH":
+                    trade["ulti_exit_watch_reason"] = reason
+                    log(f"[{trade['underlying']}] Local Pine BB EXIT_WATCH recorded (no close): {reason}.")
+                elif event_name == "EXIT":
+                    close_trade(trade, current_price, f"LOCAL PINE BB EXIT: {reason}", pnl_pct)
+            continue
 
         # Exact TradingView mode intentionally leaves the position open until
         # the chart strategy itself reports an EXIT.  In particular, do not let
@@ -8099,8 +8124,8 @@ def try_open_paper_trade(symbol, side, option, data):
     # Refresh from Alpaca first so capacity/duplicate checks use broker truth.
     sync_open_trades_from_alpaca()
 
-    exact_tv_trade = bool((data or {}).get("tradingview_exact_strategy", False))
-    if not exact_tv_trade and len(_open_trades) >= MAX_OPEN_TRADES:
+    strategy_authoritative_trade = bool((data or {}).get("tradingview_exact_strategy", False)) or bool((data or {}).get("pine_bb_local_strategy", False))
+    if not strategy_authoritative_trade and len(_open_trades) >= MAX_OPEN_TRADES:
         log(f"[{symbol}] Paper-trade capacity full ({len(_open_trades)}/{MAX_OPEN_TRADES}) — skipping.")
         return False
     if SINGLE_POSITION_PER_SYMBOL:
@@ -8112,7 +8137,7 @@ def try_open_paper_trade(symbol, side, option, data):
         log(f"[{symbol}] Already long {option['contract']} — not stacking.")
         return False
     direction_capacity_ok, direction_capacity_reason = same_direction_position_capacity_ok(symbol, side)
-    if not exact_tv_trade and not direction_capacity_ok:
+    if not strategy_authoritative_trade and not direction_capacity_ok:
         log(f"[{symbol}] Correlated-entry guard: {direction_capacity_reason} — skipping.")
         _record_entry_block("exposure_cap")
         return False
@@ -8987,6 +9012,20 @@ _ULTI_MTF_TIMEFRAMES = {
 }
 _ULTI_MTF_LOOKBACK_MULT = {"1M": 1, "5M": 1, "15M": 3, "30M": 6, "1H": 12, "4H": 48, "D": 300}
 
+def _rth_bars(bars, timeframe_minutes):
+    """Keep intraday bars overlapping the 09:30-16:00 New York session."""
+    if not RTH_ONLY or bars is None or bars.empty:
+        return bars
+    index = pd.DatetimeIndex(bars.index)
+    if index.tz is None:
+        index = index.tz_localize("UTC")
+    index_et = index.tz_convert("America/New_York")
+    session_open = index_et.normalize() + pd.Timedelta(hours=9, minutes=30)
+    session_close = index_et.normalize() + pd.Timedelta(hours=16)
+    bar_end = index_et + pd.Timedelta(minutes=timeframe_minutes)
+    keep = (index_et < session_close) & (bar_end > session_open)
+    return bars.loc[keep]
+
 
 def _ulti_fetch_mtf_bars(client, symbol, base_minutes=240):
     """Fetch each SMC timeframe's own native bars, cached per-symbol with a TTL
@@ -9007,12 +9046,26 @@ def _ulti_fetch_mtf_bars(client, symbol, base_minutes=240):
                 if hasattr(df.index, "nlevels") and df.index.nlevels > 1:
                     df = df.xs(symbol, level=0)
                 df = df.dropna()
+                if label != "D":
+                    df = _rth_bars(df, {"1M": 1, "5M": 5, "15M": 15, "30M": 30, "1H": 60, "4H": 240}[label])
             bars[label] = df
         except Exception as e:
             log(f"[{symbol}] ULTI MTF fetch failed for {label}: {e}")
             bars[label] = None
     _ulti_mtf_cache[symbol] = {"fetched_at": now, "bars": bars}
     return bars
+
+
+def _pine_bb_config():
+    """Translate Pine's 8B Test Mode input into the local engine config."""
+    mode = PINE_BB_TEST_MODE
+    if mode not in {"BB BASELINE", "BB + ULTI VETO", "BB + ULTI MANAGEMENT", "BB + ULTI FULL"}:
+        log(f"Invalid PINE_BB_TEST_MODE={mode!r}; using BB BASELINE.")
+        mode = "BB BASELINE"
+    return {
+        "use_veto": mode in {"BB + ULTI VETO", "BB + ULTI FULL"},
+        "use_management": mode in {"BB + ULTI MANAGEMENT", "BB + ULTI FULL"},
+    }
 
 
 def _ulti_events_for_symbol(client, symbol, bars_5m):
@@ -9022,7 +9075,7 @@ def _ulti_events_for_symbol(client, symbol, bars_5m):
     try:
         mtf_bars = _ulti_fetch_mtf_bars(client, symbol)
         mtf_trends = ulti_align_mtf_trends(bars_5m, mtf_bars, base_tf_label="5M")
-        return ulti_simulate(bars_5m, mtf_trends=mtf_trends)
+        return ulti_simulate(bars_5m, mtf_trends=mtf_trends, config=_pine_bb_config())
     except Exception as e:
         log(f"[{symbol}] ULTI engine error: {e}")
         return []
@@ -9030,7 +9083,7 @@ def _ulti_events_for_symbol(client, symbol, bars_5m):
 
 def _ulti_entry_signal_for_symbol(client, symbol, bars_5m):
     """Only act on an ENTRY belonging to the LATEST bar -- never replay history."""
-    if not ULTI_ENTRY_ENABLED or bars_5m is None or len(bars_5m) == 0:
+    if (not ULTI_ENTRY_ENABLED and not PINE_BB_LOCAL_MODE) or bars_5m is None or len(bars_5m) == 0:
         return None
     events = _ulti_events_for_symbol(client, symbol, bars_5m)
     latest_bar_time = bars_5m.index[-1]
@@ -9048,6 +9101,7 @@ def _ulti_apply_entry_context(data, event):
     data["signal"] = f"ULTI {side}"
     data["strategy_mode"] = "INTRADAY"
     data["signal_source"] = "ULTI"
+    data["pine_bb_local_strategy"] = PINE_BB_LOCAL_MODE
     data["setup_type"] = str(event.get("reason_code", "") or "ULTI")
     data["entry_playbook"] = data["setup_type"]
     # Reuse the same generic reason-text slots the TradingView path populates
@@ -9069,7 +9123,7 @@ def _ulti_build_entry_candidate(symbol, data, event, max_ext_from_vwap):
     if not market_open_now():
         log(f"[{symbol}] ULTI ENTRY rejected: market is not open.")
         return None
-    if opening_no_trade_minutes_remaining() > 0 or closing_no_trade_minutes_remaining() > 0:
+    if not PINE_BB_LOCAL_MODE and (opening_no_trade_minutes_remaining() > 0 or closing_no_trade_minutes_remaining() > 0):
         log(f"[{symbol}] ULTI ENTRY rejected: opening/closing no-trade window.")
         return None
     already_open, detail = has_open_underlying_position(symbol, side)
@@ -9077,11 +9131,11 @@ def _ulti_build_entry_candidate(symbol, data, event, max_ext_from_vwap):
         log(f"[{symbol}] ULTI ENTRY rejected: existing {side} position ({detail}).")
         return None
     capacity_ok, capacity_reason = same_direction_position_capacity_ok(symbol, side)
-    if not capacity_ok:
+    if not PINE_BB_LOCAL_MODE and not capacity_ok:
         log(f"[{symbol}] ULTI ENTRY rejected: {capacity_reason}.")
         return None
     ext_pct = abs(_safe_float_num(data.get("vwap_extension_pct", 0), 0))
-    if ANTI_CHASE_FILTER and ext_pct > max_ext_from_vwap:
+    if not PINE_BB_LOCAL_MODE and ANTI_CHASE_FILTER and ext_pct > max_ext_from_vwap:
         log(f"[{symbol}] ULTI ENTRY rejected: VWAP extension {ext_pct*100:.2f}% > {max_ext_from_vwap*100:.2f}%.")
         return None
 
@@ -9104,7 +9158,7 @@ def _ulti_build_entry_candidate(symbol, data, event, max_ext_from_vwap):
 
 
 def _ulti_exit_signal_for_trade(client, trade):
-    if not ULTI_EXIT_ENABLED:
+    if not ULTI_EXIT_ENABLED and not PINE_BB_LOCAL_MODE:
         return None
     if str(trade.get("signal_source", "") or "").upper() != "ULTI":
         return None
@@ -9213,7 +9267,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     # Python ULTI is authoritative only for a fresh ENTRY event on the LATEST bar.
     # Same bypass rationale as the TradingView path: old score/playbook/ignition/
     # V2 thesis gates are deliberately skipped here, only execution-safety checks apply.
-    if ULTI_ENTRY_ENABLED and data:
+    if (ULTI_ENTRY_ENABLED or PINE_BB_LOCAL_MODE) and data:
         ulti_event = _ulti_entry_signal_for_symbol(client, symbol, bars)
         if ulti_event is not None:
             ulti_candidate = _ulti_build_entry_candidate(symbol, data, ulti_event, max_ext_from_vwap)
@@ -9230,6 +9284,10 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 opened = False
             log(f"[{symbol}] ULTI ENTRY outcome={'OPENED' if opened else 'NOT_OPENED'}.")
             return
+
+    if PINE_BB_LOCAL_MODE:
+        log(f"[{symbol}] Local Pine BB: no completed-bar ENTRY on latest bar.")
+        return
 
     if not LEGACY_INTRADAY_ENTRY_ENABLED:
         log(f"[{symbol}] Legacy intraday entry path disabled; no ULTI entry on latest bar.")

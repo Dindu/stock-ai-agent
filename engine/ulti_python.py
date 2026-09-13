@@ -72,6 +72,8 @@ DEFAULT_CONFIG = {
     "smc_pivot_len": 5,
     "smc_momentum_base": 0.01,
     "smc_min_signal_distance": 5,
+    "smc_breakout_period": 5,
+    "smc_restrict_repeated": True,
     "smc_higher_tf": "5M",
     "smc_lower_tf": "5M",
     "smc_restrict_tf": "5M",
@@ -108,8 +110,10 @@ DEFAULT_CONFIG = {
     "mgmt_opp_score": 60,
     "mgmt_opp_bars": 2,
     "forming_atr": 0.30,
-    "use_veto": True,
-    "use_management": True,
+    # Pine's default Test Mode is "BB BASELINE".  Veto and management are
+    # opt-in modes, not default entry/exit requirements.
+    "use_veto": False,
+    "use_management": False,
 }
 
 
@@ -471,8 +475,8 @@ def simulate(df, mtf_trends=None, config=None, diagnostics=False):
     higher_tf_v = higher_tf.values if higher_tf is not None else np.zeros(n)
     lower_tf_v = lower_tf.values if lower_tf is not None else np.zeros(n)
 
-    highest_breakout = df["high"].rolling(cfg["smc_min_signal_distance"]).max().shift(1).values
-    lowest_breakout = df["low"].rolling(cfg["smc_min_signal_distance"]).min().shift(1).values
+    highest_breakout = df["high"].rolling(cfg["smc_breakout_period"]).max().shift(1).values
+    lowest_breakout = df["low"].rolling(cfg["smc_breakout_period"]).min().shift(1).values
 
 
     # --- persistent state (Pine `var`) ---
@@ -515,8 +519,13 @@ def simulate(df, mtf_trends=None, config=None, diagnostics=False):
             and smc_vol_cond
             and (not np.isnan(lowest_breakout[i]) and close[i] < lowest_breakout[i])
         )
-        smc_buy = smc_buy_allowed and (i - smc_last_signal_bar >= cfg["smc_min_signal_distance"])
-        smc_sell = smc_sell_allowed and (i - smc_last_signal_bar >= cfg["smc_min_signal_distance"])
+        restrict_trend = higher_tf_v[i]
+        smc_buy = smc_buy_allowed and (i - smc_last_signal_bar >= cfg["smc_min_signal_distance"]) and (
+            not cfg["smc_restrict_repeated"] or smc_last_signal != "Buy" or restrict_trend != 1
+        )
+        smc_sell = smc_sell_allowed and (i - smc_last_signal_bar >= cfg["smc_min_signal_distance"]) and (
+            not cfg["smc_restrict_repeated"] or smc_last_signal != "Sell" or restrict_trend != -1
+        )
         if smc_buy:
             smc_last_signal_bar, smc_last_signal = i, "Buy"
         if smc_sell:
@@ -729,4 +738,3 @@ def confluence_score(df, config=None):
         "pending": sorted(CONFLUENCE_COMPONENTS_PENDING),
         "event_count": len(events),
     }
-
