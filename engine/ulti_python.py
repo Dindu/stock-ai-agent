@@ -472,8 +472,10 @@ def simulate(df, mtf_trends=None, config=None, diagnostics=False):
     tf_map = mtf_trends or {}
     higher_tf = tf_map.get(cfg["smc_higher_tf"])
     lower_tf = tf_map.get(cfg["smc_lower_tf"])
+    restrict_tf = tf_map.get(cfg["smc_restrict_tf"])
     higher_tf_v = higher_tf.values if higher_tf is not None else np.zeros(n)
     lower_tf_v = lower_tf.values if lower_tf is not None else np.zeros(n)
+    restrict_tf_v = restrict_tf.values if restrict_tf is not None else np.zeros(n)
 
     highest_breakout = df["high"].rolling(cfg["smc_breakout_period"]).max().shift(1).values
     lowest_breakout = df["low"].rolling(cfg["smc_breakout_period"]).min().shift(1).values
@@ -519,7 +521,7 @@ def simulate(df, mtf_trends=None, config=None, diagnostics=False):
             and smc_vol_cond
             and (not np.isnan(lowest_breakout[i]) and close[i] < lowest_breakout[i])
         )
-        restrict_trend = higher_tf_v[i]
+        restrict_trend = restrict_tf_v[i]
         smc_buy = smc_buy_allowed and (i - smc_last_signal_bar >= cfg["smc_min_signal_distance"]) and (
             not cfg["smc_restrict_repeated"] or smc_last_signal != "Buy" or restrict_trend != 1
         )

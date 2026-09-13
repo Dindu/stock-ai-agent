@@ -6,6 +6,7 @@ runtime authority.
 """
 
 import os
+from pathlib import Path
 
 
 # Use the local Python port of the Pine BB/ULTI strategy. TradingView webhook
@@ -19,7 +20,13 @@ os.environ["LEGACY_INTRADAY_EXIT_ENABLED"] = "0"
 os.environ["TRADINGVIEW_ENTRY_ENABLED"] = "0"
 os.environ["TRADINGVIEW_EXIT_ENABLED"] = "0"
 os.environ["TRADINGVIEW_EXACT_STRATEGY_MODE"] = "0"
-os.environ["ALPACA_FEED"] = "sip"
+# Basic Alpaca plans provide live stock data through IEX.
+os.environ["ALPACA_FEED"] = "iex"
+os.environ.setdefault("PINE_RUNTIME_LOG_FILE", "logs/pine_runtime.log")
+
+runtime_log = Path(os.environ["PINE_RUNTIME_LOG_FILE"])
+runtime_log.parent.mkdir(parents=True, exist_ok=True)
+runtime_log.unlink(missing_ok=True)
 
 from spy_options_poll_bot import main as run_pine_bot
 

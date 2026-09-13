@@ -4792,7 +4792,8 @@ def fetch_bars(client, symbol):
         bars = bars.xs(symbol, level=0)
 
     bars = bars[["open", "high", "low", "close", "volume"]]
-    bars = _rth_bars(bars, BAR_MINUTES).tail(LOOKBACK_BARS)
+    bars = _rth_bars(bars, BAR_MINUTES)
+    bars = _closed_bars(bars, BAR_MINUTES).tail(LOOKBACK_BARS)
     return bars
 
 
@@ -4817,7 +4818,8 @@ def fetch_1m_bars(client, symbol):
     if isinstance(bars.index, pd.MultiIndex):
         bars = bars.xs(symbol, level=0)
     bars = bars[["open", "high", "low", "close", "volume"]]
-    bars = _rth_bars(bars, 1).tail(ONE_MINUTE_LOOKBACK_BARS + 5)
+    bars = _rth_bars(bars, 1)
+    bars = _closed_bars(bars, 1).tail(ONE_MINUTE_LOOKBACK_BARS + 5)
 
     # Never use a still-forming 1-minute candle for the trigger when requested.
     if ONE_MINUTE_REQUIRE_CLOSED_BAR and len(bars):
@@ -5759,7 +5761,18 @@ def get_trending_symbols(client, base_symbols):
 
 
 def log(msg):
-    print(f"[{datetime.now(central):%Y-%m-%d %H:%M:%S} CT] {msg}", flush=True)
+    line = f"[{datetime.now(central):%Y-%m-%d %H:%M:%S} CT] {msg}"
+    print(line, flush=True)
+    if PINE_BB_LOCAL_MODE:
+        try:
+            log_path = os.getenv("PINE_RUNTIME_LOG_FILE", "logs/pine_runtime.log")
+            parent = os.path.dirname(log_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except Exception:
+            pass
 
 
 def _reset_perf_stats_if_new_day(now_ct=None):
@@ -9039,16 +9052,35 @@ def _rth_bars(bars, timeframe_minutes):
     return bars.loc[keep]
 
 
+def _closed_bars(bars, timeframe_minutes, now=None):
+    """Drop the currently forming Alpaca bar before Pine evaluation."""
+    if bars is None or bars.empty:
+        return bars
+    now = now or pd.Timestamp.now(tz="UTC")
+    index = pd.DatetimeIndex(bars.index)
+    if index.tz is None:
+        index = index.tz_localize("UTC")
+    current_bar_start = now.floor(f"{timeframe_minutes}min")
+    return bars.loc[index < current_bar_start]
+
+
 def _ulti_fetch_mtf_bars(client, symbol, base_minutes=240):
     """Fetch each SMC timeframe's own native bars, cached per-symbol with a TTL
     since higher timeframes change slowly and re-fetching all 7 every scan
     cycle would multiply Alpaca API calls across the whole symbol universe."""
     now = datetime.now(timezone.utc)
     cached = _ulti_mtf_cache.get(symbol)
-    if cached and (now - cached["fetched_at"]).total_seconds() < ULTI_MTF_CACHE_TTL_SECONDS:
-        return cached["bars"]
+    cache_age = (now - cached["fetched_at"]).total_seconds() if cached else None
     bars = {}
     for label, tf in _ULTI_MTF_TIMEFRAMES.items():
+        if (
+            cached
+            and label not in {"1M", "5M"}
+            and cache_age is not None
+            and cache_age < ULTI_MTF_CACHE_TTL_SECONDS
+        ):
+            bars[label] = cached["bars"].get(label)
+            continue
         try:
             minutes = base_minutes * _ULTI_MTF_LOOKBACK_MULT[label]
             start = now - timedelta(minutes=minutes + 60)
@@ -9060,6 +9092,7 @@ def _ulti_fetch_mtf_bars(client, symbol, base_minutes=240):
                 df = df.dropna()
                 if label != "D":
                     df = _rth_bars(df, {"1M": 1, "5M": 5, "15M": 15, "30M": 30, "1H": 60, "4H": 240}[label])
+                    df = _closed_bars(df, {"1M": 1, "5M": 5, "15M": 15, "30M": 30, "1H": 60, "4H": 240}[label], now=now)
             bars[label] = df
         except Exception as e:
             log(f"[{symbol}] ULTI MTF fetch failed for {label}: {e}")
