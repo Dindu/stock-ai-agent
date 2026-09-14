@@ -43,6 +43,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
 WEBHOOK_SECRET = os.getenv("TRADINGVIEW_WEBHOOK_SECRET", "")
 WEBHOOK_PORT = int(os.getenv("TRADINGVIEW_WEBHOOK_PORT", "8787"))
 WEBHOOK_HOST = os.getenv("TRADINGVIEW_WEBHOOK_HOST", "0.0.0.0")
