@@ -1,12 +1,8 @@
-"""
-Index ETF Options Alerts Bot — polling version (SPY / QQQ / IWM by default).
+"""TradingView-authoritative options execution bot.
 
-Pulls 5-minute bars from Alpaca REST every POLL_SECONDS for each configured
-symbol, runs a Bull/Bear market scorecard, applies a trend-ignition filter,
-and posts a Discord alert with a near-the-money 1DTE+ option contract from
-Alpaca's live options data when the score ignites into STRONG territory.
-
-No WebSocket -> no Alpaca connection-limit issues.
+TradingView webhooks provide the only entry and exit signals. Alpaca is used
+only for signal-specific option discovery, quote validation, position checks,
+and order execution; the active runtime does not scan stock symbols.
 """
 
 import os
@@ -8531,121 +8527,98 @@ def _reset_daily_alert_state_if_needed(now_ct):
         _alerted_today["keys"] = set()
 
 
+def _tv_entry_context(signal):
+    """Build the execution context required by order tracking without scanning bars."""
+    symbol = str(signal.get("symbol", "") or "").upper()
+    side = str(signal.get("side", "") or "").upper()
+    price = _safe_float_num(signal.get("underlying_price", 0), 0.0)
+    return {
+        "symbol": symbol,
+        "price": price,
+        "side": side,
+        "signal": f"TRADINGVIEW {side}",
+        "bull_score": 0,
+        "bear_score": 0,
+        "effective_score": SCORE_SIGNAL,
+        "raw_entry_score": 0,
+        "vwap_extension_pct": 0.0,
+        "vwap": price,
+        "ema20": price,
+        "ema50": price,
+        "signal_source": "TRADINGVIEW",
+        "strategy_mode": "INTRADAY",
+        "tradingview_exact_strategy": True,
+        "setup_type": str(signal.get("setup_type", "TRADINGVIEW") or "TRADINGVIEW"),
+        "entry_playbook": str(signal.get("setup_type", "TRADINGVIEW") or "TRADINGVIEW"),
+        "tv_signal_id": str(signal.get("signal_id", "") or ""),
+        "tv_setup_type": str(signal.get("setup_type", "") or ""),
+        "tv_reason_code": str(signal.get("reason_code", "") or ""),
+        "tv_reason": str(signal.get("reason", "") or ""),
+    }
+
+
+def _process_tv_entry_signal(signal):
+    symbol = str(signal.get("symbol", "") or "").upper()
+    signal_id = str(signal.get("signal_id", "") or "")
+    side = str(signal.get("side", "") or "").upper()
+    if not symbol or side not in {"CALL", "PUT"}:
+        _tv_mark_signal_consumed(signal, "invalid_signal")
+        return
+
+    data = _tv_entry_context(signal)
+    candidate = _tv_build_entry_candidate(
+        None, symbol, data, signal, max_ext_from_vwap=1.0
+    )
+    if candidate is None:
+        return
+    try:
+        opened = try_open_paper_trade(symbol, side, candidate["option"], candidate["data"])
+    except Exception:
+        log(f"[{symbol}] TradingView paper-entry execution error:")
+        traceback.print_exc()
+        sys.stdout.flush()
+        opened = False
+    if opened:
+        _tv_set_position_owner(candidate["option"].get("contract"), signal)
+    _tv_mark_signal_consumed(signal, "opened" if opened else "execution_failed")
+    log(f"[{symbol}] TV ENTRY {signal_id} outcome={'OPENED' if opened else 'NOT_OPENED'}.")
+
+
 def run_websocket_cycle(client):
-    """Event-driven loop: evaluate symbols on ticks instead of fixed polling cadence."""
+    """Process TradingView events without subscribing to or scanning stock symbols."""
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
         raise Exception("Missing Alpaca API keys in .env")
 
-    stream = StockDataStream(
-        ALPACA_API_KEY,
-        ALPACA_SECRET_KEY,
-        feed=DataFeed(FEED),
-        raw_data=False,
-    )
-    for sym in SYMBOLS:
-        stream.subscribe_trades(_on_stock_trade_tick, sym)
-
-    stream_thread = threading.Thread(target=stream.run, daemon=True, name="alpaca-stock-stream")
-    stream_thread.start()
-    log(f"WebSocket mode enabled. Subscribed to trade ticks for {len(SYMBOLS)} symbols (feed={FEED}).")
-
+    exit_check_gap = max(1, WS_EXIT_CHECK_SECONDS)
+    loop_sleep = max(0.5, WS_LOOP_SLEEP_SECONDS)
     next_exit_check_at = datetime.now(central)
     next_exit_review_check_at = datetime.now(central)
-    next_full_scan_at = datetime.now(central)
-    min_eval_gap = max(1, WS_SYMBOL_MIN_EVAL_SECONDS)
-    exit_check_gap = max(1, WS_EXIT_CHECK_SECONDS)
-    loop_sleep = max(0.1, WS_LOOP_SLEEP_SECONDS)
-    full_scan_gap = max(10, WS_FULL_SCAN_INTERVAL_SECONDS)
-    session_open_seen = market_open_now()
     log(
-        "WebSocket cadence: "
-        f"symbol_min_eval={min_eval_gap}s, "
-        f"full_scan={full_scan_gap}s, "
-        f"exit_check={exit_check_gap}s, "
-        f"loop_sleep={loop_sleep}s"
+        "TradingView event mode enabled. "
+        f"queue={TRADINGVIEW_ACTIONABLE_QUEUE_FILE}, exit_check={exit_check_gap}s, "
+        f"loop_sleep={loop_sleep}s; stock symbol scanning disabled."
     )
 
     while True:
         now_ct = datetime.now(central)
-
-        is_open = market_open_now()
-        if not is_open:
-            if session_open_seen:
-                log("Market session ended — stopping bot process (no auto-restart).")
-                try:
-                    stream.stop()
-                except Exception:
-                    pass
-                return
-            log("Market closed (pre-open/off-hours) — websocket loop idle.")
-            time.sleep(max(5, POLL_SECONDS))
-            continue
-        session_open_seen = True
-
         _reset_daily_alert_state_if_needed(now_ct)
         _reset_perf_stats_if_new_day(now_ct)
 
-        symbols_to_run = []
-        with _ws_pending_lock:
-            pending = list(_ws_pending_symbols)
-
-        for symbol in pending:
-            last_eval = _ws_last_eval_at.get(symbol)
-            if last_eval is None or (now_ct - last_eval).total_seconds() >= min_eval_gap:
-                symbols_to_run.append(symbol)
-
-        # Safety net: periodic full scan catches missed stream events or reconnect gaps.
-        # Include trending symbols here so websocket mode keeps parity with polling mode.
-        if now_ct >= next_full_scan_at:
-            full_scan_symbols = list(SYMBOLS)
+        pending_entries = [
+            signal for signal in _tv_actionable_signals(events={"ENTRY"})
+            if not _tv_signal_consumed(str(signal.get("signal_id", "")))
+        ]
+        pending_entries.sort(
+            key=lambda signal: _tv_parse_signal_time(signal) or datetime.min.replace(tzinfo=timezone.utc)
+        )
+        for signal in pending_entries:
             try:
-                trending_symbols, _ = get_trending_symbols(client, SYMBOLS)
-                for tsym in trending_symbols:
-                    if tsym not in full_scan_symbols:
-                        full_scan_symbols.append(tsym)
-            except Exception as e:
-                log(f"Trending refresh warning (websocket full scan): {e}")
-
-            for sym in full_scan_symbols:
-                if sym not in symbols_to_run:
-                    symbols_to_run.append(sym)
-            next_full_scan_at = now_ct + timedelta(seconds=full_scan_gap)
-
-        symbols_to_run = _order_symbols_by_priority(symbols_to_run)
-        prefetched_bars = prefetch_bars_parallel(client, symbols_to_run)
-        batch_started_at = time.perf_counter()
-        symbol_eval_ms = []
-        candidates = []
-
-        for symbol in symbols_to_run:
-            symbol_started_at = time.perf_counter()
-            try:
-                candidate = run_symbol(client, symbol, prefetched_bars=prefetched_bars.get(symbol))
-                if candidate:
-                    candidates.append(candidate)
+                _process_tv_entry_signal(signal)
             except Exception:
-                log(f"[{symbol}] WebSocket cycle error:")
+                symbol = str(signal.get("symbol", "") or "").upper()
+                log(f"[{symbol}] TradingView queue entry error:")
                 traceback.print_exc()
                 sys.stdout.flush()
-            finally:
-                elapsed_ms = (time.perf_counter() - symbol_started_at) * 1000.0
-                symbol_eval_ms.append(elapsed_ms)
-                if ENABLE_SCAN_TIMING_LOGS and elapsed_ms >= SCAN_SYMBOL_LOG_THRESHOLD_MS:
-                    log(f"[SCAN] {symbol} evaluation took {elapsed_ms:.1f}ms.")
-                _ws_last_eval_at[symbol] = datetime.now(central)
-                with _ws_pending_lock:
-                    _ws_pending_symbols.discard(symbol)
-
-        if TWO_PLAYBOOK_ENTRY_MODE:
-            execute_ranked_candidates(candidates)
-
-        if ENABLE_SCAN_TIMING_LOGS and symbols_to_run:
-            total_ms = (time.perf_counter() - batch_started_at) * 1000.0
-            avg_ms = (sum(symbol_eval_ms) / len(symbol_eval_ms)) if symbol_eval_ms else 0.0
-            log(
-                f"[SCAN] WebSocket batch complete: {len(symbols_to_run)} symbol(s), "
-                f"avg eval {avg_ms:.1f}ms, total {total_ms:.1f}ms."
-            )
 
         if now_ct >= next_exit_check_at:
             try:
@@ -8666,24 +8639,9 @@ def run_websocket_cycle(client):
             )
 
         try:
-            maybe_send_hourly_perf_report(datetime.now(central))
+            maybe_send_hourly_perf_report(now_ct)
         except Exception as e:
             log(f"Hourly perf report error: {e}")
-
-        try:
-            maybe_send_morning_briefing(client, datetime.now(central))
-        except Exception as e:
-            log(f"Morning briefing error: {e}")
-
-        try:
-            maybe_send_midday_briefing(client, datetime.now(central))
-        except Exception as e:
-            log(f"Midday briefing error: {e}")
-
-        try:
-            maybe_run_swing_scan(client, now_ct)
-        except Exception as e:
-            log(f"Swing scan error: {e}")
 
         time.sleep(loop_sleep)
 
@@ -10086,7 +10044,7 @@ def main():
 
     log(
         f"Options Alert Bot started. Symbols={','.join(SYMBOLS)} "
-        f"Mode=websocket (tick-triggered). Feed={FEED}."
+        "Mode=TradingView events only; stock scanning disabled."
     )
     try:
         run_websocket_cycle(client)
