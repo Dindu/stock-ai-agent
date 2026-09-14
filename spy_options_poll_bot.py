@@ -213,6 +213,7 @@ ULTI_ENTRY_ENABLED = os.getenv("ULTI_ENTRY_ENABLED", "0") == "1"
 ULTI_EXIT_ENABLED = os.getenv("ULTI_EXIT_ENABLED", "0") == "1"
 ULTI_STRATEGY_VERSION = os.getenv("ULTI_STRATEGY_VERSION", "6.2")
 ULTI_MTF_CACHE_TTL_SECONDS = int(os.getenv("ULTI_MTF_CACHE_TTL_SECONDS", "300"))
+ULTI_MTF_FAST_CACHE_TTL_SECONDS = int(os.getenv("ULTI_MTF_FAST_CACHE_TTL_SECONDS", "30"))
 # Local Pine BB authority.  This uses the native Python port on completed
 # Alpaca 5-minute bars rather than a TradingView webhook.  Match this to the
 # Pine script's "Test Mode" input; its default is BB BASELINE.
@@ -9075,7 +9076,7 @@ def _closed_bars(bars, timeframe_minutes, now=None):
     return bars.loc[index < current_bar_start]
 
 
-def _ulti_fetch_mtf_bars(client, symbol, base_minutes=240):
+def _ulti_fetch_mtf_bars(client, symbol, base_minutes=240, base_bars=None):
     """Fetch each SMC timeframe's own native bars, cached per-symbol with a TTL
     since higher timeframes change slowly and re-fetching all 7 every scan
     cycle would multiply Alpaca API calls across the whole symbol universe."""
@@ -9084,11 +9085,18 @@ def _ulti_fetch_mtf_bars(client, symbol, base_minutes=240):
     cache_age = (now - cached["fetched_at"]).total_seconds() if cached else None
     bars = {}
     for label, tf in _ULTI_MTF_TIMEFRAMES.items():
+        if label == "5M" and base_bars is not None and not base_bars.empty:
+            bars[label] = base_bars
+            continue
+        cache_ttl = (
+            ULTI_MTF_FAST_CACHE_TTL_SECONDS
+            if label in {"1M", "5M"}
+            else ULTI_MTF_CACHE_TTL_SECONDS
+        )
         if (
             cached
-            and label not in {"1M", "5M"}
             and cache_age is not None
-            and cache_age < ULTI_MTF_CACHE_TTL_SECONDS
+            and cache_age < cache_ttl
         ):
             bars[label] = cached["bars"].get(label)
             continue
@@ -9130,7 +9138,7 @@ def _ulti_events_for_symbol(client, symbol, bars_5m):
     if bars_5m is None or len(bars_5m) < 55:
         return []
     try:
-        mtf_bars = _ulti_fetch_mtf_bars(client, symbol)
+        mtf_bars = _ulti_fetch_mtf_bars(client, symbol, base_bars=bars_5m)
         if not mtf_bars or any(v is None for v in mtf_bars.values()):
             log(f"[{symbol}] ULTI rejected: MTF data not ready for latest-bar confirmation.")
             return []
