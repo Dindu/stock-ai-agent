@@ -25,6 +25,8 @@ def _runtime_env():
             "LEGACY_INTRADAY_EXIT_ENABLED": "0",
             "SWING_MODE": "0",
             "TRADINGVIEW_ALLOWED_STRATEGY_MODE": "INTRADAY",
+            "TRADINGVIEW_WEBHOOK_HOST": "0.0.0.0",
+            "TRADINGVIEW_WEBHOOK_PORT": env.get("PORT", "8787"),
             "TRADINGVIEW_STATE_DIR": str(STATE_DIR),
             "TRADINGVIEW_SIGNAL_STATE_FILE": str(STATE_DIR / "latest_signals.json"),
             "TRADINGVIEW_ACTIONABLE_QUEUE_FILE": str(STATE_DIR / "actionable_signals.jsonl"),
@@ -51,8 +53,9 @@ def main():
             env=env,
         )
         print(
-            "TradingView webhook: http://127.0.0.1:8787/webhook/tradingview\n"
-            "Health check: http://127.0.0.1:8787/health\n"
+            f"TradingView webhook port: {env['TRADINGVIEW_WEBHOOK_PORT']}\n"
+            "Local webhook path: /webhook/tradingview\n"
+            "Health path: /health\n"
             "Bot authority: TradingView ENTRY/EXIT webhooks only",
             flush=True,
         )
