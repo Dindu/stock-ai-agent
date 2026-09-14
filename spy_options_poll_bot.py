@@ -9056,11 +9056,22 @@ def _closed_bars(bars, timeframe_minutes, now=None):
     """Drop the currently forming Alpaca bar before Pine evaluation."""
     if bars is None or bars.empty:
         return bars
-    now = now or pd.Timestamp.now(tz="UTC")
+    if now is None:
+        now_ts = pd.Timestamp.now(tz="UTC")
+    elif isinstance(now, pd.Timestamp):
+        now_ts = now.tz_convert("UTC") if now.tzinfo is not None else now.tz_localize("UTC")
+    elif isinstance(now, datetime):
+        now_ts = pd.Timestamp(now).tz_convert("UTC") if now.tzinfo is not None else pd.Timestamp(now).tz_localize("UTC")
+    else:
+        now_ts = pd.Timestamp(now)
+        if now_ts.tzinfo is None:
+            now_ts = now_ts.tz_localize("UTC")
+        else:
+            now_ts = now_ts.tz_convert("UTC")
     index = pd.DatetimeIndex(bars.index)
     if index.tz is None:
         index = index.tz_localize("UTC")
-    current_bar_start = now.floor(f"{timeframe_minutes}min")
+    current_bar_start = now_ts.floor(f"{timeframe_minutes}min")
     return bars.loc[index < current_bar_start]
 
 
@@ -9091,8 +9102,9 @@ def _ulti_fetch_mtf_bars(client, symbol, base_minutes=240):
                     df = df.xs(symbol, level=0)
                 df = df.dropna()
                 if label != "D":
-                    df = _rth_bars(df, {"1M": 1, "5M": 5, "15M": 15, "30M": 30, "1H": 60, "4H": 240}[label])
-                    df = _closed_bars(df, {"1M": 1, "5M": 5, "15M": 15, "30M": 30, "1H": 60, "4H": 240}[label], now=now)
+                    tf_minutes = {"1M": 1, "5M": 5, "15M": 15, "30M": 30, "1H": 60, "4H": 240}[label]
+                    df = _rth_bars(df, tf_minutes)
+                    df = _closed_bars(df, tf_minutes, now=now)
             bars[label] = df
         except Exception as e:
             log(f"[{symbol}] ULTI MTF fetch failed for {label}: {e}")
@@ -9119,6 +9131,9 @@ def _ulti_events_for_symbol(client, symbol, bars_5m):
         return []
     try:
         mtf_bars = _ulti_fetch_mtf_bars(client, symbol)
+        if not mtf_bars or any(v is None for v in mtf_bars.values()):
+            log(f"[{symbol}] ULTI rejected: MTF data not ready for latest-bar confirmation.")
+            return []
         mtf_trends = ulti_align_mtf_trends(bars_5m, mtf_bars, base_tf_label="5M")
         return ulti_simulate(bars_5m, mtf_trends=mtf_trends, config=_pine_bb_config())
     except Exception as e:
