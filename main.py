@@ -1,54 +1,24 @@
 import os
 import time
-import shutil
-import subprocess
 import threading
-import requests
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 
 LOCK_FILE = "/tmp/stock_ai_agent.lock"
 
 from engine.scanner import fetch_market
-from engine.ai import analyze
-from engine.news import get_news, get_macro, refresh_macro
-from engine.strategy import score_stock, pre_score, detect_scenario
-from engine.accumulation import clear_cache as clear_acc_cache
+from engine.strategy import score_stock, detect_scenario
 from engine.confluence import clear_cache as clear_confluence_cache
-from engine.regime import adjust
 from engine.exits import check_exits
 from engine import watchlist, learner
 from execution.alpaca import buy, get_positions
 from output.discord import send, send_watchlist
-from config import SCAN_INTERVAL, OLLAMA_URL
+from config import SCAN_INTERVAL
 
 EST = timezone(timedelta(hours=-5))
 
 def log(msg):
     print(f"[{datetime.now(EST).strftime('%H:%M:%S')}] {msg}", flush=True)
-
-def start_ollama():
-    if not shutil.which("ollama"):
-        log("WARNING: Ollama not found.")
-        return None
-    try:
-        requests.get(OLLAMA_URL.replace("/api/generate", ""), timeout=2)
-        log("Ollama already running.")
-        return None
-    except Exception:
-        pass
-    log("Starting Ollama...")
-    proc = subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(10):
-        time.sleep(1)
-        try:
-            requests.get(OLLAMA_URL.replace("/api/generate", ""), timeout=2)
-            log("Ollama started.")
-            return proc
-        except Exception:
-            pass
-    log("WARNING: Ollama did not start in time.")
-    return proc
 
 def exit_monitor():
     """Background thread: check exits every 5 min and log learning data."""
@@ -92,8 +62,7 @@ def _place_buy(s, score, breakdown, catalyst_summary, hold_period, trade_type, c
 
 
 def run():
-    start_ollama()
-    log("=== AI Trading System Starting ===")
+    log("=== 7-Indicator Trading System Starting ===")
     learner.print_summary()
 
     t = threading.Thread(target=exit_monitor, daemon=True)
@@ -117,13 +86,7 @@ def run():
         log("Fetching local symbols and Stocktwits trending stocks...")
         stocks = fetch_market()
         log(f"Fetched {len(stocks)} stocks")
-        clear_acc_cache()  # fresh accumulation data each cycle
         clear_confluence_cache()  # fresh 7-indicator confluence data each cycle
-
-        refresh_macro()
-        macro = get_macro()
-        if macro:
-            log(f"Macro: SPY {macro.get('spy_change_pct', '?')}% | VIX {macro.get('vix', '?')} ({macro.get('fear_level', '?')} fear)")
 
         # ── Check watchlist breakouts first ─────────────────────────────────────
         triggered = watchlist.check_triggers(stocks, held_symbols)
@@ -140,17 +103,15 @@ def run():
             )
             held_symbols.add(sym)
 
-        # ── Scenario scan ───────────────────────────────────────────────────────
-        candidates = []
+        # ── Seven-indicator scan ────────────────────────────────────────────────
+        candidates = stocks
         for s in stocks:
             scenario, desc = detect_scenario(s)
-            if scenario != "none":
-                s["scenario"]      = scenario
-                s["scenario_desc"] = desc
-                candidates.append(s)
+            s["scenario"] = scenario
+            s["scenario_desc"] = desc
 
         sc = Counter(s["scenario"] for s in candidates)
-        log(f"Scenarios found: {dict(sc)} ({len(candidates)} total)")
+        log(f"Scanning {len(candidates)} symbols with seven indicators | Scenarios: {dict(sc)}")
 
         for s in candidates:
             sym = s["symbol"]
@@ -158,30 +119,14 @@ def run():
             if sym in held_symbols:
                 continue  # already own it
 
-            ps = pre_score(s)
-            if ps < 10:
-                continue  # not interesting enough for AI
-
             log(f"  [{s['scenario'].upper()}] {sym} | ${s['price']:.2f} | {s['change']:+.2f}% | "
-                f"Gap: {s.get('gap_pct', 0):+.2f}% | Vol: {s['volume']:,} | RelVol: {s.get('rel_volume', 1):.1f}x | Pre: {ps}")
+                f"Gap: {s.get('gap_pct', 0):+.2f}% | Vol: {s['volume']:,} | RelVol: {s.get('rel_volume', 1):.1f}x")
 
-            news = get_news(sym)
-            ai   = analyze(s, news, macro)
-            score, reasons, breakdown, catalyst_summary, hold_period, trade_type, catalyst_type, flags = score_stock(s, ai)
-
-            # Apply learning multiplier (adjusts score based on historical win rate)
-            multiplier = learner.get_catalyst_multiplier(catalyst_type)
-            if multiplier != 1.0:
-                log(f"    Learning adjustment: {catalyst_type} multiplier {multiplier:.2f}x")
-                score = min(int(score * multiplier), 100)
-
-            score = adjust(score, {})
+            score, reasons, breakdown, catalyst_summary, hold_period, trade_type, catalyst_type, flags = score_stock(s)
 
             # Score breakdown log
             bd = breakdown
-            log(f"    Score: {score}/100 | "
-                f"Cat:{bd['catalyst']}/30 Fund:{bd['fundamentals']}/15 Mkt:{bd['market']}/10 "
-                f"Ins:{bd['insider']}/20 Acc:{bd['accumulation']}/15 Tech:{bd['technicals']}/10")
+            log(f"    7-indicator score: {score}/100 | Bull votes: {bd['bull_votes']}/7 | Bear votes: {bd['bear_votes']}/7")
             log(f"    [{trade_type.upper()}] {catalyst_summary}")
             if flags:
                 for flag in flags:

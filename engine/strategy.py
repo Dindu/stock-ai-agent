@@ -205,3 +205,51 @@ def score_stock(stock, ai_raw):
 
     return min(score, 100), reasons, breakdown, catalyst_summary, hold_period, trade_type, catalyst_type, flags
 
+
+def score_stock(stock, ai_raw=None):
+    """Score a stock using only the seven-indicator confluence strategy."""
+    symbol = stock.get("symbol", "?")
+    confluence = get_confluence(symbol)
+    recovery = confluence["recovery"]
+    bull_votes = confluence["bull_votes"]
+    bear_votes = confluence["bear_votes"]
+    score = round((bull_votes / 7) * 100)
+    flags = []
+    reasons = []
+
+    if confluence["description"]:
+        flags.append(f"🧭 {confluence['description']}")
+    if recovery["reason"]:
+        flags.append(f"📈 {recovery['reason']}")
+
+    trade_type = "momentum"
+    valid = (
+        bull_votes >= 5
+        and bull_votes > bear_votes
+        and recovery["stack"] == "bullish"
+        and recovery["buy_sell_ratio"] >= 1.1
+        and (recovery["fresh"] or bull_votes >= 6)
+    )
+    if not valid:
+        trade_type = "avoid"
+        reasons.append("Seven-indicator entry conditions not fully aligned")
+    else:
+        reasons.append(f"{bull_votes}/7 bullish indicators with EMA20 above VWAP")
+        reasons.append(f"Buying/selling volume ratio {recovery['buy_sell_ratio']:.2f}")
+
+    breakdown = {
+        "seven_indicator_score": score,
+        "bull_votes": bull_votes,
+        "bear_votes": bear_votes,
+    }
+    return (
+        score if valid else 0,
+        reasons,
+        breakdown,
+        "Seven-indicator technical confluence",
+        "1-2 weeks",
+        trade_type,
+        "technical_confluence",
+        flags,
+    )
+
