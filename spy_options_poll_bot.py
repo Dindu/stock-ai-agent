@@ -8970,46 +8970,8 @@ def run_symbol(client, symbol, prefetched_bars=None):
         data["one_minute_trigger"] = "DISABLED" if not ONE_MINUTE_ENTRY_ENABLED else ""
         data["one_minute_entry_confirmed"] = not ONE_MINUTE_ENTRY_ENABLED
 
-    if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE:
-        playbook_ok, playbook, playbook_reason = playbook_entry_ok(side, data, symbol)
-        if not playbook_ok:
-            if (
-                "1m sniper trigger not confirmed" in str(playbook_reason).lower()
-                and SNIPER_WATCH_ALERT_COOLDOWN_MINUTES > 0
-            ):
-                watch_key = (symbol, side)
-                watch_until = _sniper_watch_cooldowns.get(watch_key)
-                watch_now = datetime.now(central)
-                if watch_until is None or watch_now >= watch_until:
-                    side_score = int(data.get("bull_score", 0) if side == "CALL" else data.get("bear_score", 0))
-                    dominance = int((data.get("bull_score", 0) - data.get("bear_score", 0)) if side == "CALL" else (data.get("bear_score", 0) - data.get("bull_score", 0)))
-                    setup_guess = classify_entry_playbook(side, data)
-                    if setup_guess and side_score >= max(SCORE_SIGNAL, 60) and dominance >= max(10, SCORE_DOMINANCE - 2):
-                        setup_label = "PULLBACK READY" if "PULLBACK" in setup_guess else "BREAKOUT READY"
-                        wait_label = "1M RECLAIM + VOL" if "PULLBACK" in setup_guess else "RETEST CONFIRMED"
-                        watch_msg = (
-                            f"\U0001f440 **{symbol} {side}** · SNIPER WATCH\n"
-                            f"\U0001f525 {'Bull' if side == 'CALL' else 'Bear'} `{side_score}` · {setup_label}\n"
-                            f"\u23f3 Waiting: {wait_label}"
-                        )
-                        send_discord(
-                            watch_msg,
-                            color=DISCORD_COLOR_WARN,
-                            webhook_url=DISCORD_WEBHOOK_LIVE_TRADES_URL,
-                        )
-                        _sniper_watch_cooldowns[watch_key] = watch_now + timedelta(minutes=SNIPER_WATCH_ALERT_COOLDOWN_MINUTES)
-            reason_text = str(playbook_reason or "")
-            tag = "WAIT" if reason_text.startswith("ARMED_BREAKOUT_") else "BLOCKED"
-            log(f"[{symbol}] Playbook gate: {side} {tag} — {playbook_reason}.")
-            _record_entry_block("playbook_wait" if tag == "WAIT" else "playbook_block")
-            return
-        data["entry_playbook"] = playbook
-        data["setup_type"] = playbook
-        if playbook == "BREAKOUT" and side == "PUT" and not BREAKOUT_PUT_ENTRIES_ENABLED:
-            log(f"[{symbol}] Playbook gate: BREAKOUT PUT blocked by BREAKOUT_PUT_ENTRIES_ENABLED=0.")
-            _record_entry_block("breakout_put_disabled")
-            return
-        log(f"[{symbol}] Playbook gate: {playbook} {side} passed — {playbook_reason}.")
+    data["entry_playbook"] = "SEVEN_INDICATOR"
+    data["setup_type"] = "SEVEN_INDICATOR"
 
     if ML_GATE_ENABLED and (not NO_GATING_MODE) and not TWO_PLAYBOOK_ENTRY_MODE:
         ml_prob, ml_exp_ret, ml_source = _predict_ml_entry(symbol, side, data)
@@ -9062,14 +9024,6 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         _alerted_today["keys"].add(alert_key)
 
-    if not NO_GATING_MODE:
-        fresh_ok, fresh_reason = fresh_setup_confirmed(symbol, side, data)
-        if not fresh_ok:
-            if ALERT_ONLY_COOLDOWN_MINUTES > 0:
-                _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
-            log(f"[{symbol}] Fresh-setup gate: {side} blocked — {fresh_reason}.")
-            return
-
     log_v2_pre_contract_components(symbol, side, data)
 
     weekly_expiry_dte = _intraday_target_expiry_dte(now_ct)
@@ -9108,28 +9062,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
         log(f"[{symbol}] Entry quality checklist blocked {side} — {entry_reason}.")
         return
 
-    if V2_ENTRY_QUALITY_ENABLED and not NO_GATING_MODE:
-        quality_ok, quality_score, quality_detail = unified_entry_quality_v2(symbol, side, data, option)
-        data["entry_quality_v2_score"] = quality_score
-        legacy_ok, legacy_detail = _legacy_shadow_verdict(symbol, side, data, option)
-        _log_entry_attribution(symbol, side, data, quality_ok, quality_score, legacy_ok, legacy_detail)
-        if not quality_ok:
-            if ALERT_ONLY_COOLDOWN_MINUTES > 0:
-                _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
-            _alerted_today["keys"].discard(alert_key)
-            log(f"[{symbol}] Entry quality V2 gate: {side} blocked — {quality_detail}.")
-            return
-        log(f"[{symbol}] Entry quality V2: {side} CONFIRMED — {quality_score:.1f}/100 ({quality_detail}).")
-    elif ENTRY_CONFLUENCE_ENABLED and not NO_GATING_MODE:
-        confluence_ok, confluence_points, confluence_detail = classify_entry_confluence(symbol, side, data, option)
-        data["entry_confluence_points"] = confluence_points
-        if not confluence_ok:
-            if ALERT_ONLY_COOLDOWN_MINUTES > 0:
-                _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
-            _alerted_today["keys"].discard(alert_key)
-            log(f"[{symbol}] Entry confluence gate: {side} blocked — {confluence_detail}.")
-            return
-        log(f"[{symbol}] Entry confluence: {side} CONFIRMED — {confluence_points:.1f}/12 ({confluence_detail}).")
+    log(f"[{symbol}] Seven-indicator entry gate passed — proceeding to execution.")
 
     if TWO_PLAYBOOK_ENTRY_MODE:
         return {
