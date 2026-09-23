@@ -88,21 +88,6 @@ def run():
         log(f"Fetched {len(stocks)} stocks")
         clear_confluence_cache()  # fresh 7-indicator confluence data each cycle
 
-        # ── Check watchlist breakouts first ─────────────────────────────────────
-        triggered = watchlist.check_triggers(stocks, held_symbols)
-        for entry in triggered:
-            sym = entry["symbol"]
-            if sym in held_symbols:
-                continue
-            log(f"[WATCHLIST TRIGGER] {sym} broke ${entry['trigger_price']:.2f} — buying now")
-            _place_buy(
-                entry, entry["score"], entry["breakdown"],
-                entry["catalyst_summary"], entry["hold_period"],
-                entry["trade_type"], entry["catalyst_type"],
-                entry["flags"], entry["reasons"], label="WATCHLIST TRIGGER",
-            )
-            held_symbols.add(sym)
-
         # ── Seven-indicator scan ────────────────────────────────────────────────
         candidates = stocks
         for s in stocks:
