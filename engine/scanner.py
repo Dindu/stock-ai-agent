@@ -1,4 +1,4 @@
-import re
+import os
 import requests
 from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_DATA_URL
 
@@ -7,25 +7,17 @@ HEADERS = {
     "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY
 }
 
-FALLBACK_WATCHLIST = ["AAPL","MSFT","NVDA","TSLA","AMZN","AMD","PLTR","SOFI","COIN","META"]
+LOCAL_SYMBOLS = [
+    symbol.strip().upper()
+    for symbol in os.getenv(
+        "SYMBOLS",
+        "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,TSLA,AMD,PLTR,GOOGL,AVGO,ADBE,HOOD,ORCL",
+    ).split(",")
+    if symbol.strip()
+]
 
 def get_sp500_symbols():
-    try:
-        r = requests.get(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        # Tickers appear as: href="https://www.nyse.com/quote/XNYS:MMM">MMM</a>
-        symbols = re.findall(r'href="https://www\.[^"]+">([A-Z]{1,5})</a>\n</td>', r.text)
-        symbols = [s.replace(".", "/") for s in symbols]  # BRK.B -> BRK/B for Alpaca
-        if len(symbols) > 100:
-            print(f"[SCANNER] Loaded {len(symbols)} S&P 500 symbols from Wikipedia", flush=True)
-            return symbols
-    except Exception as e:
-        print(f"[SCANNER] Could not fetch S&P 500 list: {e}", flush=True)
-    print(f"[SCANNER] Using fallback watchlist of {len(FALLBACK_WATCHLIST)} symbols", flush=True)
-    return FALLBACK_WATCHLIST
+    return LOCAL_SYMBOLS
 
 def fetch_market():
     symbols = get_sp500_symbols()
