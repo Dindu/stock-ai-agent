@@ -1,0 +1,24 @@
+// Add this block to the END of the supplied ULTI-6 Pine script.
+// It exposes the key strategy series so TradingView chart-data export can be
+// compared against the Python implementation. Keep the same symbol, timeframe,
+// inputs, and session settings during the parity run.
+plot(bullScore, "PY_PARITY_bull_score", display=display.data_window)
+plot(bearScore, "PY_PARITY_bear_score", display=display.data_window)
+plot(finalBuy ? 1 : 0, "PY_PARITY_final_buy", display=display.data_window)
+plot(finalSell ? 1 : 0, "PY_PARITY_final_sell", display=display.data_window)
+plot(emaBull ? 1 : 0, "PY_PARITY_ema_bull", display=display.data_window)
+plot(emaBear ? 1 : 0, "PY_PARITY_ema_bear", display=display.data_window)
+plot(vwapBull ? 1 : 0, "PY_PARITY_vwap_bull", display=display.data_window)
+plot(vwapBear ? 1 : 0, "PY_PARITY_vwap_bear", display=display.data_window)
+plot(smcBullScore ? 1 : 0, "PY_PARITY_smc_bull", display=display.data_window)
+plot(smcBearScore ? 1 : 0, "PY_PARITY_smc_bear", display=display.data_window)
+plot(pokiBullScore ? 1 : 0, "PY_PARITY_poki_bull", display=display.data_window)
+plot(pokiBearScore ? 1 : 0, "PY_PARITY_poki_bear", display=display.data_window)
+plot(volumeBullScore ? 1 : 0, "PY_PARITY_volume_bull", display=display.data_window)
+plot(volumeBearScore ? 1 : 0, "PY_PARITY_volume_bear", display=display.data_window)
+plot(patBullScore ? 1 : 0, "PY_PARITY_pat_bull", display=display.data_window)
+plot(patBearScore ? 1 : 0, "PY_PARITY_pat_bear", display=display.data_window)
+plot(smcTrendStrength, "PY_PARITY_smc_trend_strength", display=display.data_window)
+plot(smcConfidence, "PY_PARITY_smc_confidence", display=display.data_window)
+plot(emaValue, "PY_PARITY_ema", display=display.data_window)
+plot(vwapValue, "PY_PARITY_vwap", display=display.data_window)

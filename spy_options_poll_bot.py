@@ -28,7 +28,7 @@ import pytz
 import requests
 from dotenv import load_dotenv
 from engine.ai import analyze_briefing
-from engine.ulti_python import simulate as ulti_simulate, align_mtf_trends as ulti_align_mtf_trends
+from engine.ulti6_strategy import ULT16Strategy
 
 from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
 from alpaca.data.live import StockDataStream
@@ -143,9 +143,10 @@ VOLUME_MULTIPLIER = 1.5
 # since VWAP and delta_5m are meaningless once a position is held overnight.
 # ---------------------------------------------------------------------------
 SWING_MODE = os.getenv("SWING_MODE", "1") == "1"
-SWING_MIN_DTE = int(os.getenv("SWING_MIN_DTE", "25"))    # ~monthly options
-SWING_MAX_DTE = int(os.getenv("SWING_MAX_DTE", "45"))
-SWING_FALLBACK_MAX_DTE = int(os.getenv("SWING_FALLBACK_MAX_DTE", "60"))
+SWING_ONLY_MODE = os.getenv("SWING_ONLY_MODE", "1") == "1"
+SWING_MIN_DTE = int(os.getenv("SWING_MIN_DTE", "12"))
+SWING_MAX_DTE = int(os.getenv("SWING_MAX_DTE", "14"))
+SWING_FALLBACK_MAX_DTE = int(os.getenv("SWING_FALLBACK_MAX_DTE", "14"))
 SWING_SCAN_HOUR_CT = int(os.getenv("SWING_SCAN_HOUR_CT", "8"))     # once/day after open
 SWING_SCAN_MINUTE_CT = int(os.getenv("SWING_SCAN_MINUTE_CT", "45"))
 SWING_RECENT_HIGH_LOOKBACK_DAYS = int(os.getenv("SWING_RECENT_HIGH_LOOKBACK_DAYS", "20"))
@@ -155,8 +156,9 @@ SWING_RSI_OVERBOUGHT = int(os.getenv("SWING_RSI_OVERBOUGHT", "75"))
 SWING_RSI_OVERSOLD = int(os.getenv("SWING_RSI_OVERSOLD", "25"))
 SWING_MAX_EXT_FROM_SMA20_ATR = float(os.getenv("SWING_MAX_EXT_FROM_SMA20_ATR", "2.5"))
 SWING_STRUCTURE_TOLERANCE_PCT = float(os.getenv("SWING_STRUCTURE_TOLERANCE_PCT", "0.01"))
-# Swing exits: wider target/stop than the intraday 20%/25% option-premium profile,
-# since a multi-day hold needs room for daily noise without stopping out early.
+SWING_REQUIRE_EMA_VWAP_ALIGNMENT = os.getenv("SWING_REQUIRE_EMA_VWAP_ALIGNMENT", "1") == "1"
+SWING_MIN_VOLUME_PRESSURE_RATIO = float(os.getenv("SWING_MIN_VOLUME_PRESSURE_RATIO", "1.10"))
+# Swing exits use the same fixed option-premium risk stop as every other bot trade.
 SWING_PROFIT_TARGET_PCT = float(os.getenv("SWING_PROFIT_TARGET_PCT", "0.35"))
 SWING_STOP_LOSS_PCT = float(os.getenv("SWING_STOP_LOSS_PCT", "0.20"))
 SWING_PARTIAL_TP_PCT = float(os.getenv("SWING_PARTIAL_TP_PCT", "0.20"))
@@ -396,8 +398,8 @@ ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
 # Set to 0 to keep the bot in pure alert mode (no orders submitted, no tracking).
 ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "1"
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))  # take-profit at +20%
-STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.25"))  # emergency option-premium stop; thesis invalidation exits earlier
-# Adaptive exit profile (expectancy-focused, not trade-count suppression).
+STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.20"))  # fixed option-premium stop
+# Adaptive target profile; the stop remains fixed at STOP_LOSS_PCT.
 PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "0.12"))
 PARTIAL_CLOSE_FRACTION = float(os.getenv("PARTIAL_CLOSE_FRACTION", "0.70"))
 TRAILING_STOP_GIVEBACK_PCT = float(os.getenv("TRAILING_STOP_GIVEBACK_PCT", "0.10"))
@@ -440,9 +442,7 @@ ADAPTIVE_EXIT_PROFILE_ENABLED = os.getenv("ADAPTIVE_EXIT_PROFILE_ENABLED", "1") 
 HIGH_VOL_RATIO = float(os.getenv("HIGH_VOL_RATIO", "1.50"))
 LOW_VOL_RATIO = float(os.getenv("LOW_VOL_RATIO", "0.90"))
 HIGH_VOL_TARGET_PCT = float(os.getenv("HIGH_VOL_TARGET_PCT", "0.24"))
-HIGH_VOL_STOP_PCT = float(os.getenv("HIGH_VOL_STOP_PCT", "0.14"))
 LOW_VOL_TARGET_PCT = float(os.getenv("LOW_VOL_TARGET_PCT", "0.16"))
-LOW_VOL_STOP_PCT = float(os.getenv("LOW_VOL_STOP_PCT", "0.14"))
 # Option contract ranking preferences.
 TARGET_OPTION_DELTA_MIN = float(os.getenv("TARGET_OPTION_DELTA_MIN", "0.45"))
 TARGET_OPTION_DELTA_MAX = float(os.getenv("TARGET_OPTION_DELTA_MAX", "0.65"))
@@ -613,6 +613,11 @@ GOOGLE_PRIVATE_KEY        = os.getenv("GOOGLE_PRIVATE_KEY", "").replace("\\n", "
 OWNER_EMAIL               = os.getenv("OWNER_EMAIL", "")  # your Gmail — sheet is shared to this on startup
 GSHEET_RETRY_SECONDS      = int(os.getenv("GSHEET_RETRY_SECONDS", "60"))
 
+# Seven-module confluence is measured in shadow mode first. Set to ENFORCE only
+# after enough logged trades are available for an out-of-sample comparison.
+SEVEN_MODULE_MODE = os.getenv("SEVEN_MODULE_MODE", "SHADOW").strip().upper()
+SEVEN_MODULE_MIN_SCORE = int(os.getenv("SEVEN_MODULE_MIN_SCORE", "5"))
+
 # Per-symbol score-trend history (one reading per cycle).
 # Use a larger default in websocket mode so 5m/10m deltas are reliably available.
 _SCORE_HISTORY_CAP = int(os.getenv("SCORE_HISTORY_CAP", "120"))
@@ -731,6 +736,7 @@ _TRADES_HEADERS = [
     "Trade ID", "Symbol", "Entry Price", "Exit Price", "Strike", "Direction",
     "Entry Time", "Exit Time", "Exit Reason", "Status", "Options Expiration",
     "Alpaca Order ID", "P&L", "P&L %", "Duration", "Created At", "Updated At", "Setup Type",
+    "7M Score", "7M Flags",
 ]
 _EXIT_REVIEWS_HEADERS = [
     "Review ID", "Status", "Review Due CT", "Reviewed At CT", "Trade ID", "Symbol", "Contract", "Side",
@@ -1083,6 +1089,8 @@ def log_trade_open_to_sheets(trade):
             opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),  # Created At
             opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),  # Updated At
             trade.get("setup_type", trade.get("entry_timing", "UNKNOWN")),
+            trade.get("seven_module_score", ""),
+            trade.get("seven_module_flags", ""),
         ]
         # Store entry_ignition_delta and entry_option_oi for future analysis
         trade["sheets_entry_ignition"] = trade.get("entry_ignition_delta", 0)
@@ -1144,6 +1152,8 @@ def log_trade_to_sheets(row, trade, final_close=True):
             opened.strftime("%Y-%m-%d %H:%M:%S") if isinstance(opened, datetime) else str(opened),  # Created At
             now,                                                # Updated At
             trade.get("setup_type", trade.get("entry_timing", "UNKNOWN")),
+            trade.get("seven_module_score", ""),
+            trade.get("seven_module_flags", ""),
         ]
 
         ws = _gsheet.worksheet("Trades")
@@ -1981,38 +1991,21 @@ def entry_momentum_continuation_ok(symbol, side, data):
 
 
 def adaptive_target_stop_pcts(data, score=None):
-    """Return target/stop percentages tuned to current volatility regime and conviction."""
+    """Return the volatility-aware target and the fixed option risk stop."""
     base_target = float(PROFIT_TARGET_PCT)
     base_stop = float(STOP_LOSS_PCT)
     if not ADAPTIVE_EXIT_PROFILE_ENABLED:
-        # Still apply marginal score tighter stop even when adaptive profile is off.
-        if MARGINAL_SCORE_STOP_ENABLED and score is not None:
-            sc = int(score or 0)
-            if MARGINAL_SCORE_FLOOR <= sc < MARGINAL_SCORE_CEIL:
-                base_stop = min(base_stop, max(0.01, MARGINAL_STOP_PCT))
         return base_target, base_stop
 
     vol_ratio = _safe_float_num((data or {}).get("vol_ratio", 1.0), 1.0)
     if vol_ratio >= HIGH_VOL_RATIO:
-        stop = max(0.01, HIGH_VOL_STOP_PCT)
-    elif vol_ratio <= LOW_VOL_RATIO:
-        stop = max(0.01, LOW_VOL_STOP_PCT)
-        base_target = max(0.01, LOW_VOL_TARGET_PCT)
-        return base_target, stop
-    else:
-        stop = base_stop
-
-    target = base_target
-    if vol_ratio >= HIGH_VOL_RATIO:
         target = max(0.01, HIGH_VOL_TARGET_PCT)
+    elif vol_ratio <= LOW_VOL_RATIO:
+        target = max(0.01, LOW_VOL_TARGET_PCT)
+    else:
+        target = base_target
 
-    # Marginal score tighter stop overrides vol regime stop downward.
-    if MARGINAL_SCORE_STOP_ENABLED and score is not None:
-        sc = int(score or 0)
-        if MARGINAL_SCORE_FLOOR <= sc < MARGINAL_SCORE_CEIL:
-            stop = min(stop, max(0.01, MARGINAL_STOP_PCT))
-
-    return target, stop
+    return target, base_stop
 
 
 def runner_exit_profile_for_trade(signal, score, data, base_target_pct):
@@ -2734,6 +2727,13 @@ def playbook_entry_ok(side, data, symbol=None):
 
     if playbook is None:
         return False, None, "no breakout or pullback-continuation structure"
+    seven_score = _safe_int_num(data.get("seven_module_score", 0), 0)
+    if SEVEN_MODULE_MODE == "ENFORCE" and seven_score < SEVEN_MODULE_MIN_SCORE:
+        _record_entry_block("seven_module_confluence")
+        return False, playbook, (
+            f"seven-module confluence {seven_score}/7 < {SEVEN_MODULE_MIN_SCORE}/7 "
+            f"({data.get('seven_module_flags', '')})"
+        )
     if playbook == "BREAKOUT" and hold_confirmed is False:
         return False, playbook, hold_reason
     if call_side:
@@ -3973,6 +3973,12 @@ def analyze(df, client, symbol):
     else:
         sentiment = "Bear lean"
 
+    seven_module = _seven_module_confluence(
+        df, side, price, vwap, ema20, ema50, ema20_rising, strong_volume,
+        bullish_candle, bearish_candle, recent_high, recent_low, support_level,
+        resistance_level, fresh_breakout, fresh_breakdown,
+    )
+
     data = {
         "bar_time": latest.name,
         "price": price,
@@ -4035,6 +4041,9 @@ def analyze(df, client, symbol):
         "sentiment": sentiment,
         "context_valid": context_valid,
         "context_reason": context_reason,
+        "seven_module_score": seven_module["score"],
+        "seven_module_flags": seven_module["flags"],
+        "seven_module_states": seven_module["states"],
     }
 
     return side, data
@@ -4145,11 +4154,14 @@ def fetch_daily_bars(client, symbol, lookback_days=280):
 
 
 def calculate_swing_indicators(df):
-    """Daily-bar indicators for swing trading. No VWAP — see module note above."""
+    """Daily-bar indicators for swing trading, including a rolling volume VWAP."""
     df = df.copy()
+    df["EMA20"] = df["close"].ewm(span=20, adjust=False).mean()
     df["SMA20"] = df["close"].rolling(20).mean()
     df["SMA50"] = df["close"].rolling(50).mean()
     df["SMA200"] = df["close"].rolling(200).mean()
+    volume_sum = df["volume"].rolling(20).sum()
+    df["VWAP20"] = (df["close"] * df["volume"]).rolling(20).sum() / volume_sum.replace(0, pd.NA)
     df["VOL_AVG20"] = df["volume"].rolling(20).mean()
     df["RSI14"] = calculate_rsi(df["close"], period=14)
     prev_close = df["close"].shift(1)
@@ -4177,6 +4189,8 @@ def analyze_swing(df, symbol):
 
     price = float(latest["close"])
     open_ = float(latest["open"])
+    ema20 = float(latest["EMA20"]) if not pd.isna(latest["EMA20"]) else price
+    vwap20 = float(latest["VWAP20"]) if not pd.isna(latest["VWAP20"]) else price
     sma20 = float(latest["SMA20"]) if not pd.isna(latest["SMA20"]) else price
     sma50 = float(latest["SMA50"]) if not pd.isna(latest["SMA50"]) else price
     sma200 = float(latest["SMA200"]) if not pd.isna(latest["SMA200"]) else price
@@ -4193,6 +4207,14 @@ def analyze_swing(df, symbol):
     bearish_candle = price < open_
     vol_ratio = (volume / vol_avg) if vol_avg > 0 else 1.0
 
+    volume_window = df.iloc[-5:].copy()
+    candle_range = (volume_window["high"] - volume_window["low"]).replace(0, pd.NA)
+    buy_fraction = ((volume_window["close"] - volume_window["low"]) / candle_range).fillna(0.5).clip(0.0, 1.0)
+    buy_volume = float((volume_window["volume"] * buy_fraction).sum())
+    sell_volume = float((volume_window["volume"] * (1.0 - buy_fraction)).sum())
+    buy_sell_ratio = buy_volume / max(1.0, sell_volume)
+    sell_buy_ratio = sell_volume / max(1.0, buy_volume)
+
     sma20_back = float(df["SMA20"].iloc[-6]) if len(df) >= 6 and not pd.isna(df["SMA20"].iloc[-6]) else sma20
     sma20_rising = sma20 > sma20_back
     sma20_falling = sma20 < sma20_back
@@ -4205,8 +4227,11 @@ def analyze_swing(df, symbol):
     fresh_breakout = prev_close <= recent_high and price > recent_high
     fresh_breakdown = prev_close >= recent_low and price < recent_low
 
-    uptrend = price > sma20 > sma50
-    downtrend = price < sma20 < sma50
+    sma200_available = not pd.isna(latest["SMA200"])
+    market_bullish = price > sma50 and sma20_rising and (not sma200_available or sma50 > sma200)
+    market_bearish = price < sma50 and sma20_falling and (not sma200_available or sma50 < sma200)
+    uptrend = price > ema20 > vwap20 and price > sma20 > sma50
+    downtrend = price < ema20 < vwap20 and price < sma20 < sma50
 
     # Pullback: trend intact, price dipped to SMA20 in the last few sessions, reclaimed today.
     pullback_window = df.iloc[-4:-1]
@@ -4253,6 +4278,11 @@ def analyze_swing(df, symbol):
 
     if playbook is None or side_score < SWING_MIN_SCORE or dominance < SWING_MIN_DOMINANCE:
         return "NO TRADE", None
+    if SWING_REQUIRE_EMA_VWAP_ALIGNMENT:
+        if side == "CALL" and (not market_bullish or not bullish_candle or buy_sell_ratio < SWING_MIN_VOLUME_PRESSURE_RATIO):
+            return "NO TRADE", None
+        if side == "PUT" and (not market_bearish or not bearish_candle or sell_buy_ratio < SWING_MIN_VOLUME_PRESSURE_RATIO):
+            return "NO TRADE", None
     if side == "CALL" and rsi >= SWING_RSI_OVERBOUGHT:
         return "NO TRADE", None
     if side == "PUT" and rsi <= SWING_RSI_OVERSOLD:
@@ -4271,6 +4301,8 @@ def analyze_swing(df, symbol):
         "bear_score": bear_score,
         "dominance": dominance,
         "sma20": sma20,
+        "ema20": ema20,
+        "vwap20": vwap20,
         "sma50": sma50,
         "sma200": sma200,
         "rsi": rsi,
@@ -4278,6 +4310,12 @@ def analyze_swing(df, symbol):
         "recent_high": recent_high,
         "recent_low": recent_low,
         "vol_ratio": vol_ratio,
+        "buy_volume": buy_volume,
+        "sell_volume": sell_volume,
+        "buy_sell_ratio": buy_sell_ratio,
+        "sell_buy_ratio": sell_buy_ratio,
+        "market_bullish": market_bullish,
+        "market_bearish": market_bearish,
         "strategy_mode": "SWING",
     }
     return side, data
@@ -4395,6 +4433,7 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
     When ``data`` and ``max_ext_from_vwap`` are provided, run entry-quality prechecks
     during candidate selection so we rank only contracts that are actually tradeable.
     """
+    signal = str(signal or "").upper().split()[-1]
     if _option_client is None or _trading_client is None:
         print(f"[{symbol}] Option/trading client not initialised — cannot fetch contracts.", flush=True)
         return None
@@ -5685,6 +5724,68 @@ def _is_stock_like_trending_candidate(sym):
     return allowed
 
 
+def _seven_module_confluence(df, side, price, vwap, ema20, ema50, ema20_rising,
+                             strong_volume, bullish_candle, bearish_candle,
+                             recent_high, recent_low, support_level,
+                             resistance_level, fresh_breakout, fresh_breakdown):
+    """Return a directional seven-module score from the bot's OHLCV evidence.
+
+    These are execution-side proxies for the chart modules. They are deliberately
+    logged before enforcement so the filter can be evaluated against outcomes.
+    """
+    call_side = str(side or "").upper() == "CALL"
+    closes = df["close"].astype(float)
+    vidya_length = 14
+    vidya = closes.ewm(span=vidya_length, adjust=False).mean()
+    if len(closes) >= vidya_length + 1:
+        changes = closes.diff().abs().rolling(vidya_length).sum()
+        efficiency = (closes.diff().abs() / changes.replace(0, pd.NA)).fillna(0.0)
+        alpha = (efficiency * (2.0 / (vidya_length + 1))).clip(lower=0.01, upper=1.0)
+        values = [float(closes.iloc[0])]
+        for index in range(1, len(closes)):
+            prior = values[-1]
+            current_alpha = float(alpha.iloc[index]) if pd.notna(alpha.iloc[index]) else 2.0 / (vidya_length + 1)
+            values.append(prior + current_alpha * (float(closes.iloc[index]) - prior))
+        vidya = pd.Series(values, index=closes.index)
+
+    vidya_rising = float(vidya.iloc[-1]) >= float(vidya.iloc[-2])
+    ema_aligned = (price > ema20 > ema50 and ema20_rising) if call_side else (price < ema20 < ema50 and not ema20_rising)
+    vwap_aligned = price > vwap if call_side else price < vwap
+    volume_aligned = strong_volume and (bullish_candle if call_side else bearish_candle)
+    vidya_aligned = vidya_rising if call_side else not vidya_rising
+
+    lookback = df.iloc[-4:-1]
+    prior_high = float(lookback["high"].max()) if len(lookback) else recent_high
+    prior_low = float(lookback["low"].min()) if len(lookback) else recent_low
+    poki_aligned = (price > prior_high if call_side else price < prior_low)
+
+    zone = support_level if call_side else resistance_level
+    zone_level = float(zone.get("level", 0.0)) if isinstance(zone, dict) else 0.0
+    ualgo_aligned = (
+        (zone_level > 0 and price >= zone_level) or fresh_breakout
+        if call_side else
+        (zone_level > 0 and price <= zone_level) or fresh_breakdown
+    )
+    smc_aligned = (
+        fresh_breakout or (price > ema50 and float(df["low"].iloc[-1]) >= float(df["low"].tail(5).min()))
+        if call_side else
+        fresh_breakdown or (price < ema50 and float(df["high"].iloc[-1]) <= float(df["high"].tail(5).max()))
+    )
+
+    states = {
+        "EMA": ema_aligned,
+        "VWAP": vwap_aligned,
+        "VOL": volume_aligned,
+        "POKI": poki_aligned,
+        "SMC": smc_aligned,
+        "UALGO": ualgo_aligned,
+        "VIDYA": vidya_aligned,
+    }
+    score = sum(1 for enabled in states.values() if enabled)
+    flags = ",".join(f"{name}={'1' if enabled else '0'}" for name, enabled in states.items())
+    return {"score": score, "flags": flags, "states": states}
+
+
 def _fetch_stocktwits_trending_symbols():
     """Fetch trending symbols from Stocktwits public endpoint."""
     if not ENABLE_STOCKTWITS_TRENDING:
@@ -6775,6 +6876,8 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "entry_resistance_touches": ((data or {}).get("resistance_level") or {}).get("touches") if isinstance((data or {}).get("resistance_level"), dict) else None,
         "entry_resistance_strength": ((data or {}).get("resistance_level") or {}).get("strength") if isinstance((data or {}).get("resistance_level"), dict) else None,
         "entry_resistance_distance_atr": ((data or {}).get("resistance_level") or {}).get("distance_atr") if isinstance((data or {}).get("resistance_level"), dict) else None,
+        "seven_module_score": _safe_int_num((data or {}).get("seven_module_score", 0), 0),
+        "seven_module_flags": str((data or {}).get("seven_module_flags", "") or ""),
         "opened_at":  datetime.now(central),
         "status":     "OPEN",
         "entry_message_id": None,
@@ -6903,10 +7006,7 @@ def sync_open_trades_from_alpaca():
         prev = previous.get(contract_sym)
         if prev is None:
             recovered += 1
-        # Decide stop pct for this recovered/re-synced position.
-        # For truly new recoveries (prev=None), apply tighter stop.
-        # If market bias is opposing the position direction, tighten further.
-        _rec_stop_pct = STOP_LOSS_PCT
+        # Recovered positions use the same fixed stop as newly opened positions.
         if prev is None and RECOVERED_MARKET_ALIGN_ENABLED:
             spy_side = _spy_vwap_side()
             qqq_side = _qqq_vwap_cache.get("side")
@@ -6914,10 +7014,9 @@ def sync_open_trades_from_alpaca():
             spy_opposing  = (pos_side == "CALL" and spy_side == "bear") or (pos_side == "PUT" and spy_side == "bull")
             qqq_opposing  = (pos_side == "CALL" and qqq_side == "bear") or (pos_side == "PUT" and qqq_side == "bull")
             if spy_opposing or qqq_opposing:
-                _rec_stop_pct = min(STOP_LOSS_PCT, max(0.01, RECOVERED_OPPOSING_STOP_PCT))
                 log(
                     f"[{p['underlying']}] Recovered {pos_side} opposing market bias "
-                    f"(spy={spy_side}, qqq={qqq_side}) — tighter stop {_rec_stop_pct*100:.0f}%."
+                    f"(spy={spy_side}, qqq={qqq_side}) — fixed stop {STOP_LOSS_PCT*100:.0f}%."
                 )
         _open_trades[contract_sym] = {
             "underlying": p["underlying"],
@@ -6930,9 +7029,9 @@ def sync_open_trades_from_alpaca():
             "qty": p["qty"],
             "current_price": p["current_price"],
             "target": p["entry"] * (1 + PROFIT_TARGET_PCT),
-            "stop": p["entry"] * (1 - (float(prev.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT) if prev else _rec_stop_pct)),
+            "stop": p["entry"] * (1 - STOP_LOSS_PCT),
             "target_pct": PROFIT_TARGET_PCT,
-            "stop_pct": float(prev.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT) if prev else _rec_stop_pct,
+            "stop_pct": STOP_LOSS_PCT,
             "score": prev.get("score", 0) if prev else 0,
             "max_pnl_pct": prev.get("max_pnl_pct", 0.0) if prev else 0.0,
             "runner_profile": bool(prev.get("runner_profile", False)) if prev else False,
@@ -7256,7 +7355,7 @@ def track_open_trades():
                 elif event_name == "EXIT":
                     close_trade(trade, current_price, f"LOCAL PINE BB EXIT: {reason}", pnl_pct)
             elif pnl_pct <= -abs(PINE_EMERGENCY_STOP_PCT):
-                close_trade(trade, current_price, "LOCAL PINE EMERGENCY OPTION STOP", pnl_pct)
+                close_trade(trade, current_price, "STOP LOSS", pnl_pct)
             elif trade.get("pine_exit_last_status") == "error":
                 failures = int(trade.get("pine_data_fail_count", 0) or 0) + 1
                 trade["pine_data_fail_count"] = failures
@@ -7401,9 +7500,9 @@ def track_open_trades():
                 close_trade(trade, current_price, "RUNNER PNL GIVEBACK STOP", pnl_pct)
                 continue
 
-        # 4) Emergency option-premium stop as risk backstop only.
+        # 4) Fixed option-premium stop.
         if pnl_pct <= -stop_pct:
-            close_trade(trade, current_price, "EMERGENCY STOP LOSS", pnl_pct)
+            close_trade(trade, current_price, "STOP LOSS", pnl_pct)
             continue
 
         # 5) TradingView technical exit (INTRADAY only). EXIT_WATCH is telemetry only;
@@ -8439,13 +8538,15 @@ def run_cycle(client):
 
     # Entry scan first (symbol loop), then exit management in the same cycle.
     # This keeps the flow aligned with: entry -> check exit -> exit.
-    symbols_to_scan = list(SYMBOLS)
-    trending_symbols, _ = get_trending_symbols(client, SYMBOLS)
-    for sym in trending_symbols:
-        if sym not in symbols_to_scan:
-            symbols_to_scan.append(sym)
-
-    symbols_to_scan = _order_symbols_by_priority(symbols_to_scan)
+    symbols_to_scan = [] if SWING_ONLY_MODE else list(SYMBOLS)
+    if not SWING_ONLY_MODE:
+        trending_symbols, _ = get_trending_symbols(client, SYMBOLS)
+        for sym in trending_symbols:
+            if sym not in symbols_to_scan:
+                symbols_to_scan.append(sym)
+        symbols_to_scan = _order_symbols_by_priority(symbols_to_scan)
+    else:
+        log("[SWING] Swing-only mode active — intraday entry scan disabled.")
     prefetched_bars = prefetch_bars_parallel(client, symbols_to_scan)
     symbol_eval_ms = []
     candidates = []
@@ -9092,7 +9193,7 @@ def _pine_bb_config():
 
 
 def _ulti_events_for_symbol(client, symbol, bars_5m):
-    """Run the full ULTI engine and return its event lifecycle for this symbol."""
+    """Run ULTI-6 and translate its latest transition into bot events."""
     if bars_5m is None or len(bars_5m) < 55:
         return []
     try:
@@ -9100,8 +9201,25 @@ def _ulti_events_for_symbol(client, symbol, bars_5m):
         if not mtf_bars or any(v is None for v in mtf_bars.values()):
             log(f"[{symbol}] ULTI rejected: MTF data not ready for latest-bar confirmation.")
             return []
-        mtf_trends = ulti_align_mtf_trends(bars_5m, mtf_bars, base_tf_label="5M")
-        return ulti_simulate(bars_5m, mtf_trends=mtf_trends, config=_pine_bb_config())
+        strategy = ULT16Strategy()
+        strategy.validate_exact_inputs(bars_5m, mtf=mtf_bars)
+        signals = strategy.calculate(bars_5m, mtf=mtf_bars)
+        if signals.empty:
+            return []
+        latest = signals.iloc[-1]
+        signal = str(latest.get("signal", "NONE")).upper()
+        timestamp = signals.index[-1]
+        if signal == "BUY":
+            return [
+                {"time": timestamp, "event": "EXIT", "side": "PUT", "price": float(latest["close"]), "reason_code": "ULTI6_SELL_REVERSAL", "reason": "ULTI-6 BUY transition"},
+                {"time": timestamp, "event": "ENTRY", "side": "CALL", "price": float(latest["close"]), "reason_code": "ULTI6_BUY", "reason": "ULTI-6 BUY transition"},
+            ]
+        if signal == "SELL":
+            return [
+                {"time": timestamp, "event": "EXIT", "side": "CALL", "price": float(latest["close"]), "reason_code": "ULTI6_SELL_REVERSAL", "reason": "ULTI-6 SELL transition"},
+                {"time": timestamp, "event": "ENTRY", "side": "PUT", "price": float(latest["close"]), "reason_code": "ULTI6_SELL", "reason": "ULTI-6 SELL transition"},
+            ]
+        return []
     except Exception as e:
         log(f"[{symbol}] ULTI engine error: {e}")
         return []
