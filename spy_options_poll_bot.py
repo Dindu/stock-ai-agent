@@ -138,6 +138,7 @@ RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
 MIN_DTE = int(os.getenv("MIN_DTE", "1"))   # Minimum DTE (exclude 0DTE)
 MAX_DTE = int(os.getenv("MAX_DTE", "3"))  # Primary DTE window (normally 1-3)
 FALLBACK_MAX_DTE = int(os.getenv("FALLBACK_MAX_DTE", "5"))  # If primary window has no tradeable contract, extend to 4-5 DTE
+NON_ETF_MIN_DTE = int(os.getenv("NON_ETF_MIN_DTE", "4"))
 VOLUME_MULTIPLIER = 1.5
 
 # ---------------------------------------------------------------------------
@@ -8979,11 +8980,14 @@ def run_symbol(client, symbol, prefetched_bars=None):
         data["entry_max_dte"] = FALLBACK_MAX_DTE
         log(f"[{symbol}] ETF contract policy: limiting selection to {contract_min_dte}-{contract_max_dte} DTE.")
     else:
-        contract_min_dte = weekly_expiry_dte
-        contract_max_dte = max(weekly_expiry_dte, FALLBACK_MAX_DTE)
+        contract_min_dte = max(NON_ETF_MIN_DTE, 4)
+        contract_max_dte = max(contract_min_dte, weekly_expiry_dte + 3)
         contract_fallback_max_dte = max(contract_max_dte, weekly_expiry_dte + 3)
         data["entry_max_dte"] = contract_fallback_max_dte
-        log(f"[{symbol}] Stock contract policy: targeting {weekly_expiry_dte} DTE, allowing up to {contract_fallback_max_dte} DTE.")
+        log(
+            f"[{symbol}] Stock contract policy: searching nearest available expiry "
+            f"from {contract_min_dte} DTE through {contract_fallback_max_dte} DTE."
+        )
     option = get_option_contract(
         symbol,
         side,
