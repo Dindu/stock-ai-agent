@@ -114,7 +114,7 @@ def run():
         log(f"Positions: {list(held_symbols) or 'none'} | Watchlist: {list(wl.keys()) or 'none'}")
 
         # ── Fetch market data ───────────────────────────────────────────────────
-        log("Fetching 500 stocks...")
+        log("Fetching local symbols and Stocktwits trending stocks...")
         stocks = fetch_market()
         log(f"Fetched {len(stocks)} stocks")
         clear_acc_cache()  # fresh accumulation data each cycle
