@@ -906,7 +906,8 @@ def log_alert_to_sheets(symbol, data, option):
         ws.append_row(row, value_input_option="USER_ENTERED")
         alert_row = len(ws.col_values(1))
         oi = _safe_int_num((option or {}).get("open_interest", 0), 0)
-        log(f"[{symbol}] Alert logged to Google Sheets (ignition={delta:+d} OI={oi:,}).")
+        delta_label = f"{delta:+d}" if isinstance(delta, (int, float)) else "n/a"
+        log(f"[{symbol}] Alert logged to Google Sheets (ignition={delta_label} OI={oi:,}).")
         return alert_row
     except Exception as e:
         log(f"[{symbol}] Google Sheets alert log failed: {e}")
