@@ -3,6 +3,7 @@ import re
 
 from engine.insiders import get_insider_signal
 from engine.accumulation import check_accumulation
+from engine.confluence import get_confluence
 
 
 # ─── Scenario Detection ────────────────────────────────────────────────────────
@@ -163,6 +164,35 @@ def score_stock(stock, ai_raw):
         "gap_down":     4,
     }
     breakdown["technicals"] = tech_scores.get(scenario, 2)
+
+    # 7-indicator confluence (EMA/VWAP/Volume/Poki/SMC/UAlgo/VIDYA) on 5m bars
+    confluence = get_confluence(symbol)
+    is_bearish_scenario = scenario in ("gap_down", "oversold")
+    aligned_votes = confluence["bear_votes"] if is_bearish_scenario else confluence["bull_votes"]
+    opposing_votes = confluence["bull_votes"] if is_bearish_scenario else confluence["bear_votes"]
+    if confluence["description"]:
+        flags.append(f"🧭 {confluence['description']}")
+        breakdown["technicals"] = min(breakdown["technicals"] + aligned_votes, 10)
+        if aligned_votes < 4 or opposing_votes > aligned_votes:
+            trade_type = "avoid"
+
+    # Recovery entry: EMA20 must be above VWAP (below for bearish) with the stock
+    # actually trading through both, confirmed by buying/selling volume pressure.
+    recovery = confluence["recovery"]
+    wanted_stack = "bearish" if is_bearish_scenario else "bullish"
+    if recovery["reason"]:
+        flags.append(f"📈 {recovery['reason']}")
+    if recovery["stack"] != wanted_stack:
+        trade_type = "avoid"
+    else:
+        volume_confirmed = recovery["buy_sell_ratio"] <= (1 / 1.1) if is_bearish_scenario else recovery["buy_sell_ratio"] >= 1.1
+        if not volume_confirmed:
+            trade_type = "avoid"
+        elif not recovery["fresh"]:
+            # Trend already extended (not a fresh EMA/VWAP recovery) — demand
+            # stronger confluence agreement before chasing it.
+            if aligned_votes < 6:
+                trade_type = "avoid"
 
     # ── Final score ──────────────────────────────────────────────────────────────
     score = sum(breakdown.values())

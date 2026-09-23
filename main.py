@@ -14,6 +14,7 @@ from engine.ai import analyze
 from engine.news import get_news, get_macro, refresh_macro
 from engine.strategy import score_stock, pre_score, detect_scenario
 from engine.accumulation import clear_cache as clear_acc_cache
+from engine.confluence import clear_cache as clear_confluence_cache
 from engine.regime import adjust
 from engine.exits import check_exits
 from engine import watchlist, learner
@@ -117,6 +118,7 @@ def run():
         stocks = fetch_market()
         log(f"Fetched {len(stocks)} stocks")
         clear_acc_cache()  # fresh accumulation data each cycle
+        clear_confluence_cache()  # fresh 7-indicator confluence data each cycle
 
         refresh_macro()
         macro = get_macro()
