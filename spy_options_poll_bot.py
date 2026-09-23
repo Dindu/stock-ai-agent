@@ -18,6 +18,7 @@ from math import exp
 import subprocess
 import threading
 import traceback
+from engine.confluence import get_confluence_from_bars
 import uuid
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8908,6 +8909,38 @@ def run_symbol(client, symbol, prefetched_bars=None):
     data["raw_entry_score"] = raw_score
     data["macro_penalty"] = macro_penalty
     data["effective_score"] = effective_score
+
+    # Seven-indicator confluence is the final 5m entry authority for both sides.
+    confluence = get_confluence_from_bars(bars)
+    data["seven_indicator_confluence"] = confluence
+    aligned_votes = confluence["bull_votes"] if side == "CALL" else confluence["bear_votes"]
+    opposing_votes = confluence["bear_votes"] if side == "CALL" else confluence["bull_votes"]
+    recovery = confluence["recovery"]
+    expected_stack = "bullish" if side == "CALL" else "bearish"
+    volume_confirmed = (
+        recovery["buy_sell_ratio"] >= 1.1
+        if side == "CALL"
+        else recovery["buy_sell_ratio"] <= (1 / 1.1)
+    )
+    confluence_ok = (
+        aligned_votes >= 5
+        and aligned_votes > opposing_votes
+        and recovery["stack"] == expected_stack
+        and volume_confirmed
+        and (recovery["fresh"] or aligned_votes >= 6)
+    )
+    log(
+        f"[{symbol}] 7-indicator confluence: {confluence['description']} | "
+        f"{recovery['reason']}"
+    )
+    if not confluence_ok:
+        log(
+            f"[{symbol}] 7-indicator gate: {side} blocked — "
+            f"aligned={aligned_votes}/7, opposing={opposing_votes}/7, "
+            f"stack={recovery['stack']}, volume_confirmed={volume_confirmed}."
+        )
+        _record_entry_block("seven_indicator_confluence")
+        return
 
     # Real lower-timeframe timing: only after the 5m setup passes the hard score gate.
     if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and ONE_MINUTE_ENTRY_ENABLED:

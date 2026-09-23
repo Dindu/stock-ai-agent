@@ -57,7 +57,29 @@ def _fetch(symbol):
         df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
         if len(df) < 30:
             return _empty_result()
+        return _calculate_confluence(df)
+    except Exception:
+        return _empty_result()
 
+
+def get_confluence_from_bars(bars):
+    """Calculate confluence from the active bot's existing 5-minute bars."""
+    try:
+        df = bars.rename(
+            columns={
+                "open": "Open", "high": "High", "low": "Low",
+                "close": "Close", "volume": "Volume",
+            }
+        )
+        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        if len(df) < 30:
+            return _empty_result()
+        return _calculate_confluence(df)
+    except Exception:
+        return _empty_result()
+
+
+def _calculate_confluence(df):
         votes = {
             "ema":    _vote_ema(df),
             "vwap":   _vote_vwap(df),
@@ -82,8 +104,6 @@ def _fetch(symbol):
             "score": score, "bull_votes": bull_votes, "bear_votes": bear_votes,
             "votes": votes, "description": description, "recovery": recovery,
         }
-    except Exception:
-        return _empty_result()
 
 
 def _empty_recovery():
