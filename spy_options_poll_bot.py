@@ -161,7 +161,6 @@ SWING_STRUCTURE_TOLERANCE_PCT = float(os.getenv("SWING_STRUCTURE_TOLERANCE_PCT",
 # Swing exits: wider target/stop than the intraday 20%/25% option-premium profile,
 # since a multi-day hold needs room for daily noise without stopping out early.
 SWING_PROFIT_TARGET_PCT = float(os.getenv("SWING_PROFIT_TARGET_PCT", "0.35"))
-SWING_STOP_LOSS_PCT = float(os.getenv("SWING_STOP_LOSS_PCT", "0.20"))
 SWING_PARTIAL_TP_PCT = float(os.getenv("SWING_PARTIAL_TP_PCT", "0.20"))
 SWING_PARTIAL_CLOSE_FRACTION = float(os.getenv("SWING_PARTIAL_CLOSE_FRACTION", "0.50"))
 SWING_TRAILING_STOP_GIVEBACK_PCT = float(os.getenv("SWING_TRAILING_STOP_GIVEBACK_PCT", "0.15"))
@@ -278,17 +277,9 @@ SPY_MACRO_HARD_BLOCK    = os.getenv("SPY_MACRO_HARD_BLOCK", "0") == "1"
 # extra score penalty to CALLs so only truly high-conviction bullish entries pass.
 BEARISH_TAPE_CALL_PENALTY_ENABLED = os.getenv("BEARISH_TAPE_CALL_PENALTY_ENABLED", "1") == "1"
 BEARISH_TAPE_CALL_SCORE_PENALTY   = int(os.getenv("BEARISH_TAPE_CALL_SCORE_PENALTY", "8"))
-# Marginal score tighter stop: for borderline setups (score < MARGINAL_SCORE_CEIL),
-# apply a tighter stop so weak entries don't bleed out to full stop.
-MARGINAL_SCORE_STOP_ENABLED = os.getenv("MARGINAL_SCORE_STOP_ENABLED", "1") == "1"
 MARGINAL_SCORE_FLOOR  = int(os.getenv("MARGINAL_SCORE_FLOOR", "64"))
 MARGINAL_SCORE_CEIL   = int(os.getenv("MARGINAL_SCORE_CEIL",  "77"))
-MARGINAL_STOP_PCT     = float(os.getenv("MARGINAL_STOP_PCT",  "0.08"))
-# Recovered position market alignment: when a recovered position direction is
-# opposite to current market bias, apply a tighter stop and a score penalty so it
-# exits quickly if the market continues against it.
 RECOVERED_MARKET_ALIGN_ENABLED      = os.getenv("RECOVERED_MARKET_ALIGN_ENABLED", "1") == "1"
-RECOVERED_OPPOSING_STOP_PCT         = float(os.getenv("RECOVERED_OPPOSING_STOP_PCT", "0.05"))
 RECOVERED_OPPOSING_SCORE_PENALTY    = int(os.getenv("RECOVERED_OPPOSING_SCORE_PENALTY", "12"))
 
 # Anti-chase entry filters: avoid entering when price is too stretched from VWAP,
@@ -346,7 +337,7 @@ ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
 # Set to 0 to keep the bot in pure alert mode (no orders submitted, no tracking).
 ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "1"
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))  # take-profit at +20%
-STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT",     "0.25"))  # emergency option-premium stop; thesis invalidation exits earlier
+STOP_LOSS_PCT     = 0.20  # fixed option-premium stop for every active trade
 # Adaptive exit profile (expectancy-focused, not trade-count suppression).
 PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "0.12"))
 PARTIAL_CLOSE_FRACTION = float(os.getenv("PARTIAL_CLOSE_FRACTION", "0.70"))
@@ -382,14 +373,11 @@ RUNNER_PARTIAL_TP_PCT = float(os.getenv("RUNNER_PARTIAL_TP_PCT", "0.14"))
 RUNNER_PARTIAL_CLOSE_FRACTION = float(os.getenv("RUNNER_PARTIAL_CLOSE_FRACTION", "0.35"))
 RUNNER_TRAILING_GIVEBACK_PCT = float(os.getenv("RUNNER_TRAILING_GIVEBACK_PCT", "0.08"))
 MAX_TRADE_HOLD_MINUTES = int(os.getenv("MAX_TRADE_HOLD_MINUTES", "90"))
-# Regime-aware target/stop profile.
-ADAPTIVE_EXIT_PROFILE_ENABLED = os.getenv("ADAPTIVE_EXIT_PROFILE_ENABLED", "1") == "1"
+# Regime-aware target profile.
 HIGH_VOL_RATIO = float(os.getenv("HIGH_VOL_RATIO", "1.50"))
 LOW_VOL_RATIO = float(os.getenv("LOW_VOL_RATIO", "0.90"))
 HIGH_VOL_TARGET_PCT = float(os.getenv("HIGH_VOL_TARGET_PCT", "0.24"))
-HIGH_VOL_STOP_PCT = float(os.getenv("HIGH_VOL_STOP_PCT", "0.14"))
 LOW_VOL_TARGET_PCT = float(os.getenv("LOW_VOL_TARGET_PCT", "0.16"))
-LOW_VOL_STOP_PCT = float(os.getenv("LOW_VOL_STOP_PCT", "0.14"))
 # Option contract ranking preferences.
 TARGET_OPTION_DELTA_MIN = float(os.getenv("TARGET_OPTION_DELTA_MIN", "0.45"))
 TARGET_OPTION_DELTA_MAX = float(os.getenv("TARGET_OPTION_DELTA_MAX", "0.65"))
@@ -1929,38 +1917,8 @@ def entry_momentum_continuation_ok(symbol, side, data):
 
 
 def adaptive_target_stop_pcts(data, score=None):
-    """Return target/stop percentages tuned to current volatility regime and conviction."""
-    base_target = float(PROFIT_TARGET_PCT)
-    base_stop = float(STOP_LOSS_PCT)
-    if not ADAPTIVE_EXIT_PROFILE_ENABLED:
-        # Still apply marginal score tighter stop even when adaptive profile is off.
-        if MARGINAL_SCORE_STOP_ENABLED and score is not None:
-            sc = int(score or 0)
-            if MARGINAL_SCORE_FLOOR <= sc < MARGINAL_SCORE_CEIL:
-                base_stop = min(base_stop, max(0.01, MARGINAL_STOP_PCT))
-        return base_target, base_stop
-
-    vol_ratio = _safe_float_num((data or {}).get("vol_ratio", 1.0), 1.0)
-    if vol_ratio >= HIGH_VOL_RATIO:
-        stop = max(0.01, HIGH_VOL_STOP_PCT)
-    elif vol_ratio <= LOW_VOL_RATIO:
-        stop = max(0.01, LOW_VOL_STOP_PCT)
-        base_target = max(0.01, LOW_VOL_TARGET_PCT)
-        return base_target, stop
-    else:
-        stop = base_stop
-
-    target = base_target
-    if vol_ratio >= HIGH_VOL_RATIO:
-        target = max(0.01, HIGH_VOL_TARGET_PCT)
-
-    # Marginal score tighter stop overrides vol regime stop downward.
-    if MARGINAL_SCORE_STOP_ENABLED and score is not None:
-        sc = int(score or 0)
-        if MARGINAL_SCORE_FLOOR <= sc < MARGINAL_SCORE_CEIL:
-            stop = min(stop, max(0.01, MARGINAL_STOP_PCT))
-
-    return target, stop
+    """Return the target and the single fixed 20% stop-loss."""
+    return float(PROFIT_TARGET_PCT), STOP_LOSS_PCT
 
 
 def runner_exit_profile_for_trade(signal, score, data, base_target_pct):
@@ -6629,7 +6587,7 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
     is_swing = str((data or {}).get("strategy_mode", "") or "").upper() == "SWING"
     if is_swing:
         target_pct = SWING_PROFIT_TARGET_PCT
-        stop_pct = SWING_STOP_LOSS_PCT
+        stop_pct = STOP_LOSS_PCT
         partial_tp_pct = SWING_PARTIAL_TP_PCT
         partial_close_fraction = SWING_PARTIAL_CLOSE_FRACTION
         trailing_giveback_pct = SWING_TRAILING_STOP_GIVEBACK_PCT
@@ -6832,22 +6790,7 @@ def sync_open_trades_from_alpaca():
         prev = previous.get(contract_sym)
         if prev is None:
             recovered += 1
-        # Decide stop pct for this recovered/re-synced position.
-        # For truly new recoveries (prev=None), apply tighter stop.
-        # If market bias is opposing the position direction, tighten further.
         _rec_stop_pct = STOP_LOSS_PCT
-        if prev is None and RECOVERED_MARKET_ALIGN_ENABLED:
-            spy_side = _spy_vwap_side()
-            qqq_side = _qqq_vwap_cache.get("side")
-            pos_side = p["side"]
-            spy_opposing  = (pos_side == "CALL" and spy_side == "bear") or (pos_side == "PUT" and spy_side == "bull")
-            qqq_opposing  = (pos_side == "CALL" and qqq_side == "bear") or (pos_side == "PUT" and qqq_side == "bull")
-            if spy_opposing or qqq_opposing:
-                _rec_stop_pct = min(STOP_LOSS_PCT, max(0.01, RECOVERED_OPPOSING_STOP_PCT))
-                log(
-                    f"[{p['underlying']}] Recovered {pos_side} opposing market bias "
-                    f"(spy={spy_side}, qqq={qqq_side}) — tighter stop {_rec_stop_pct*100:.0f}%."
-                )
         _open_trades[contract_sym] = {
             "underlying": p["underlying"],
             "signal": prev.get("signal", f"RECOVERED {p['side']}") if prev else f"RECOVERED {p['side']}",
@@ -6859,9 +6802,9 @@ def sync_open_trades_from_alpaca():
             "qty": p["qty"],
             "current_price": p["current_price"],
             "target": p["entry"] * (1 + PROFIT_TARGET_PCT),
-            "stop": p["entry"] * (1 - (float(prev.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT) if prev else _rec_stop_pct)),
+            "stop": p["entry"] * (1 - _rec_stop_pct),
             "target_pct": PROFIT_TARGET_PCT,
-            "stop_pct": float(prev.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT) if prev else _rec_stop_pct,
+            "stop_pct": STOP_LOSS_PCT,
             "score": prev.get("score", 0) if prev else 0,
             "max_pnl_pct": prev.get("max_pnl_pct", 0.0) if prev else 0.0,
             "runner_profile": bool(prev.get("runner_profile", False)) if prev else False,
@@ -7234,8 +7177,6 @@ def track_open_trades():
         if (not partial_taken) and current_price >= partial_target and int(trade.get("qty", 0) or 0) > 1:
             partial_qty = max(1, int(round(int(trade.get("qty", 0)) * max(0.1, min(0.9, partial_close_fraction)))))
             close_trade(trade, current_price, "PARTIAL TAKE PROFIT", pnl_pct, close_qty=partial_qty, final_close=False)
-            # After partial TP, protect remaining risk by moving stop near break-even.
-            trade["stop"] = max(float(trade.get("stop", 0.0) or 0.0), float(trade.get("entry", 0.0) or 0.0) * 0.99)
             continue
 
         # Single-lot trades cannot scale out; allow full target exit.
