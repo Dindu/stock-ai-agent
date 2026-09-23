@@ -5104,7 +5104,9 @@ def entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap):
             )
 
     dte = _safe_int_num((option or {}).get("dte", 0), 0)
-    effective_entry_max_dte = max(MAX_DTE, FALLBACK_MAX_DTE) if FALLBACK_MAX_DTE > 0 else MAX_DTE
+    requested_entry_max_dte = _safe_int_num((data or {}).get("entry_max_dte", 0), 0)
+    configured_entry_max_dte = max(MAX_DTE, FALLBACK_MAX_DTE) if FALLBACK_MAX_DTE > 0 else MAX_DTE
+    effective_entry_max_dte = max(configured_entry_max_dte, requested_entry_max_dte)
     if effective_entry_max_dte > 0 and dte > effective_entry_max_dte:
         return False, f"DTE {dte} > max {effective_entry_max_dte}"
 
@@ -9026,21 +9028,34 @@ def run_symbol(client, symbol, prefetched_bars=None):
 
     log_v2_pre_contract_components(symbol, side, data)
 
+    is_etf_contract = symbol in ETF_SYMBOLS
     weekly_expiry_dte = _intraday_target_expiry_dte(now_ct)
+    if is_etf_contract:
+        contract_min_dte = MIN_DTE
+        contract_max_dte = FALLBACK_MAX_DTE
+        contract_fallback_max_dte = FALLBACK_MAX_DTE
+        data["entry_max_dte"] = FALLBACK_MAX_DTE
+        log(f"[{symbol}] ETF contract policy: limiting selection to {contract_min_dte}-{contract_max_dte} DTE.")
+    else:
+        contract_min_dte = weekly_expiry_dte
+        contract_max_dte = max(weekly_expiry_dte, FALLBACK_MAX_DTE)
+        contract_fallback_max_dte = max(contract_max_dte, weekly_expiry_dte + 3)
+        data["entry_max_dte"] = contract_fallback_max_dte
+        log(f"[{symbol}] Stock contract policy: targeting {weekly_expiry_dte} DTE, allowing up to {contract_fallback_max_dte} DTE.")
     option = get_option_contract(
         symbol,
         side,
         data["price"],
         data=data,
         max_ext_from_vwap=max_ext_from_vwap,
-        min_dte=weekly_expiry_dte,
-        max_dte=weekly_expiry_dte,
-        fallback_max_dte=weekly_expiry_dte + 3,
+        min_dte=contract_min_dte,
+        max_dte=contract_max_dte,
+        fallback_max_dte=contract_fallback_max_dte,
     )
     if not option:
         if (not NO_GATING_MODE) and ALERT_ONLY_COOLDOWN_MINUTES > 0:
             _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
-        log(f"[{symbol}] {data['signal']} setup detected, but no valid weekly-expiry ({weekly_expiry_dte} DTE) option found — skipping (real trades only).")
+        log(f"[{symbol}] {data['signal']} setup detected, but no valid option found in {contract_min_dte}-{contract_fallback_max_dte} DTE — skipping.")
         return
 
     if str((option or {}).get("_selection_mode", "")).upper() == "RELAXED_FALLBACK":
