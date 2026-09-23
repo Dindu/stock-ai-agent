@@ -586,6 +586,10 @@ ONE_MINUTE_MAX_TRIGGER_AGE_BARS = int(os.getenv("ONE_MINUTE_MAX_TRIGGER_AGE_BARS
 ONE_MINUTE_RECLAIM_WINDOW_BARS = int(os.getenv("ONE_MINUTE_RECLAIM_WINDOW_BARS", "3"))
 ONE_MINUTE_REQUIRE_CLOSED_BAR = os.getenv("ONE_MINUTE_REQUIRE_CLOSED_BAR", "1") == "1"
 ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD = os.getenv("ONE_MINUTE_BYPASS_5M_BREAKOUT_HOLD", "1") == "1"
+MOMENTUM_BREAKOUT_BYPASS_ENABLED = os.getenv("MOMENTUM_BREAKOUT_BYPASS_ENABLED", "1") == "1"
+MOMENTUM_BREAKOUT_MIN_SCORE = int(os.getenv("MOMENTUM_BREAKOUT_MIN_SCORE", "70"))
+MOMENTUM_BREAKOUT_MIN_DOMINANCE = int(os.getenv("MOMENTUM_BREAKOUT_MIN_DOMINANCE", "25"))
+MOMENTUM_BREAKOUT_MIN_VOLUME_RATIO = float(os.getenv("MOMENTUM_BREAKOUT_MIN_VOLUME_RATIO", "1.0"))
 ENTRY_TIMING_V1_ENABLED = os.getenv("ENTRY_TIMING_V1_ENABLED", "1") == "1"
 ENTRY_TIMING_V1_ENTRY_WINDOW_MINUTES = int(os.getenv("ENTRY_TIMING_V1_ENTRY_WINDOW_MINUTES", "3"))
 SNIPER_WATCH_ALERT_COOLDOWN_MINUTES = int(os.getenv("SNIPER_WATCH_ALERT_COOLDOWN_MINUTES", "30"))
@@ -5024,6 +5028,49 @@ def one_minute_entry_timing(symbol, side, bars_1m, five_min_data):
     return None, (
         f"waiting 1m PUT trigger; price={price:.2f}, EMA9={ema9:.2f}, VWAP1m={one_vwap:.2f}, "
         f"volx={vol_ratio:.2f}, ema9_slope={ema9_slope:+.4f}"
+    )
+
+
+def _strong_momentum_breakout_entry(side, data):
+    """Allow a decisive 5m breakout to bypass a pullback-only 1m trigger."""
+    if not MOMENTUM_BREAKOUT_BYPASS_ENABLED:
+        return False, "disabled"
+
+    side = str(side or "").upper()
+    call_side = side == "CALL"
+    score = _safe_float_num((data or {}).get("bull_score" if call_side else "bear_score", 0.0), 0.0)
+    opposite = _safe_float_num((data or {}).get("bear_score" if call_side else "bull_score", 0.0), 0.0)
+    dominance = score - opposite
+    delta_key = "bull_5m" if call_side else "bear_5m"
+    prior_score = (data or {}).get(delta_key)
+    delta = None if prior_score is None else score - _safe_float_num(prior_score, score)
+    price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
+    vwap = _safe_float_num((data or {}).get("vwap", price), price)
+    ema20 = _safe_float_num((data or {}).get("ema20", price), price)
+    ema50 = _safe_float_num((data or {}).get("ema50", price), price)
+    volume_ratio = _safe_float_num((data or {}).get("vol_ratio", 0.0), 0.0)
+    candle_ok = bool((data or {}).get("bullish_candle" if call_side else "bearish_candle", False))
+    fresh_break = bool((data or {}).get("fresh_breakout" if call_side else "fresh_breakdown", False))
+    aligned = (price > vwap and price > ema20 and price > ema50) if call_side else (price < vwap and price < ema20 and price < ema50)
+
+    spy_side = _spy_vwap_side()
+    qqq_side = _qqq_vwap_side()
+    macro_ok = (spy_side != "bear" or qqq_side != "bear") if call_side else (spy_side == "bear" or qqq_side == "bear")
+    checks = (
+        score >= MOMENTUM_BREAKOUT_MIN_SCORE,
+        dominance >= MOMENTUM_BREAKOUT_MIN_DOMINANCE,
+        delta is None or delta >= 0,
+        fresh_break,
+        aligned,
+        candle_ok,
+        volume_ratio >= MOMENTUM_BREAKOUT_MIN_VOLUME_RATIO,
+        macro_ok,
+    )
+    if all(checks):
+        return True, f"score={score:.0f}, dominance={dominance:.0f}, volx={volume_ratio:.2f}, delta={delta if delta is not None else 'n/a'}"
+    return False, (
+        f"score={score:.0f}, dominance={dominance:.0f}, delta={delta if delta is not None else 'n/a'}, "
+        f"fresh_break={fresh_break}, aligned={aligned}, candle={candle_ok}, volx={volume_ratio:.2f}, macro={macro_ok}"
     )
 
 
@@ -9839,16 +9886,23 @@ def run_symbol(client, symbol, prefetched_bars=None):
     # Real lower-timeframe timing: only after the 5m setup passes the hard score gate.
     if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and ONE_MINUTE_ENTRY_ENABLED:
         try:
-            bars_1m = fetch_1m_bars(client, symbol)
-            trigger, trigger_reason = one_minute_entry_timing(symbol, side, bars_1m, data)
-            data["one_minute_trigger"] = trigger or ""
-            data["one_minute_entry_confirmed"] = bool(trigger)
-            data["one_minute_bar_time"] = str(bars_1m.index[-1]) if bars_1m is not None and len(bars_1m) else ""
-            if trigger:
-                log(f"[{symbol}] 1m SNIPER PASS: {trigger} — {trigger_reason}")
+            momentum_breakout, momentum_reason = _strong_momentum_breakout_entry(side, data)
+            if momentum_breakout:
+                data["one_minute_trigger"] = "MOMENTUM_BREAKOUT"
+                data["one_minute_entry_confirmed"] = True
+                data["one_minute_bar_time"] = ""
+                log(f"[{symbol}] 5m MOMENTUM BREAKOUT: {side} accepted without pullback wait — {momentum_reason}")
             else:
-                log(f"[{symbol}] 1m SNIPER WAIT: {trigger_reason}")
-            if ENTRY_TIMING_V1_ENABLED:
+                bars_1m = fetch_1m_bars(client, symbol)
+                trigger, trigger_reason = one_minute_entry_timing(symbol, side, bars_1m, data)
+                data["one_minute_trigger"] = trigger or ""
+                data["one_minute_entry_confirmed"] = bool(trigger)
+                data["one_minute_bar_time"] = str(bars_1m.index[-1]) if bars_1m is not None and len(bars_1m) else ""
+                if trigger:
+                    log(f"[{symbol}] 1m SNIPER PASS: {trigger} — {trigger_reason}")
+                else:
+                    log(f"[{symbol}] 1m SNIPER WAIT: {trigger_reason}")
+            if ENTRY_TIMING_V1_ENABLED and not momentum_breakout:
                 timing_ok, timing_state, timing_reason = _entry_timing_v1_evaluate(symbol, side, data)
                 data["entry_timing_v1_state"] = timing_state
                 data["entry_timing_v1_reason"] = timing_reason
