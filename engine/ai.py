@@ -2,7 +2,44 @@ import json
 import re
 import time
 import requests
-from config import OLLAMA_URL, GROQ_API_KEY, GROQ_MODEL
+from config import OLLAMA_URL, OLLAMA_MODEL, GROQ_API_KEY, GROQ_MODEL
+
+_groq_model_cache = None
+
+
+def _resolve_groq_model():
+    global _groq_model_cache
+    if _groq_model_cache:
+        return _groq_model_cache
+
+    configured = GROQ_MODEL.strip()
+    try:
+        response = requests.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            timeout=15,
+        )
+        payload = response.json() if response.status_code == 200 else {}
+        available = [str(item.get("id")) for item in payload.get("data", []) if item.get("id")]
+        preferred = [
+            configured,
+            "llama-3.1-8b-instant",
+            "llama-3.3-70b-versatile",
+            "openai/gpt-oss-20b",
+            "openai/gpt-oss-120b",
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+        ]
+        _groq_model_cache = next((model for model in preferred if model != "auto" and model in available), None)
+        if _groq_model_cache is None and configured != "auto" and not available:
+            _groq_model_cache = configured
+        if _groq_model_cache is None and available:
+            _groq_model_cache = available[0]
+    except Exception as exc:
+        print(f"[AI] Groq model discovery failed: {type(exc).__name__}: {exc}", flush=True)
+        _groq_model_cache = configured if configured != "auto" else "llama-3.3-70b-versatile"
+
+    print(f"[AI] Using Groq model: {_groq_model_cache}", flush=True)
+    return _groq_model_cache
 
 def analyze(stock, news, macro):
     """
@@ -96,16 +133,11 @@ Return JSON only:
   "reasons": ["<specific reason 1>", "<specific reason 2>", "<specific reason 3>"]
 }}"""
 
-    if GROQ_API_KEY:
-        return _analyze_groq(symbol, prompt)
-    else:
-        return _analyze_ollama(symbol, prompt)
+    return _analyze_ollama(symbol, prompt)
 
 
 def analyze_briefing(prompt):
     """Generate one model-backed market briefing from an aggregate prompt."""
-    if GROQ_API_KEY:
-        return _analyze_groq_briefing(prompt)
     return _analyze_ollama_briefing(prompt)
 
 
@@ -113,6 +145,7 @@ def analyze_briefing(prompt):
 
 def _analyze_groq(symbol, prompt):
     print(f"[AI] Sending prompt for {symbol} to Groq...", flush=True)
+    model = _resolve_groq_model()
     time.sleep(4)  # proactive throttle: ~15 calls/min stays under 6000 TPM
     for attempt in range(5):
         try:
@@ -123,7 +156,7 @@ def _analyze_groq(symbol, prompt):
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": GROQ_MODEL,
+                    "model": model,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.2,
                     "response_format": {"type": "json_object"}
@@ -155,7 +188,7 @@ def _analyze_ollama(symbol, prompt):
     print(f"[AI] Sending prompt for {symbol} to Ollama...", flush=True)
     try:
         r = requests.post(OLLAMA_URL, json={
-            "model": "llama3.1",
+            "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False,
             "format": "json"
@@ -181,7 +214,7 @@ def _analyze_groq_briefing(prompt):
                 "Content-Type": "application/json",
             },
             json={
-                "model": "llama-3.1-8b-instant",
+                "model": _resolve_groq_model(),
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.2,
             },
@@ -202,7 +235,7 @@ def _analyze_ollama_briefing(prompt):
     try:
         r = requests.post(
             OLLAMA_URL,
-            json={"model": "llama3.1", "prompt": prompt, "stream": False},
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
             timeout=90,
         )
         result = r.json().get("response")
