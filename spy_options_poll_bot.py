@@ -8441,6 +8441,19 @@ def run_symbol(client, symbol, prefetched_bars=None):
         log(f"[{symbol}] Seven-indicator strategy: no directional vote — skipping.")
         return
 
+    location_ok = True
+    location_reason = "room available"
+    opposing_level = data.get("resistance_level") if side == "CALL" else data.get("support_level")
+    if isinstance(opposing_level, dict):
+        level = _safe_float_num(opposing_level.get("level"), 0.0)
+        strength = _safe_float_num(opposing_level.get("strength"), 0.0)
+        distance_atr = _safe_float_num(opposing_level.get("distance_atr"), 999.0)
+        price = _safe_float_num(data.get("price"), 0.0)
+        level_is_ahead = level > price if side == "CALL" else level < price
+        if level_is_ahead and strength >= 70.0 and distance_atr < 0.75:
+            location_ok = False
+            location_reason = f"strong opposing level ${level:.2f} only {distance_atr:.2f} ATR away"
+
     seven_score = int(round((aligned_votes / 7.0) * 100.0))
     confluence_ok = (
         aligned_votes >= 5
@@ -8449,6 +8462,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
         and volume_confirmed
         and (recovery["fresh"] or aligned_votes >= 6)
         and confirmation["call" if side == "CALL" else "put"]
+        and location_ok
     )
     if side == "CALL" and symbol != "SPY" and _spy_vwap_side() == "bear":
         confluence_ok = confluence_ok and aligned_votes >= 6 and recovery["fresh"] and recovery["buy_sell_ratio"] >= 1.35
@@ -8456,7 +8470,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
         log(
             f"[{symbol}] Seven-indicator strategy: {side} blocked — "
             f"{confluence['description']}, {recovery['reason']}, "
-            f"{confirmation['reason']}"
+            f"{confirmation['reason']}, location={location_reason}"
         )
         _record_entry_block("seven_indicator_strategy")
         return
