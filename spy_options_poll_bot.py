@@ -8444,7 +8444,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     rsi_oversold = int(profile["rsi_oversold"])
     max_ext_from_vwap = float(profile["max_ext_from_vwap"])
 
-    side, data = analyze(bars, client, symbol)
+    _legacy_side, data = analyze(bars, client, symbol)
     if data:
         news_context = _get_symbol_news_context(symbol)
         data["latest_news"] = news_context.get("latest_news", "No recent Alpaca news")
@@ -8468,8 +8468,52 @@ def run_symbol(client, symbol, prefetched_bars=None):
         _update_symbol_opportunity_cache(symbol, data)
         _maybe_send_transition_alert(symbol, data)
 
-    if side == "NO TRADE":
+    if not data:
         return
+
+    confluence = get_confluence_from_bars(bars)
+    bull_votes = confluence["bull_votes"]
+    bear_votes = confluence["bear_votes"]
+    recovery = confluence["recovery"]
+    if bull_votes > bear_votes:
+        side = "CALL"
+        aligned_votes, opposing_votes = bull_votes, bear_votes
+        expected_stack = "bullish"
+        volume_confirmed = recovery["buy_sell_ratio"] >= 1.1
+    elif bear_votes > bull_votes:
+        side = "PUT"
+        aligned_votes, opposing_votes = bear_votes, bull_votes
+        expected_stack = "bearish"
+        volume_confirmed = recovery["buy_sell_ratio"] <= (1 / 1.1)
+    else:
+        log(f"[{symbol}] Seven-indicator strategy: no directional vote — skipping.")
+        return
+
+    seven_score = int(round((aligned_votes / 7.0) * 100.0))
+    confluence_ok = (
+        aligned_votes >= 5
+        and aligned_votes > opposing_votes
+        and recovery["stack"] == expected_stack
+        and volume_confirmed
+        and (recovery["fresh"] or aligned_votes >= 6)
+    )
+    if side == "CALL" and symbol != "SPY" and _spy_vwap_side() == "bear":
+        confluence_ok = confluence_ok and aligned_votes >= 6 and recovery["fresh"] and recovery["buy_sell_ratio"] >= 1.35
+    if not confluence_ok:
+        log(
+            f"[{symbol}] Seven-indicator strategy: {side} blocked — "
+            f"{confluence['description']}, {recovery['reason']}"
+        )
+        _record_entry_block("seven_indicator_strategy")
+        return
+
+    data["side"] = side
+    data["signal"] = f"STRONG {side}"
+    data["tier"] = "STRONG"
+    data["bull_score"] = seven_score if side == "CALL" else int(round((opposing_votes / 7.0) * 100.0))
+    data["bear_score"] = seven_score if side == "PUT" else int(round((opposing_votes / 7.0) * 100.0))
+    data["seven_indicator_confluence"] = confluence
+    data["strategy_authority"] = "SEVEN_INDICATORS"
 
     closing_block_minutes = closing_no_trade_minutes_remaining()
     if closing_block_minutes > 0:
@@ -8855,7 +8899,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     data["effective_score"] = effective_score
 
     # Seven-indicator confluence is the final 5m entry authority for both sides.
-    confluence = get_confluence_from_bars(bars)
+    confluence = data.get("seven_indicator_confluence") or get_confluence_from_bars(bars)
     data["seven_indicator_confluence"] = confluence
     aligned_votes = confluence["bull_votes"] if side == "CALL" else confluence["bear_votes"]
     opposing_votes = confluence["bear_votes"] if side == "CALL" else confluence["bull_votes"]
