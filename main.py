@@ -10,6 +10,7 @@ os.environ["ENTRY_TIMING_V1_ENABLED"] = "0"
 os.environ["ENABLE_MORNING_BRIEFING"] = "0"
 os.environ["ENABLE_MIDDAY_BRIEFING"] = "0"
 os.environ["MAX_TRADE_HOLD_MINUTES"] = "0"
+os.environ["SPY_MACRO_HARD_BLOCK"] = "0"
 
 from spy_options_poll_bot import main as run_options_bot
 

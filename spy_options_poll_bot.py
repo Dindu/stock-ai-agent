@@ -269,11 +269,10 @@ RSI_OVERBOUGHT     = int(os.getenv("RSI_OVERBOUGHT", "70"))  # block CALL entrie
 RSI_OVERSOLD       = int(os.getenv("RSI_OVERSOLD",   "30"))  # block PUT entries below this
 
 # Macro alignment for non-SPY symbols.
-# Default behavior is confidence adjustment (penalty), not a hard veto.
-# Set SPY_MACRO_HARD_BLOCK=1 to restore strict blocking behavior.
+# CALL entries require SPY VWAP alignment; PUT entries remain allowed in bearish tape.
 SPY_MACRO_ALIGN         = os.getenv("SPY_MACRO_ALIGN", "1") == "1"
 SPY_MACRO_SCORE_PENALTY = int(os.getenv("SPY_MACRO_SCORE_PENALTY", "10"))
-SPY_MACRO_HARD_BLOCK    = os.getenv("SPY_MACRO_HARD_BLOCK", "0") == "1"
+SPY_MACRO_HARD_BLOCK    = os.getenv("SPY_MACRO_HARD_BLOCK", "1") == "1"
 # Bearish tape CALL penalty: if SPY+QQQ are both bearish at entry time, add an
 # extra score penalty to CALLs so only truly high-conviction bullish entries pass.
 BEARISH_TAPE_CALL_PENALTY_ENABLED = os.getenv("BEARISH_TAPE_CALL_PENALTY_ENABLED", "1") == "1"
@@ -8886,6 +8885,25 @@ def run_symbol(client, symbol, prefetched_bars=None):
         )
         _record_entry_block("seven_indicator_confluence")
         return
+
+    # Adverse tape is a quality tier, not a blanket CALL ban. Require an
+    # exceptional fresh recovery before taking a bullish setup against SPY.
+    spy_bearish = symbol != "SPY" and _spy_vwap_side() == "bear"
+    if side == "CALL" and spy_bearish:
+        adverse_tape_ok = (
+            aligned_votes >= 6
+            and recovery["fresh"]
+            and recovery["buy_sell_ratio"] >= 1.35
+        )
+        if not adverse_tape_ok:
+            log(
+                f"[{symbol}] Adverse-tape CALL quality tier: setup remains eligible only with "
+                f"6/7+ fresh confluence and buy/sell volume >=1.35; "
+                f"got aligned={aligned_votes}/7, fresh={recovery['fresh']}, "
+                f"buy/sell={recovery['buy_sell_ratio']:.2f}."
+            )
+            _record_entry_block("adverse_tape_call_quality")
+            return
 
     # Real lower-timeframe timing: only after the 5m setup passes the hard score gate.
     if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and ONE_MINUTE_ENTRY_ENABLED:
