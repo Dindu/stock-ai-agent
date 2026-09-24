@@ -2983,7 +2983,7 @@ def execute_ranked_candidates(candidates):
         if not NO_GATING_MODE:
             _alerted_today["keys"].add(candidate["alert_key"])
         log(
-            f"[{symbol}] Candidate selected: {candidate['playbook']} {side} "
+            f"[{symbol}] Seven-indicator candidate selected: {side} "
             f"rank={rank:.1f} ({len(ranked)} eligible, top {MAX_NEW_ENTRIES_PER_CYCLE} executable)."
         )
         try:
@@ -3749,21 +3749,15 @@ def analyze(df, client, symbol):
         context_valid, context_reason = call_valid, call_reason
         if call_valid or not context_gate_authority:
             side, score, tier, signal = "CALL", bull_score, "STRONG", "STRONG CALL"
-            if not call_valid:
-                print(f"[{symbol}] {call_reason} | Score was {bull_score} (above threshold) — advisory under V2, not blocking", flush=True)
         else:
             side, score, tier, signal = "NO TRADE", bull_score, "REJECTED", f"STRONG_CALL_CONTEXT_FAIL"
-            print(f"[{symbol}] {call_reason} | Score was {bull_score} (above threshold)", flush=True)
     elif bear_score >= strong_threshold and -diff >= SCORE_DOMINANCE:
         put_valid, put_reason = validate_put_context()
         context_valid, context_reason = put_valid, put_reason
         if put_valid or not context_gate_authority:
             side, score, tier, signal = "PUT", bear_score, "STRONG", "STRONG PUT"
-            if not put_valid:
-                print(f"[{symbol}] {put_reason} | Score was {bear_score} (above threshold) — advisory under V2, not blocking", flush=True)
         else:
             side, score, tier, signal = "NO TRADE", bear_score, "REJECTED", f"STRONG_PUT_CONTEXT_FAIL"
-            print(f"[{symbol}] {put_reason} | Score was {bear_score} (above threshold)", flush=True)
     elif bull_score >= SCORE_SIGNAL and diff >= SCORE_DOMINANCE:
         call_valid, call_reason = validate_call_context()
         context_valid, context_reason = call_valid, call_reason
@@ -3800,13 +3794,6 @@ def analyze(df, client, symbol):
     bull_5m, bear_5m = history_at(IGNITION_LOOKBACK_S)
     bull_10m, bear_10m = history_at(IGNITION_LOOKBACK_S * 2)
 
-    print(f"[{symbol}] BULL score: {bull_score:3d} | BEAR score: {bear_score:3d}", flush=True)
-    if bull_5m is not None:
-        print(f"[{symbol}]   5m ago : BULL {bull_5m:3d} | BEAR {bear_5m:3d}  (Δ BULL {bull_score - bull_5m:+d})", flush=True)
-    if bull_10m is not None:
-        print(f"[{symbol}]  10m ago : BULL {bull_10m:3d} | BEAR {bear_10m:3d}  (Δ BULL {bull_score - bull_10m:+d})", flush=True)
-    print(f"[{symbol}]   Bull components: {bull_breakdown}", flush=True)
-    print(f"[{symbol}]   Bear components: {bear_breakdown}", flush=True)
         # ATR diagnostics only - does NOT block or approve trades.
     atr14 = float(latest.get("ATR14", float("nan")))
     vwap_dist_atr = float("nan")
@@ -3835,37 +3822,6 @@ def analyze(df, client, symbol):
             structure_dist_atr = abs(price - structure_level) / atr14
         else:
             structure_dist_atr = float("nan")
-
-        print(
-            f"[{symbol}]   ATR14(5m)={atr14:.4f} | "
-            f"VWAP dist={vwap_dist_atr:.2f} ATR | "
-            f"EMA20 dist={ema20_dist_atr:.2f} ATR | "
-            f"{structure_label} dist={structure_dist_atr:.2f} ATR",
-            flush=True,
-        )
-
-        # Horizontal S/R diagnostics only.
-        if support_level:
-            print(
-                f"[{symbol}]   H-SUPPORT ${support_level['level']:.2f} | "
-                f"touches={support_level['touches']} | "
-                f"strength={support_level['strength']:.0f}/100 | "
-                f"distance={support_level['distance_atr']:.2f} ATR",
-                flush=True,
-            )
-        else:
-            print(f"[{symbol}]   H-SUPPORT none", flush=True)
-
-        if resistance_level:
-            print(
-                f"[{symbol}]   H-RESISTANCE ${resistance_level['level']:.2f} | "
-                f"touches={resistance_level['touches']} | "
-                f"strength={resistance_level['strength']:.0f}/100 | "
-                f"distance={resistance_level['distance_atr']:.2f} ATR",
-                flush=True,
-            )
-        else:
-            print(f"[{symbol}]   H-RESISTANCE none", flush=True)
 
     # Sentiment summary line for the human glance.
     if diff >= 30:
@@ -8452,11 +8408,6 @@ def run_symbol(client, symbol, prefetched_bars=None):
         data["news_impact_label"] = news_context.get("impact_label", "LOW")
         data["news_impact_reason"] = news_context.get("impact_reason", "headline flow")
 
-        trend_5m = f" | 5m\u0394 BULL {data['bull_score'] - data['bull_5m']:+d}" if data['bull_5m'] is not None else ""
-        log(
-            f"[{symbol}] {data['price']:.2f} | {data['signal']} | "
-            f"BULL {data['bull_score']} BEAR {data['bear_score']} ({data['sentiment']}){trend_5m}"
-        )
         # Keep SPY VWAP macro cache fresh for the alignment filter used by QQQ/IWM.
         if symbol == "SPY":
             _spy_vwap_cache["side"] = "bull" if data["price"] > data["vwap"] else "bear"
@@ -9030,8 +8981,6 @@ def run_symbol(client, symbol, prefetched_bars=None):
     # when a shared-cycle candidate is selected for execution.
     if not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         _alerted_today["keys"].add(alert_key)
-
-    log_v2_pre_contract_components(symbol, side, data)
 
     is_etf_contract = symbol in ETF_SYMBOLS
     weekly_expiry_dte = _intraday_target_expiry_dte(now_ct)
