@@ -8501,61 +8501,6 @@ def run_symbol(client, symbol, prefetched_bars=None):
     else:
         data["promoted_quality_ok"] = False
 
-    # Hard minimum score gate with dynamic threshold from regime + continuation quality.
-    # V2: this score is evidence feeding the unified Trend score, not an automatic veto —
-    # only enforced as a hard block in legacy (non-V2) mode.
-    enforce_hard_gate = (
-        HARD_SCORE_GATE_ENABLED
-        and (not (V2_ENTRY_QUALITY_ENABLED and TWO_PLAYBOOK_ENTRY_MODE))
-        and ((not NO_GATING_MODE) or HARD_SCORE_GATE_IN_NO_GATING_MODE)
-    )
-    if HARD_SCORE_GATE_ENABLED and V2_ENTRY_QUALITY_ENABLED and TWO_PLAYBOOK_ENTRY_MODE:
-        side_score = data["bull_score"] if side == "CALL" else data["bear_score"]
-        min_required_score = min(BREAKOUT_MIN_SCORE, PULLBACK_MIN_SCORE)
-        if side_score < min_required_score:
-            log(
-                f"[{symbol}] Hard score gate (advisory under V2): {side} {side_score} < {min_required_score} "
-                "— not blocking, letting unified entry quality decide."
-            )
-    if enforce_hard_gate:
-        side_score = data["bull_score"] if side == "CALL" else data["bear_score"]
-        min_required_score = (
-            min(BREAKOUT_MIN_SCORE, PULLBACK_MIN_SCORE)
-            if TWO_PLAYBOOK_ENTRY_MODE
-            else dynamic_min_required_score(symbol, side, data)
-        )
-        if data.get("watchlist_promoted", False) and RECALL_FIRST_MODE:
-            dominance = abs(int(data.get("bull_score", 0)) - int(data.get("bear_score", 0)))
-            promoted_floor = max(50, SCORE_WATCH)
-            promoted_dom_floor = max(20, SCORE_DOMINANCE)
-            if side_score < promoted_floor or dominance < promoted_dom_floor:
-                log(
-                    f"[{symbol}] Hard score gate (promoted): {side} score/dom too weak "
-                    f"({side_score}/{dominance}) < ({promoted_floor}/{promoted_dom_floor}) - skipping."
-                )
-                return
-            log(
-                f"[{symbol}] Hard score gate relaxed (watchlist promoted): {side} {side_score} "
-                f"with dominance {dominance} (base requirement {min_required_score})."
-            )
-        elif side_score < min_required_score:
-            log(
-                f"[{symbol}] Hard score gate: {side} {side_score} < {min_required_score} "
-                f"- skipping (requires >= {min_required_score})."
-            )
-            return
-
-    # Only send Discord alerts for STRONG tier unless watchlist was selectively promoted.
-    if (
-        (not NO_GATING_MODE)
-        and not TWO_PLAYBOOK_ENTRY_MODE
-        and data["tier"] != "STRONG"
-        and not data.get("watchlist_promoted", False)
-    ):
-        log(f"[{symbol}] {data['signal']} (BULL {data['bull_score']} / BEAR {data['bear_score']}) "
-            f"\u2014 below STRONG threshold, no Discord alert.")
-        return
-
     enforce_opening_window = (not NO_GATING_MODE) or ENFORCE_OPENING_WINDOW_IN_NO_GATING
     if enforce_opening_window:
         opening_block_minutes = opening_no_trade_minutes_remaining()
