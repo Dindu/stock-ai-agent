@@ -8426,6 +8426,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     bull_votes = confluence["bull_votes"]
     bear_votes = confluence["bear_votes"]
     recovery = confluence["recovery"]
+    confirmation = confluence["confirmation"]
     if bull_votes > bear_votes:
         side = "CALL"
         aligned_votes, opposing_votes = bull_votes, bear_votes
@@ -8447,13 +8448,15 @@ def run_symbol(client, symbol, prefetched_bars=None):
         and recovery["stack"] == expected_stack
         and volume_confirmed
         and (recovery["fresh"] or aligned_votes >= 6)
+        and confirmation["call" if side == "CALL" else "put"]
     )
     if side == "CALL" and symbol != "SPY" and _spy_vwap_side() == "bear":
         confluence_ok = confluence_ok and aligned_votes >= 6 and recovery["fresh"] and recovery["buy_sell_ratio"] >= 1.35
     if not confluence_ok:
         log(
             f"[{symbol}] Seven-indicator strategy: {side} blocked — "
-            f"{confluence['description']}, {recovery['reason']}"
+            f"{confluence['description']}, {recovery['reason']}, "
+            f"{confirmation['reason']}"
         )
         _record_entry_block("seven_indicator_strategy")
         return

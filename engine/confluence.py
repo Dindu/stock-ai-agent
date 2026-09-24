@@ -42,6 +42,7 @@ def _empty_result():
     return {
         "score": 0, "bull_votes": 0, "bear_votes": 0, "votes": {}, "description": "",
         "recovery": _empty_recovery(),
+        "confirmation": {"call": False, "put": False, "reason": "insufficient data"},
     }
 
 
@@ -72,6 +73,10 @@ def get_confluence_from_bars(bars):
             }
         )
         df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        last_bar_start = pd.Timestamp(df.index[-1])
+        now = pd.Timestamp.now(tz=last_bar_start.tz) if last_bar_start.tzinfo else pd.Timestamp.now()
+        if last_bar_start + pd.Timedelta(minutes=5) > now:
+            df = df.iloc[:-1]
         if len(df) < 30:
             return _empty_result()
         return _calculate_confluence(df)
@@ -99,11 +104,58 @@ def _calculate_confluence(df):
         description = f"{aligned}/7 indicators {direction} (EMA/VWAP/Vol/Poki/SMC/UAlgo/VIDYA)"
 
         recovery = _recovery_entry_signal(df)
+        confirmation = _closed_bar_confirmation(df)
 
         return {
             "score": score, "bull_votes": bull_votes, "bear_votes": bear_votes,
             "votes": votes, "description": description, "recovery": recovery,
+            "confirmation": confirmation,
         }
+
+
+def _closed_bar_confirmation(df):
+    """Confirm the latest completed candle held structure and pressure."""
+    if len(df) < 21:
+        return {"call": False, "put": False, "reason": "insufficient completed bars"}
+
+    close = df["Close"].iloc[-1]
+    open_price = df["Open"].iloc[-1]
+    high = df["High"].iloc[-1]
+    low = df["Low"].iloc[-1]
+    candle_range = high - low
+    close_location = (close - low) / candle_range if candle_range > 0 else 0.5
+    ema20 = df["Close"].ewm(span=20, adjust=False).mean().iloc[-1]
+    typical = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    session = df.index.date
+    pv = (typical * df["Volume"]).groupby(session).cumsum()
+    vv = df["Volume"].groupby(session).cumsum()
+    vwap = (pv / vv.replace(0, np.nan)).iloc[-1]
+    volume = df["Volume"].iloc[-1]
+    volume_average = df["Volume"].rolling(20).mean().iloc[-1]
+    volume_ratio = volume / volume_average if volume_average > 0 else 0.0
+
+    window = df.iloc[-10:]
+    window_range = (window["High"] - window["Low"]).replace(0, np.nan)
+    buy_volume = (window["Volume"] * (window["Close"] - window["Low"]) / window_range).fillna(0).sum()
+    sell_volume = (window["Volume"] * (window["High"] - window["Close"]) / window_range).fillna(0).sum()
+    pressure_ratio = buy_volume / sell_volume if sell_volume > 0 else float("inf") if buy_volume > 0 else 1.0
+
+    call_ok = (
+        close > ema20 and close > vwap and close > open_price
+        and close_location >= 0.60 and pressure_ratio >= 1.10
+    )
+    put_ok = (
+        close < ema20 and close < vwap and close < open_price
+        and close_location <= 0.40 and pressure_ratio <= (1 / 1.10)
+    )
+    return {
+        "call": call_ok,
+        "put": put_ok,
+        "reason": (
+            f"closed candle close={close:.2f}, EMA20={ema20:.2f}, VWAP={vwap:.2f}, "
+            f"location={close_location:.2f}, volx={volume_ratio:.2f}, pressure={pressure_ratio:.2f}"
+        ),
+    }
 
 
 def _empty_recovery():
