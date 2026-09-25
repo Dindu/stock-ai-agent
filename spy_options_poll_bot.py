@@ -8326,12 +8326,10 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if bull_votes > bear_votes:
         side = "CALL"
         aligned_votes, opposing_votes = bull_votes, bear_votes
-        expected_stack = "bullish"
         volume_confirmed = recovery["buy_sell_ratio"] >= 1.1
     elif bear_votes > bull_votes:
         side = "PUT"
         aligned_votes, opposing_votes = bear_votes, bull_votes
-        expected_stack = "bearish"
         volume_confirmed = recovery["buy_sell_ratio"] <= (1 / 1.1)
     else:
         log(f"[{symbol}] Seven-indicator strategy: no directional vote — skipping.")
@@ -8354,14 +8352,12 @@ def run_symbol(client, symbol, prefetched_bars=None):
     confluence_ok = (
         aligned_votes >= 5
         and aligned_votes > opposing_votes
-        and recovery["stack"] == expected_stack
         and volume_confirmed
-        and (recovery["fresh"] or aligned_votes >= 6)
         and confirmation["call" if side == "CALL" else "put"]
         and location_ok
     )
     if side == "CALL" and symbol != "SPY" and _spy_vwap_side() == "bear":
-        confluence_ok = confluence_ok and aligned_votes >= 6 and recovery["fresh"] and recovery["buy_sell_ratio"] >= 1.35
+        confluence_ok = confluence_ok and aligned_votes >= 6 and recovery["buy_sell_ratio"] >= 1.35
     if not confluence_ok:
         log(
             f"[{symbol}] Seven-indicator strategy: {side} blocked — "
@@ -8722,9 +8718,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     confluence_ok = (
         aligned_votes >= 5
         and aligned_votes > opposing_votes
-        and recovery["stack"] == expected_stack
         and volume_confirmed
-        and (recovery["fresh"] or aligned_votes >= 6)
     )
     log(
         f"[{symbol}] 7-indicator confluence: {confluence['description']} | "
@@ -8745,7 +8739,6 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if side == "CALL" and spy_bearish:
         adverse_tape_ok = (
             aligned_votes >= 6
-            and recovery["fresh"]
             and recovery["buy_sell_ratio"] >= 1.35
         )
         if not adverse_tape_ok:
