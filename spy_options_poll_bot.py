@@ -337,6 +337,7 @@ ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
 # Set to 0 to keep the bot in pure alert mode (no orders submitted, no tracking).
 ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "1"
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))  # take-profit at +20%
+FINAL_PROFIT_TARGET_PCT = float(os.getenv("FINAL_PROFIT_TARGET_PCT", "0.30"))  # close remaining contracts at +30%
 STOP_LOSS_PCT     = 0.20  # fixed option-premium stop for every active trade
 # Adaptive exit profile (expectancy-focused, not trade-count suppression).
 PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "0.12"))
@@ -7069,8 +7070,28 @@ def track_open_trades():
 
         maybe_send_trade_progress_alert(trade, current_price, pnl_pct)
 
-        stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT)
-        # The fixed 20% option-premium stop is the only active strategy exit.
+        partial_taken = bool(trade.get("partial_taken", False))
+        current_qty = int(trade.get("qty", 0) or 0)
+        if partial_taken and pnl_pct >= FINAL_PROFIT_TARGET_PCT:
+            close_trade(trade, current_price, "FINAL PROFIT TARGET HIT", pnl_pct)
+            continue
+
+        if not partial_taken and pnl_pct >= PROFIT_TARGET_PCT:
+            if current_qty <= 1:
+                close_trade(trade, current_price, "PROFIT TARGET HIT", pnl_pct)
+            else:
+                partial_qty = max(1, (current_qty + 1) // 2)
+                close_trade(
+                    trade,
+                    current_price,
+                    "PARTIAL PROFIT TARGET HIT",
+                    pnl_pct,
+                    close_qty=partial_qty,
+                    final_close=False,
+                )
+            continue
+
+        stop_pct = STOP_LOSS_PCT
         if pnl_pct <= -stop_pct:
             close_trade(trade, current_price, "EMERGENCY STOP LOSS", pnl_pct)
             continue
