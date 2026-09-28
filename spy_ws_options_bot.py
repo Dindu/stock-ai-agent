@@ -18,7 +18,8 @@ FEED = os.getenv("ALPACA_FEED", "iex")
 
 SYMBOL = "SPY"
 BAR_MINUTES = 5
-MIN_DTE = 1
+MIN_DTE = int(os.getenv("MIN_DTE", "1"))
+ENABLE_0DTE_AND_EARLIEST_EXPIRY = os.getenv("ENABLE_0DTE_AND_EARLIEST_EXPIRY", "0") == "1"
 MAX_DTE = 7
 VOLUME_MULTIPLIER = 1.5
 REQUIRE_VWAP_DIRECTION = True
@@ -139,12 +140,13 @@ def analyze(df):
 
 def get_valid_expiry(ticker):
     today = date.today()
+    minimum_dte = 0 if ENABLE_0DTE_AND_EARLIEST_EXPIRY else MIN_DTE
 
     for expiry in ticker.options:
         exp_date = datetime.strptime(expiry, "%Y-%m-%d").date()
         dte = (exp_date - today).days
 
-        if MIN_DTE <= dte <= MAX_DTE:
+        if minimum_dte <= dte <= MAX_DTE:
             return expiry, dte
 
     return None, None
@@ -287,7 +289,7 @@ async def on_trade(trade):
     option = get_option_contract(signal, data["price"])
 
     if not option:
-        send_discord(f"⚠️ {signal} setup detected, but no valid 1DTE+ option found.")
+        send_discord(f"⚠️ {signal} setup detected, but no valid option found in the configured DTE window.")
         return
 
     if option["contract"] == last_alert_contract:
@@ -324,7 +326,7 @@ Now: `{data['vwap_distance_now']:.2f}`
 Previous: `{data['vwap_distance_prev']:.2f}`
 
 **Rule**
-Minimum 1DTE.
+Earliest-expiry policy: `{ENABLE_0DTE_AND_EARLIEST_EXPIRY}`.
 Near-the-money only.
 VWAP direction filter enabled.
 Alert only — verify chart before taking play.
@@ -338,7 +340,10 @@ def main():
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
         raise Exception("Missing Alpaca API keys in .env")
 
-    send_discord("✅ SPY WebSocket Options Alert Bot started. Minimum 1DTE. Alerts only.")
+    send_discord(
+        "✅ SPY WebSocket Options Alert Bot started. "
+        f"Earliest-expiry policy: {ENABLE_0DTE_AND_EARLIEST_EXPIRY}. Alerts only."
+    )
 
     stream = StockDataStream(
         ALPACA_API_KEY,

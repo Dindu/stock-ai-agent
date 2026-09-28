@@ -135,10 +135,11 @@ OPENING_EXCEPTION_MIN_VOL_RATIO = float(os.getenv("OPENING_EXCEPTION_MIN_VOL_RAT
 CLOSING_NO_TRADE_MINUTES = int(os.getenv("CLOSING_NO_TRADE_MINUTES", "30"))
 LOOKBACK_BARS = 120
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
-MIN_DTE = int(os.getenv("MIN_DTE", "1"))   # Minimum DTE (exclude 0DTE)
+MIN_DTE = int(os.getenv("MIN_DTE", "1"))
 MAX_DTE = int(os.getenv("MAX_DTE", "3"))  # Primary DTE window (normally 1-3)
 FALLBACK_MAX_DTE = int(os.getenv("FALLBACK_MAX_DTE", "5"))  # If primary window has no tradeable contract, extend to 4-5 DTE
 NON_ETF_MIN_DTE = int(os.getenv("NON_ETF_MIN_DTE", "4"))
+ENABLE_0DTE_AND_EARLIEST_EXPIRY = os.getenv("ENABLE_0DTE_AND_EARLIEST_EXPIRY", "0") == "1"
 VOLUME_MULTIPLIER = 1.5
 
 # ---------------------------------------------------------------------------
@@ -4253,7 +4254,7 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
 
 
 def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, max_ext_from_vwap=None, search_min_dte=None, search_max_dte=None):
-    """Fetch the best available >=MIN_DTE option contract from Alpaca.
+    """Fetch the best available option contract from Alpaca within the requested DTE window.
 
     When ``data`` and ``max_ext_from_vwap`` are provided, run entry-quality prechecks
     during candidate selection so we rank only contracts that are actually tradeable.
@@ -4263,7 +4264,7 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
         return None
     try:
         today = date.today()
-        effective_min_dte = MIN_DTE if search_min_dte is None else max(MIN_DTE, int(search_min_dte))
+        effective_min_dte = MIN_DTE if search_min_dte is None else max(0, int(search_min_dte))
         effective_max_dte = MAX_DTE if search_max_dte is None else int(search_max_dte)
         min_exp = today + timedelta(days=effective_min_dte)
         max_exp = today + timedelta(days=effective_max_dte) if effective_max_dte > 0 else None
@@ -8857,13 +8858,16 @@ def run_symbol(client, symbol, prefetched_bars=None):
     is_etf_contract = symbol in ETF_SYMBOLS
     weekly_expiry_dte = _intraday_target_expiry_dte(now_ct)
     if is_etf_contract:
-        contract_min_dte = MIN_DTE
+        contract_min_dte = 0 if ENABLE_0DTE_AND_EARLIEST_EXPIRY else MIN_DTE
         contract_max_dte = FALLBACK_MAX_DTE
         contract_fallback_max_dte = FALLBACK_MAX_DTE
         data["entry_max_dte"] = FALLBACK_MAX_DTE
-        log(f"[{symbol}] ETF contract policy: limiting selection to {contract_min_dte}-{contract_max_dte} DTE.")
+        log(
+            f"[{symbol}] ETF contract policy: limiting selection to {contract_min_dte}-{contract_max_dte} DTE "
+            f"(earliest-expiry policy={'on' if ENABLE_0DTE_AND_EARLIEST_EXPIRY else 'off'})."
+        )
     else:
-        contract_min_dte = max(NON_ETF_MIN_DTE, 4)
+        contract_min_dte = 0 if ENABLE_0DTE_AND_EARLIEST_EXPIRY else max(NON_ETF_MIN_DTE, 4)
         contract_max_dte = max(contract_min_dte, weekly_expiry_dte + 3)
         contract_fallback_max_dte = max(contract_max_dte, weekly_expiry_dte + 3)
         data["entry_max_dte"] = contract_fallback_max_dte
