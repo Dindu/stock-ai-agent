@@ -141,7 +141,7 @@ FALLBACK_MAX_DTE = int(os.getenv("FALLBACK_MAX_DTE", "5"))  # If primary window 
 NON_ETF_MIN_DTE = int(os.getenv("NON_ETF_MIN_DTE", "4"))
 ENABLE_0DTE_AND_EARLIEST_EXPIRY = os.getenv("ENABLE_0DTE_AND_EARLIEST_EXPIRY", "0") == "1"
 FORCE_0DTE_ALL = os.getenv("FORCE_0DTE_ALL", "1") == "1"
-ZERO_DTE_FALLBACK_MAX_DTE = max(1, min(3, int(os.getenv("ZERO_DTE_FALLBACK_MAX_DTE", "3"))))
+ZERO_DTE_FALLBACK_MAX_DTE = max(1, min(4, int(os.getenv("ZERO_DTE_FALLBACK_MAX_DTE", "4"))))
 VOLUME_MULTIPLIER = 1.5
 
 # ---------------------------------------------------------------------------
