@@ -140,6 +140,8 @@ MAX_DTE = int(os.getenv("MAX_DTE", "3"))  # Primary DTE window (normally 1-3)
 FALLBACK_MAX_DTE = int(os.getenv("FALLBACK_MAX_DTE", "5"))  # If primary window has no tradeable contract, extend to 4-5 DTE
 NON_ETF_MIN_DTE = int(os.getenv("NON_ETF_MIN_DTE", "4"))
 ENABLE_0DTE_AND_EARLIEST_EXPIRY = os.getenv("ENABLE_0DTE_AND_EARLIEST_EXPIRY", "0") == "1"
+FORCE_0DTE_ALL = os.getenv("FORCE_0DTE_ALL", "1") == "1"
+ZERO_DTE_FALLBACK_MAX_DTE = max(1, min(3, int(os.getenv("ZERO_DTE_FALLBACK_MAX_DTE", "3"))))
 VOLUME_MULTIPLIER = 1.5
 
 # ---------------------------------------------------------------------------
@@ -4206,7 +4208,7 @@ def _intraday_target_expiry_dte(now=None):
     return max(0, (target_friday - today).days)
 
 
-def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_from_vwap=None, min_dte=None, max_dte=None, fallback_max_dte=None):
+def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_from_vwap=None, min_dte=None, max_dte=None, fallback_max_dte=None, earliest_expiry_fallback=False):
     """Cached wrapper around ``_get_option_contract_uncached``.
 
     Short-lived cache only — never changes which contract is selected or rejected,
@@ -4216,13 +4218,52 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
     primary_min_dte = MIN_DTE if min_dte is None else int(min_dte)
     primary_max_dte = MAX_DTE if max_dte is None else int(max_dte)
     effective_fallback_max_dte = FALLBACK_MAX_DTE if fallback_max_dte is None else int(fallback_max_dte)
+
+    def is_relaxed_fallback(result):
+        return str((result or {}).get("_selection_mode", "")).upper() == "RELAXED_FALLBACK"
+
+    def search_fallback():
+        fallback_min = max(primary_min_dte, primary_max_dte + 1)
+        if earliest_expiry_fallback:
+            first_relaxed_result = None
+            for fallback_dte in range(fallback_min, effective_fallback_max_dte + 1):
+                log(
+                    f"[{symbol}] No tradeable contract in {primary_min_dte}-{primary_max_dte} DTE; "
+                    f"trying earliest fallback expiry at {fallback_dte} DTE."
+                )
+                result = _get_option_contract_uncached(
+                    symbol,
+                    signal,
+                    underlying_price,
+                    data=data,
+                    max_ext_from_vwap=max_ext_from_vwap,
+                    search_min_dte=fallback_dte,
+                    search_max_dte=fallback_dte,
+                )
+                if result is not None:
+                    if not is_relaxed_fallback(result):
+                        return result
+                    if first_relaxed_result is None:
+                        first_relaxed_result = result
+            return first_relaxed_result
+
+        log(f"[{symbol}] No tradeable contract in {primary_min_dte}-{primary_max_dte} DTE; extending search to {fallback_min}-{effective_fallback_max_dte} DTE.")
+        return _get_option_contract_uncached(
+            symbol,
+            signal,
+            underlying_price,
+            data=data,
+            max_ext_from_vwap=max_ext_from_vwap,
+            search_min_dte=fallback_min,
+            search_max_dte=effective_fallback_max_dte,
+        )
+
     if not OPTION_SEARCH_CACHE_ENABLED:
         primary = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=primary_min_dte, search_max_dte=primary_max_dte)
-        if primary is not None or effective_fallback_max_dte <= primary_max_dte:
+        if (primary is not None and not is_relaxed_fallback(primary)) or effective_fallback_max_dte <= primary_max_dte:
             return primary
-        fallback_min = max(primary_min_dte, primary_max_dte + 1)
-        log(f"[{symbol}] No tradeable contract in {primary_min_dte}-{primary_max_dte} DTE; extending search to {fallback_min}-{effective_fallback_max_dte} DTE.")
-        return _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=fallback_min, search_max_dte=effective_fallback_max_dte)
+        fallback = search_fallback()
+        return fallback if fallback is not None and not is_relaxed_fallback(fallback) else (primary or fallback)
 
     setup_type = str((data or {}).get("entry_playbook", "") or (data or {}).get("setup_type", "") or "")
     bar_time = (data or {}).get("bar_time")
@@ -4237,10 +4278,14 @@ def get_option_contract(symbol, signal, underlying_price, data=None, max_ext_fro
         return cached["result"]
 
     result = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=primary_min_dte, search_max_dte=primary_max_dte)
-    if result is None and effective_fallback_max_dte > primary_max_dte:
-        fallback_min = max(primary_min_dte, primary_max_dte + 1)
-        log(f"[{symbol}] No tradeable contract in {primary_min_dte}-{primary_max_dte} DTE; extending search to {fallback_min}-{effective_fallback_max_dte} DTE.")
-        result = _get_option_contract_uncached(symbol, signal, underlying_price, data=data, max_ext_from_vwap=max_ext_from_vwap, search_min_dte=fallback_min, search_max_dte=effective_fallback_max_dte)
+    if (result is None or is_relaxed_fallback(result)) and effective_fallback_max_dte > primary_max_dte:
+        primary_result = result
+        fallback_result = search_fallback()
+        result = (
+            fallback_result
+            if fallback_result is not None and not is_relaxed_fallback(fallback_result)
+            else (primary_result or fallback_result)
+        )
     is_negative = result is None
     ttl_seconds = OPTION_SEARCH_NEGATIVE_CACHE_TTL_SECONDS if is_negative else OPTION_SEARCH_CACHE_TTL_SECONDS
     if is_negative:
@@ -8855,26 +8900,36 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         _alerted_today["keys"].add(alert_key)
 
-    is_etf_contract = symbol in ETF_SYMBOLS
-    weekly_expiry_dte = _intraday_target_expiry_dte(now_ct)
-    if is_etf_contract:
-        contract_min_dte = 0 if ENABLE_0DTE_AND_EARLIEST_EXPIRY else MIN_DTE
-        contract_max_dte = FALLBACK_MAX_DTE
-        contract_fallback_max_dte = FALLBACK_MAX_DTE
-        data["entry_max_dte"] = FALLBACK_MAX_DTE
-        log(
-            f"[{symbol}] ETF contract policy: limiting selection to {contract_min_dte}-{contract_max_dte} DTE "
-            f"(earliest-expiry policy={'on' if ENABLE_0DTE_AND_EARLIEST_EXPIRY else 'off'})."
-        )
-    else:
-        contract_min_dte = 0 if ENABLE_0DTE_AND_EARLIEST_EXPIRY else max(NON_ETF_MIN_DTE, 4)
-        contract_max_dte = max(contract_min_dte, weekly_expiry_dte + 3)
-        contract_fallback_max_dte = max(contract_max_dte, weekly_expiry_dte + 3)
+    if FORCE_0DTE_ALL:
+        contract_min_dte = 0
+        contract_max_dte = 0
+        contract_fallback_max_dte = ZERO_DTE_FALLBACK_MAX_DTE
         data["entry_max_dte"] = contract_fallback_max_dte
         log(
-            f"[{symbol}] Stock contract policy: searching nearest available expiry "
-            f"from {contract_min_dte} DTE through {contract_fallback_max_dte} DTE."
+            f"[{symbol}] Intraday contract policy: searching 0DTE first, then the earliest "
+            f"valid expiry from 1-{contract_fallback_max_dte} DTE."
         )
+    else:
+        is_etf_contract = symbol in ETF_SYMBOLS
+        weekly_expiry_dte = _intraday_target_expiry_dte(now_ct)
+        if is_etf_contract:
+            contract_min_dte = 0 if ENABLE_0DTE_AND_EARLIEST_EXPIRY else MIN_DTE
+            contract_max_dte = FALLBACK_MAX_DTE
+            contract_fallback_max_dte = FALLBACK_MAX_DTE
+            data["entry_max_dte"] = FALLBACK_MAX_DTE
+            log(
+                f"[{symbol}] ETF contract policy: limiting selection to {contract_min_dte}-{contract_max_dte} DTE "
+                f"(earliest-expiry policy={'on' if ENABLE_0DTE_AND_EARLIEST_EXPIRY else 'off'})."
+            )
+        else:
+            contract_min_dte = max(NON_ETF_MIN_DTE, 4)
+            contract_max_dte = max(contract_min_dte, weekly_expiry_dte + 3)
+            contract_fallback_max_dte = contract_max_dte
+            data["entry_max_dte"] = contract_fallback_max_dte
+            log(
+                f"[{symbol}] Stock contract policy: searching nearest available expiry "
+                f"from {contract_min_dte} DTE through {contract_fallback_max_dte} DTE."
+            )
     option = get_option_contract(
         symbol,
         side,
@@ -8884,6 +8939,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
         min_dte=contract_min_dte,
         max_dte=contract_max_dte,
         fallback_max_dte=contract_fallback_max_dte,
+        earliest_expiry_fallback=FORCE_0DTE_ALL,
     )
     if not option:
         if (not NO_GATING_MODE) and ALERT_ONLY_COOLDOWN_MINUTES > 0:
