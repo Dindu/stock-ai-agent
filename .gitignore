@@ -23,3 +23,5 @@ env/
 # Bot artifacts
 trade_results.csv
 *.log
+pine_trade_state.json
+pine_trade_state.json.*.tmp

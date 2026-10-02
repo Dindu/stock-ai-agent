@@ -18,7 +18,7 @@ from math import exp
 import subprocess
 import threading
 import traceback
-from engine.confluence import get_confluence_from_bars
+from engine.ulti7_strategy import pine_exit_event, ulti7_entry_engine
 import uuid
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -133,7 +133,7 @@ OPENING_EXCEPTION_MIN_DOMINANCE = int(os.getenv("OPENING_EXCEPTION_MIN_DOMINANCE
 OPENING_EXCEPTION_MIN_SIDE_DELTA_5M = int(os.getenv("OPENING_EXCEPTION_MIN_SIDE_DELTA_5M", "8"))
 OPENING_EXCEPTION_MIN_VOL_RATIO = float(os.getenv("OPENING_EXCEPTION_MIN_VOL_RATIO", "1.20"))
 CLOSING_NO_TRADE_MINUTES = int(os.getenv("CLOSING_NO_TRADE_MINUTES", "30"))
-LOOKBACK_BARS = 120
+LOOKBACK_BARS = 2000
 RECENT_HIGH_LOOKBACK = 20  # bars used for intraday recent high/low (~100 min)
 MIN_DTE = int(os.getenv("MIN_DTE", "1"))
 MAX_DTE = int(os.getenv("MAX_DTE", "3"))  # Primary DTE window (normally 1-3)
@@ -323,6 +323,7 @@ ENABLE_MIDDAY_BRIEFING = os.getenv("ENABLE_MIDDAY_BRIEFING", "1") == "1"
 MIDDAY_BRIEFING_HOUR_CT = int(os.getenv("MIDDAY_BRIEFING_HOUR_CT", "12"))
 MIDDAY_BRIEFING_MINUTE_CT = int(os.getenv("MIDDAY_BRIEFING_MINUTE_CT", "5"))
 BRIEFING_STATE_FILE = os.getenv("BRIEFING_STATE_FILE", "briefing_sent_state.json")
+PINE_TRADE_STATE_FILE = os.getenv("PINE_TRADE_STATE_FILE", "pine_trade_state.json")
 MORNING_BRIEFING_NEWS_LIMIT = int(os.getenv("MORNING_BRIEFING_NEWS_LIMIT", "40"))
 MORNING_BRIEFING_HEADLINES_PER_SECTION = int(os.getenv("MORNING_BRIEFING_HEADLINES_PER_SECTION", "3"))
 MORNING_BRIEFING_NEWS_SYMBOLS = os.getenv(
@@ -569,6 +570,9 @@ _pdh_pdl_cache: "dict[str, dict]" = {sym: {"date": None, "pdh": None, "pdl": Non
 # Open paper-trade book: contract symbol -> trade record dict.
 # Capped by MAX_OPEN_TRADES across all underlyings.
 _open_trades: "dict[str, dict]" = {}
+_pine_trade_state_lock = threading.RLock()
+_pine_engine_state_load_lock = threading.Lock()
+_pine_engine_state_loaded = False
 # Lazily-initialized Alpaca paper TradingClient (created in main()).
 _trading_client: "TradingClient | None" = None
 # Lazily-initialized Alpaca OptionHistoricalDataClient (created in main()).
@@ -1346,6 +1350,8 @@ def _trade_progress_reason(trade, current_price, pnl_pct):
 
 def maybe_send_trade_progress_alert(trade, current_price, pnl_pct):
     """Send a one-time +10% progress update, preferably as a reply to entry alert."""
+    if trade.get("strategy_authority") == "ULTI7_V95":
+        return
     sent = bool(trade.get("milestone_10_sent", False))
     if sent:
         return
@@ -4683,8 +4689,10 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
 def fetch_bars(client, symbol):
     """Pull the most recent ~LOOKBACK_BARS 5-minute bars for ``symbol`` from Alpaca."""
     end = datetime.now(timezone.utc)
-    # 5 days back so a Monday start always captures the previous Friday's bars.
-    start = end - timedelta(days=5)
+    # Include ample session history so 200-period Pine ATR and stateful source
+    # indicators have enough warmup, including across weekends and holidays.
+    lookback_days = max(5, int(LOOKBACK_BARS * 7.0 / (78.0 * 5.0) * 1.5))
+    start = end - timedelta(days=lookback_days)
 
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
@@ -6609,7 +6617,11 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         partial_close_fraction = float(runner_profile.get("partial_close_fraction", PARTIAL_CLOSE_FRACTION))
         trailing_giveback_pct = float(runner_profile.get("trailing_giveback_pct", TRAILING_STOP_GIVEBACK_PCT))
         max_hold_minutes = MAX_TRADE_HOLD_MINUTES
-    underlying_entry_price = _safe_float_num((data or {}).get("price", 0.0), 0.0)
+    pine_decision = (data or {}).get("pine_entry_decision") or {}
+    pine_exit_plan = pine_decision.get("exit_plan") if pine_decision else None
+    underlying_entry_price = _safe_float_num(
+        pine_decision.get("entry_underlying", (data or {}).get("price", 0.0)), 0.0
+    )
     delta_5m, delta_10m = (None, None) if is_swing else _score_trend_deltas(data or {}, side)
     entry_timing = (str((data or {}).get("entry_playbook", "") or "SWING")) if is_swing else _classify_entry_timing(data or {}, side)
     setup_type = str((data or {}).get("entry_playbook") or (data or {}).get("setup_type") or entry_timing or "UNKNOWN")
@@ -6659,9 +6671,15 @@ def open_trade_record(symbol, signal, option, score, fill_price, qty, data=None)
         "entry_timing": entry_timing,
         "one_minute_trigger": str((data or {}).get("one_minute_trigger", "") or ""),
         "setup_type": setup_type,
+        "strategy_authority": str((data or {}).get("strategy_authority", "") or ""),
+        "pine_exit_plan": dict(pine_exit_plan) if pine_exit_plan else None,
+        "pine_original_qty": int(qty) if pine_exit_plan else 0,
         "entry_ignition_delta": ignition_delta,
         "entry_option_oi": option_oi,
-        "entry_atr14": _safe_float_num((data or {}).get("atr14", 0.0), 0.0),
+        "entry_atr14": _safe_float_num(
+            pine_exit_plan.get("atr", (data or {}).get("atr14", 0.0)) if pine_exit_plan else (data or {}).get("atr14", 0.0),
+            0.0,
+        ),
         "entry_support_level": ((data or {}).get("support_level") or {}).get("level") if isinstance((data or {}).get("support_level"), dict) else None,
         "entry_support_touches": ((data or {}).get("support_level") or {}).get("touches") if isinstance((data or {}).get("support_level"), dict) else None,
         "entry_support_strength": ((data or {}).get("support_level") or {}).get("strength") if isinstance((data or {}).get("support_level"), dict) else None,
@@ -6716,6 +6734,97 @@ def _is_option_asset_class(asset_class_val):
     return token in ("option", "options", "us_option")
 
 
+def _load_pine_trade_state():
+    try:
+        with open(PINE_TRADE_STATE_FILE, "r", encoding="utf-8") as state_file:
+            payload = json.load(state_file)
+        trades = payload.get("trades", {}) if isinstance(payload, dict) else {}
+        return trades if isinstance(trades, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        log(f"Pine trade-state recovery failed: {type(exc).__name__}: {exc}")
+        return {}
+
+
+def _restore_pine_entry_state():
+    global _pine_engine_state_loaded
+    if _pine_engine_state_loaded:
+        return
+    with _pine_engine_state_load_lock:
+        if _pine_engine_state_loaded:
+            return
+        try:
+            with open(PINE_TRADE_STATE_FILE, "r", encoding="utf-8") as state_file:
+                payload = json.load(state_file)
+            state = payload.get("strategy_states", {}) if isinstance(payload, dict) else {}
+            ulti7_entry_engine.restore_state(state)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            log(f"Pine entry-state recovery failed: {type(exc).__name__}: {exc}")
+        _pine_engine_state_loaded = True
+
+
+def _save_pine_trade_state():
+    _restore_pine_entry_state()
+    with _pine_trade_state_lock:
+        _write_pine_trade_state()
+
+
+def _write_pine_trade_state():
+    trades = {}
+    for contract, trade in _open_trades.items():
+        plan = trade.get("pine_exit_plan")
+        if not plan or trade.get("strategy_authority") != "ULTI7_V95":
+            continue
+        opened_at = trade.get("opened_at")
+        trades[contract] = {
+            "contract": contract,
+            "underlying": trade.get("underlying"),
+            "side": trade.get("side"),
+            "option_entry": float(trade.get("entry", 0.0) or 0.0),
+            "qty": int(trade.get("qty", 0) or 0),
+            "original_qty": int(trade.get("pine_original_qty", 0) or 0),
+            "pine_exit_plan": dict(plan),
+            "strategy_authority": "ULTI7_V95",
+            "setup_type": str(trade.get("setup_type", "UNKNOWN") or "UNKNOWN"),
+            "signal": str(trade.get("signal", "") or ""),
+            "entry_atr14": float(trade.get("entry_atr14", 0.0) or 0.0),
+            "underlying_entry_price": float(trade.get("underlying_entry_price", 0.0) or 0.0),
+            "opened_at": opened_at.isoformat() if hasattr(opened_at, "isoformat") else str(opened_at or ""),
+            "partial_taken": bool(trade.get("partial_taken", False)),
+            "partial_close_qty": int(trade.get("partial_close_qty", 0) or 0),
+            "partial_exit_px": float(trade.get("partial_exit_px", 0.0) or 0.0),
+            "partial_pnl_pct": float(trade.get("partial_pnl_pct", 0.0) or 0.0),
+            "partial_realized_dollar": float(trade.get("partial_realized_dollar", 0.0) or 0.0),
+            "partial_realized_cost": float(trade.get("partial_realized_cost", 0.0) or 0.0),
+            "score": int(trade.get("score", 0) or 0),
+            "entry_message_id": trade.get("entry_message_id"),
+        }
+    folder = os.path.dirname(PINE_TRADE_STATE_FILE)
+    try:
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        temp_path = f"{PINE_TRADE_STATE_FILE}.{os.getpid()}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as state_file:
+            json.dump(
+                {
+                    "version": 2,
+                    "trades": trades,
+                    "strategy_states": ulti7_entry_engine.export_state(),
+                },
+                state_file,
+                indent=2,
+                sort_keys=True,
+            )
+            state_file.flush()
+            os.fsync(state_file.fileno())
+        os.replace(temp_path, PINE_TRADE_STATE_FILE)
+    except Exception as exc:
+        log(f"Pine trade-state save failed: {type(exc).__name__}: {exc}")
+
+
 def sync_open_trades_from_alpaca():
     """Mirror _open_trades from live Alpaca option positions.
 
@@ -6730,6 +6839,7 @@ def sync_open_trades_from_alpaca():
     scanned_option = 0
     current_positions = []
     previous = dict(_open_trades)
+    persisted = _load_pine_trade_state()
     try:
         for pos in _trading_client.get_all_positions():
             scanned_total += 1
@@ -6795,9 +6905,21 @@ def sync_open_trades_from_alpaca():
     _open_trades.clear()
     for p in current_positions:
         contract_sym = p["contract"]
-        prev = previous.get(contract_sym)
+        prev = previous.get(contract_sym) or persisted.get(contract_sym)
         if prev is None:
             recovered += 1
+        recovered_entry = _safe_float_num(
+            prev.get("option_entry", prev.get("entry", p["entry"])) if prev else p["entry"],
+            p["entry"],
+        )
+        opened_at = prev.get("opened_at") if prev else None
+        if isinstance(opened_at, str) and opened_at:
+            try:
+                opened_at = datetime.fromisoformat(opened_at)
+            except ValueError:
+                opened_at = None
+        if opened_at is None:
+            opened_at = datetime.now(central)
         _rec_stop_pct = STOP_LOSS_PCT
         _open_trades[contract_sym] = {
             "underlying": p["underlying"],
@@ -6806,7 +6928,7 @@ def sync_open_trades_from_alpaca():
             "contract": contract_sym,
             "expiry": p["expiry"],
             "strike": p["strike"],
-            "entry": p["entry"],
+            "entry": recovered_entry,
             "qty": p["qty"],
             "current_price": p["current_price"],
             "target": p["entry"] * (1 + PROFIT_TARGET_PCT),
@@ -6838,15 +6960,20 @@ def sync_open_trades_from_alpaca():
             "setup_type": prev.get("setup_type", "UNKNOWN") if prev else "UNKNOWN",
             "entry_ignition_delta": prev.get("entry_ignition_delta", 0) if prev else 0,
             "entry_option_oi": prev.get("entry_option_oi", 0) if prev else 0,
-            "opened_at": prev.get("opened_at", datetime.now(central)) if prev else datetime.now(central),
+            "opened_at": opened_at,
             "status": "OPEN",
             "trade_id": prev.get("trade_id") if prev else None,
             "sheets_row": prev.get("sheets_row") if prev else None,
             "alerts_row": prev.get("alerts_row") if prev else None,
             "entry_message_id": prev.get("entry_message_id") if prev else None,
             "milestone_10_sent": prev.get("milestone_10_sent", False) if prev else False,
+            "strategy_authority": prev.get("strategy_authority", "") if prev else "",
+            "pine_exit_plan": dict(prev.get("pine_exit_plan") or {}) if prev and prev.get("pine_exit_plan") else None,
+            "pine_original_qty": int(prev.get("original_qty", prev.get("pine_original_qty", p["qty"])) or p["qty"]) if prev and prev.get("pine_exit_plan") else 0,
+            "entry_atr14": float(prev.get("entry_atr14", 0.0) or 0.0) if prev else 0.0,
         }
 
+    _save_pine_trade_state()
     if recovered:
         log(f"Recovered {recovered} open option position(s) from Alpaca for exit tracking.")
     else:
@@ -7120,6 +7247,79 @@ def track_open_trades():
             f"PnL {pnl_pct * 100:+.2f}%")
 
         maybe_send_trade_progress_alert(trade, current_price, pnl_pct)
+
+        pine_exit_plan = trade.get("pine_exit_plan")
+        if pine_exit_plan and trade.get("strategy_mode") != "SWING":
+            underlying_bars = None
+            try:
+                bars_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+                underlying_bars = fetch_bars(bars_client, trade["underlying"])
+            except Exception as bars_error:
+                log(f"[{trade['underlying']}] Pine exit bars unavailable: {bars_error}")
+            last_processed_pine_bar = pine_exit_plan.get("last_bar", "")
+            exit_event = pine_exit_event(trade, underlying_bars)
+            if exit_event:
+                exit_kind = exit_event["kind"]
+                close_qty = int(exit_event.get("close_qty", 0) or 0)
+                if close_qty <= 0 and exit_kind in ("TP1", "TP2"):
+                    if exit_kind == "TP1":
+                        pine_exit_plan["tp1_taken"] = True
+                        entry_underlying = float(pine_exit_plan["entry_price"])
+                        atr = float(pine_exit_plan["atr"])
+                        pine_exit_plan["stop"] = max(float(pine_exit_plan["stop"]), entry_underlying + 0.05 * atr) if trade["side"] == "CALL" else min(float(pine_exit_plan["stop"]), entry_underlying - 0.05 * atr)
+                    else:
+                        pine_exit_plan["tp2_taken"] = True
+                        pine_exit_plan["runner_active"] = True
+                    log(f"[{trade['underlying']}] {exit_event['reason']}: no contracts available for this scale leg; runner retained.")
+                    _save_pine_trade_state()
+                    continue
+                qty_before_exit = int(trade.get("qty", 0) or 0)
+                close_trade(
+                    trade,
+                    current_price,
+                    exit_event["reason"],
+                    pnl_pct,
+                    close_qty=close_qty,
+                    final_close=exit_kind in ("STOP", "TP3"),
+                )
+                qty_after_exit = int(trade.get("qty", 0) or 0)
+                exit_filled = qty_after_exit < qty_before_exit or contract_sym not in _open_trades
+                if exit_filled and exit_kind == "TP1" and contract_sym in _open_trades:
+                    pine_exit_plan["tp1_taken"] = True
+                    entry_underlying = float(pine_exit_plan["entry_price"])
+                    atr = float(pine_exit_plan["atr"])
+                    pine_exit_plan["stop"] = max(float(pine_exit_plan["stop"]), entry_underlying + 0.05 * atr) if trade["side"] == "CALL" else min(float(pine_exit_plan["stop"]), entry_underlying - 0.05 * atr)
+                    same_bar_tp2 = exit_event.get("same_bar_tp2")
+                    if same_bar_tp2:
+                        tp2_qty = int(same_bar_tp2.get("close_qty", 0) or 0)
+                        if tp2_qty <= 0:
+                            pine_exit_plan["tp2_taken"] = True
+                            pine_exit_plan["runner_active"] = True
+                        else:
+                            qty_before_tp2 = int(trade.get("qty", 0) or 0)
+                            close_trade(
+                                trade,
+                                current_price,
+                                same_bar_tp2["reason"],
+                                pnl_pct,
+                                close_qty=tp2_qty,
+                                final_close=False,
+                            )
+                            tp2_filled = int(trade.get("qty", 0) or 0) < qty_before_tp2
+                            if tp2_filled:
+                                pine_exit_plan["tp2_taken"] = True
+                                pine_exit_plan["runner_active"] = True
+                            elif contract_sym in _open_trades:
+                                pine_exit_plan["last_bar"] = last_processed_pine_bar
+                elif exit_filled and exit_kind == "TP2" and contract_sym in _open_trades:
+                    pine_exit_plan["tp2_taken"] = True
+                    pine_exit_plan["runner_active"] = True
+                elif not exit_filled and contract_sym in _open_trades:
+                    pine_exit_plan["last_bar"] = last_processed_pine_bar
+                _save_pine_trade_state()
+                continue
+            _save_pine_trade_state()
+            continue
 
         partial_taken = bool(trade.get("partial_taken", False))
         current_qty = int(trade.get("qty", 0) or 0)
@@ -7633,6 +7833,16 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
             exit_market_context,
             trade.get("entry_ignition_delta", 0),
         )
+    if final_close and trade.get("strategy_authority") == "ULTI7_V95":
+        pine_plan = trade.get("pine_exit_plan") or {}
+        exit_reason = str(reason or "")
+        ulti7_entry_engine.record_exit(
+            trade.get("underlying"),
+            trade.get("side", ""),
+            is_loss=exit_reason.startswith("PINE ATR/STRUCTURE STOP") and not bool(pine_plan.get("tp1_taken")),
+            runner=exit_reason.startswith("PINE RUNNER TRAIL"),
+            bar_time=pine_plan.get("last_bar"),
+        )
     outcome_label = "PROFIT" if is_profit else "LOSS"
     exit_type_label = "Profit" if is_profit else "Loss"
     exit_icon = "\U0001f7e2" if is_profit else "\U0001f534"
@@ -7654,6 +7864,27 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         short_reason = "RUNNER PROFIT GIVEBACK"
     elif short_reason.startswith("TIME EXIT"):
         short_reason = "TIME EXIT"
+    pine_plan = trade.get("pine_exit_plan") or {}
+    pine_exit_detail = ""
+    if trade.get("strategy_authority") == "ULTI7_V95" and pine_plan:
+        if str(reason).startswith("PINE TP1"):
+            short_reason = "ULTI-7 SPOT TP1 (+0.75 ATR)"
+            pine_exit_detail = (
+                f"Spot TP1 `${float(pine_plan['tp1']):.2f}` reached; sold about 50%. "
+                "Stop moves to entry +/-0.05 ATR."
+            )
+        elif str(reason).startswith("PINE TP2"):
+            short_reason = "ULTI-7 SPOT TP2 (+1.50 ATR)"
+            pine_exit_detail = (
+                f"Spot TP2 `${float(pine_plan['tp2']):.2f}` reached; sold about 15%. "
+                "Remaining contracts are the runner; 3-bar / 0.10 ATR trail starts next bar."
+            )
+        elif str(reason).startswith("PINE RUNNER TRAIL"):
+            short_reason = "ULTI-7 RUNNER TRAIL"
+            pine_exit_detail = f"Underlying 3-bar runner stop `${float(pine_plan['stop']):.2f}` triggered."
+        elif str(reason).startswith("PINE ATR/STRUCTURE STOP"):
+            short_reason = "ULTI-7 INITIAL STOP" if not pine_plan.get("tp1_taken") else "ULTI-7 PROTECTED STOP"
+            pine_exit_detail = f"Underlying stop `${float(pine_plan['stop']):.2f}` triggered."
     is_partial = (not final_close and close_qty_int < current_qty)
     shown_dollar = _combined_dollar if (final_close and _combined_cost > 0) else ((exit_px - entry_px) * close_qty_int * 100.0)
     if abs(shown_dollar - int(round(shown_dollar))) < 0.005:
@@ -7679,6 +7910,7 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         f"{line1}\n"
         f"`${entry_px:.2f}` → `${exit_px:.2f}` · `{duration_min}m` · Qty `{close_qty_int}`\n"
         f"{line3}\n"
+        f"{pine_exit_detail + chr(10) if pine_exit_detail else ''}"
         f"Reason: {short_reason}"
     )
     exit_color = DISCORD_COLOR_CALL if is_profit else DISCORD_COLOR_PUT
@@ -7770,9 +8002,11 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         total_partial_dollar = float(trade.get("partial_realized_dollar", 0.0) or 0.0)
         trade["partial_pnl_pct"] = (total_partial_dollar / total_partial_cost) if total_partial_cost > 0 else pnl_pct
         log(f"[{trade['underlying']}] Partial close executed: {close_qty_int} closed, {trade['qty']} remaining.")
+        _save_pine_trade_state()
         return
 
     _open_trades.pop(trade["contract"], None)
+    _save_pine_trade_state()
 
     with _auto_retrain_lock:
         _auto_retrain_state["closed_count"] = int(_auto_retrain_state.get("closed_count", 0)) + 1
@@ -7928,6 +8162,7 @@ def try_open_paper_trade(symbol, side, option, data):
 
     trade = open_trade_record(symbol, signal_label, option, score, fill_price, qty, data=data)
     _open_trades[trade["contract"]] = trade
+    _save_pine_trade_state()
     _record_trade_open_for_perf(datetime.now(central))
 
     # Persist both ALERTS and TRADES records as part of the same entry flow.
@@ -7943,6 +8178,9 @@ def try_open_paper_trade(symbol, side, option, data):
     partial_tp_pct = float(trade.get("partial_tp_pct", PARTIAL_TP_PCT))
     target_1 = float(trade.get("partial_target", trade['entry'] * (1 + max(0.01, partial_tp_pct))))
     target_2 = float(trade.get("target", trade['entry'] * (1 + PROFIT_TARGET_PCT)))
+    pine_plan = trade.get("pine_exit_plan") or {}
+    pine_entry_decision = data.get("pine_entry_decision") or {}
+    pine_managed = trade.get("strategy_authority") == "ULTI7_V95" and bool(pine_plan)
 
     score_line = f"{score}/100"
     if macro_penalty > 0:
@@ -7986,14 +8224,35 @@ def try_open_paper_trade(symbol, side, option, data):
         trigger_compact = "RETEST CONFIRMED"
     elif trigger_raw == "MOMENTUM_COMPRESSION":
         trigger_compact = "COMPRESSION BREAK"
+    elif trigger_raw == "PINE_V95":
+        trigger_compact = "ULTI-7 V9.5"
     else:
         trigger_compact = "SNIPER CONFIRMED"
+
+    if pine_managed:
+        strategy_line = (
+            f"\U0001f9ed **ULTI-7 V9.5** · `{setup_compact}` · "
+            f"Src `{pine_entry_decision.get('long_votes', 0)}/{pine_entry_decision.get('short_votes', 0)}` · "
+            f"MTF `{pine_entry_decision.get('call_mtf', 0)}/{pine_entry_decision.get('put_mtf', 0)}`"
+        )
+        target_line = (
+            f"\U0001f3af Spot TP1 `${float(pine_plan['tp1']):.2f}` (50%) · "
+            f"TP2 `${float(pine_plan['tp2']):.2f}` (15%)\n"
+            f"\U0001f6e1 Spot SL `${float(pine_plan['stop']):.2f}` · "
+            "runner trails 3 bars / 0.10 ATR after TP2"
+        )
+    else:
+        strategy_line = (
+            f"\U0001f525 {'Bull' if trade['side'] == 'CALL' else 'Bear'} `{primary_score}` · "
+            f"{setup_compact} · {trigger_compact}"
+        )
+        target_line = f"\U0001f3af `${target_1:.2f}` / `${target_2:.2f}` · \U0001f6e1\ufe0f `-{stop_pct:.0f}%`"
 
     entry_msg = send_discord(
         f"\U0001f3af **{trade['underlying']} {trade['side']}** · {expiry_mmdd} · {strike_contract}\n"
         f"\U0001f4b5 `${trade['entry']:.2f}` · Spot `${underlying_entry_price:.2f}` · Qty `{trade['qty']}`\n"
-        f"\U0001f525 {'Bull' if trade['side'] == 'CALL' else 'Bear'} `{primary_score}` · {setup_compact} · {trigger_compact}\n"
-        f"\U0001f3af `${target_1:.2f}` / `${target_2:.2f}` · \U0001f6e1\ufe0f `-{stop_pct:.0f}%` · `{trade['opened_at']:%H:%M CT}`",
+        f"{strategy_line}\n"
+        f"{target_line} · `{trade['opened_at']:%H:%M CT}`",
         color=DISCORD_COLOR_CALL if trade['side'] == 'CALL' else DISCORD_COLOR_PUT,
         wait_for_response=True,
         webhook_url=DISCORD_WEBHOOK_LIVE_TRADES_URL,
@@ -8390,62 +8649,30 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if not data:
         return
 
-    confluence = get_confluence_from_bars(bars)
-    bull_votes = confluence["bull_votes"]
-    bear_votes = confluence["bear_votes"]
-    recovery = confluence["recovery"]
-    confirmation = confluence["confirmation"]
-    if bull_votes > bear_votes:
-        side = "CALL"
-        aligned_votes, opposing_votes = bull_votes, bear_votes
-        volume_confirmed = recovery["buy_sell_ratio"] >= 1.1
-    elif bear_votes > bull_votes:
-        side = "PUT"
-        aligned_votes, opposing_votes = bear_votes, bull_votes
-        volume_confirmed = recovery["buy_sell_ratio"] <= (1 / 1.1)
-    else:
-        log(f"[{symbol}] Seven-indicator strategy: no directional vote — skipping.")
-        return
-
-    location_ok = True
-    location_reason = "room available"
-    opposing_level = data.get("resistance_level") if side == "CALL" else data.get("support_level")
-    if isinstance(opposing_level, dict):
-        level = _safe_float_num(opposing_level.get("level"), 0.0)
-        strength = _safe_float_num(opposing_level.get("strength"), 0.0)
-        distance_atr = _safe_float_num(opposing_level.get("distance_atr"), 999.0)
-        price = _safe_float_num(data.get("price"), 0.0)
-        level_is_ahead = level > price if side == "CALL" else level < price
-        if level_is_ahead and strength >= 70.0 and distance_atr < 0.75:
-            location_ok = False
-            location_reason = f"strong opposing level ${level:.2f} only {distance_atr:.2f} ATR away"
-
-    seven_score = int(round((aligned_votes / 7.0) * 100.0))
-    confluence_ok = (
-        aligned_votes >= 5
-        and aligned_votes > opposing_votes
-        and volume_confirmed
-        and confirmation["call" if side == "CALL" else "put"]
-        and location_ok
+    _restore_pine_entry_state()
+    pine_decision, pine_reason = ulti7_entry_engine.evaluate(
+        symbol, bars, data, now=datetime.now(central)
     )
-    if side == "CALL" and symbol != "SPY" and _spy_vwap_side() == "bear":
-        confluence_ok = confluence_ok and aligned_votes >= 6 and recovery["buy_sell_ratio"] >= 1.35
-    if not confluence_ok:
-        log(
-            f"[{symbol}] Seven-indicator strategy: {side} blocked — "
-            f"{confluence['description']}, {recovery['reason']}, "
-            f"{confirmation['reason']}, location={location_reason}"
-        )
-        _record_entry_block("seven_indicator_strategy")
+    _save_pine_trade_state()
+    if not pine_decision:
+        log(f"[{symbol}] ULTI-7 V9.5 entry: no candidate — {pine_reason}.")
+        _record_entry_block("ulti7_entry_engine")
         return
 
+    side = pine_decision["side"]
     data["side"] = side
     data["signal"] = f"STRONG {side}"
     data["tier"] = "STRONG"
-    data["bull_score"] = seven_score if side == "CALL" else int(round((opposing_votes / 7.0) * 100.0))
-    data["bear_score"] = seven_score if side == "PUT" else int(round((opposing_votes / 7.0) * 100.0))
-    data["seven_indicator_confluence"] = confluence
-    data["strategy_authority"] = "SEVEN_INDICATORS"
+    data["entry_playbook"] = pine_decision["setup"]
+    data["setup_type"] = pine_decision["setup"]
+    data["pine_entry_decision"] = pine_decision
+    data["pine_entry_approved"] = True
+    data["strategy_authority"] = "ULTI7_V95"
+    log(
+        f"[{symbol}] ULTI-7 V9.5 selected {pine_decision['setup']} {side} — "
+        f"{pine_reason}; source_votes={pine_decision['long_votes']}/{pine_decision['short_votes']} "
+        f"MTF={pine_decision['call_mtf']}/{pine_decision['put_mtf']}."
+    )
 
     closing_block_minutes = closing_no_trade_minutes_remaining()
     if closing_block_minutes > 0:
@@ -8531,7 +8758,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 return
 
     # Trend-ignition filter: only fire when the move is *just starting*, not mid- or late-trend.
-    if IGNITION_REQUIRED and not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
+    if IGNITION_REQUIRED and not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE and not data.get("pine_entry_approved"):
         entry_timing = _classify_entry_timing(data or {}, side)
         if side == "CALL":
             now_score = data["bull_score"]
@@ -8713,7 +8940,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
 
     # Continuation check: relaxed version (ignition delta already requires momentum confirmation)
     # Note: We're keeping this gate but making it advisory only during fresh ignitions
-    if not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE and not data.get("ignition_confirmed", False):
+    if not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE and not data.get("ignition_confirmed", False) and not data.get("pine_entry_approved"):
         cont_ok, cont_reason = entry_momentum_continuation_ok(symbol, side, data)
         if not cont_ok:
             log(f"[{symbol}] Momentum continuation filter: {side} blocked — {cont_reason}.")
@@ -8722,7 +8949,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     # ── RSI exhaustion filter ─────────────────────────────────────────────────
     # Don't enter CALLs when RSI is already overbought (move likely exhausted),
     # or PUTs when RSI is already oversold.
-    if RSI_FILTER and not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
+    if RSI_FILTER and not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE and not data.get("pine_entry_approved"):
         rsi = data.get("rsi", 50.0)
         if side == "CALL" and rsi >= rsi_overbought:
             log(f"[{symbol}] RSI filter: CALL blocked — RSI {rsi:.1f} >= {rsi_overbought} (overbought, late entry).")
@@ -8733,7 +8960,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
 
     # ── Macro alignment context (penalty by default, optional hard block) ───
     macro_penalty = 0
-    if SPY_MACRO_ALIGN and (not NO_GATING_MODE) and symbol != "SPY" and "SPY" in SYMBOLS:
+    if SPY_MACRO_ALIGN and (not NO_GATING_MODE) and not data.get("pine_entry_approved") and symbol != "SPY" and "SPY" in SYMBOLS:
         spy_vwap_side = _spy_vwap_side()
         misaligned = (side == "CALL" and spy_vwap_side != "bull") or (side == "PUT" and spy_vwap_side != "bear")
         if misaligned:
@@ -8755,6 +8982,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
         BEARISH_TAPE_CALL_PENALTY_ENABLED
         and side == "CALL"
         and (not NO_GATING_MODE)
+        and not data.get("pine_entry_approved")
     ):
         spy_side = _spy_vwap_side()
         qqq_side = _qqq_vwap_cache.get("side")
@@ -8775,56 +9003,8 @@ def run_symbol(client, symbol, prefetched_bars=None):
     data["macro_penalty"] = macro_penalty
     data["effective_score"] = effective_score
 
-    # Seven-indicator confluence is the final 5m entry authority for both sides.
-    confluence = data.get("seven_indicator_confluence") or get_confluence_from_bars(bars)
-    data["seven_indicator_confluence"] = confluence
-    aligned_votes = confluence["bull_votes"] if side == "CALL" else confluence["bear_votes"]
-    opposing_votes = confluence["bear_votes"] if side == "CALL" else confluence["bull_votes"]
-    recovery = confluence["recovery"]
-    expected_stack = "bullish" if side == "CALL" else "bearish"
-    volume_confirmed = (
-        recovery["buy_sell_ratio"] >= 1.1
-        if side == "CALL"
-        else recovery["buy_sell_ratio"] <= (1 / 1.1)
-    )
-    confluence_ok = (
-        aligned_votes >= 5
-        and aligned_votes > opposing_votes
-        and volume_confirmed
-    )
-    log(
-        f"[{symbol}] 7-indicator confluence: {confluence['description']} | "
-        f"{recovery['reason']}"
-    )
-    if not confluence_ok:
-        log(
-            f"[{symbol}] 7-indicator gate: {side} blocked — "
-            f"aligned={aligned_votes}/7, opposing={opposing_votes}/7, "
-            f"stack={recovery['stack']}, volume_confirmed={volume_confirmed}."
-        )
-        _record_entry_block("seven_indicator_confluence")
-        return
-
-    # Adverse tape is a quality tier, not a blanket CALL ban. Require an
-    # exceptional fresh recovery before taking a bullish setup against SPY.
-    spy_bearish = symbol != "SPY" and _spy_vwap_side() == "bear"
-    if side == "CALL" and spy_bearish:
-        adverse_tape_ok = (
-            aligned_votes >= 6
-            and recovery["buy_sell_ratio"] >= 1.35
-        )
-        if not adverse_tape_ok:
-            log(
-                f"[{symbol}] Adverse-tape CALL quality tier: setup remains eligible only with "
-                f"6/7+ fresh confluence and buy/sell volume >=1.35; "
-                f"got aligned={aligned_votes}/7, fresh={recovery['fresh']}, "
-                f"buy/sell={recovery['buy_sell_ratio']:.2f}."
-            )
-            _record_entry_block("adverse_tape_call_quality")
-            return
-
     # Real lower-timeframe timing: only after the 5m setup passes the hard score gate.
-    if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and ONE_MINUTE_ENTRY_ENABLED:
+    if TWO_PLAYBOOK_ENTRY_MODE and not NO_GATING_MODE and ONE_MINUTE_ENTRY_ENABLED and not data.get("pine_entry_approved"):
         try:
             bars_1m = fetch_1m_bars(client, symbol)
             trigger, trigger_reason = one_minute_entry_timing(symbol, side, bars_1m, data)
@@ -8847,14 +9027,18 @@ def run_symbol(client, symbol, prefetched_bars=None):
             data["one_minute_trigger"] = ""
             data["one_minute_entry_confirmed"] = False
             log(f"[{symbol}] 1m sniper evaluation failed: {type(e).__name__}: {e}")
+    elif data.get("pine_entry_approved"):
+        data["one_minute_trigger"] = "PINE_V95"
+        data["one_minute_entry_confirmed"] = True
     else:
         data["one_minute_trigger"] = "DISABLED" if not ONE_MINUTE_ENTRY_ENABLED else ""
         data["one_minute_entry_confirmed"] = not ONE_MINUTE_ENTRY_ENABLED
 
-    data["entry_playbook"] = "SEVEN_INDICATOR"
-    data["setup_type"] = "SEVEN_INDICATOR"
+    if not data.get("pine_entry_approved"):
+        data["entry_playbook"] = "SEVEN_INDICATOR"
+        data["setup_type"] = "SEVEN_INDICATOR"
 
-    if ML_GATE_ENABLED and (not NO_GATING_MODE) and not TWO_PLAYBOOK_ENTRY_MODE:
+    if ML_GATE_ENABLED and (not NO_GATING_MODE) and not TWO_PLAYBOOK_ENTRY_MODE and not data.get("pine_entry_approved"):
         ml_prob, ml_exp_ret, ml_source = _predict_ml_entry(symbol, side, data)
         data["ml_probability"] = ml_prob
         data["ml_expected_return"] = ml_exp_ret
@@ -8883,7 +9067,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     # ── Anti-chase filters ───────────────────────────────────────────────────
     # Avoid buying when price is already too extended away from VWAP, and avoid
     # entering when the latest candle already flipped against our side.
-    if ANTI_CHASE_FILTER and not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
+    if ANTI_CHASE_FILTER and not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE and not data.get("pine_entry_approved"):
         ext_pct = float(data.get("vwap_extension_pct", 0.0))
         if ext_pct > max_ext_from_vwap:
             log(
@@ -8892,7 +9076,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
             )
             return
 
-    if CANDLE_CONFIRMATION and not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
+    if CANDLE_CONFIRMATION and not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE and not data.get("pine_entry_approved"):
         if side == "CALL" and not data.get("bullish_candle", False):
             log(f"[{symbol}] Candle filter: CALL blocked — latest candle is not bullish.")
             return
