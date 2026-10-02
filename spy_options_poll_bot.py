@@ -4312,7 +4312,7 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
         effective_min_dte = MIN_DTE if search_min_dte is None else max(0, int(search_min_dte))
         effective_max_dte = MAX_DTE if search_max_dte is None else int(search_max_dte)
         min_exp = today + timedelta(days=effective_min_dte)
-        max_exp = today + timedelta(days=effective_max_dte) if effective_max_dte > 0 else None
+        max_exp = today + timedelta(days=effective_max_dte)
         option_type = "call" if signal == "CALL" else "put"
 
         req_kwargs = {
@@ -4323,8 +4323,7 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
             "strike_price_lte": str(round(underlying_price * 1.05, 2)),
             "limit": 50,
         }
-        if max_exp is not None:
-            req_kwargs["expiration_date_lte"] = max_exp
+        req_kwargs["expiration_date_lte"] = max_exp
 
         req = GetOptionContractsRequest(**req_kwargs)
         result = _trading_client.get_option_contracts(req)
@@ -4466,6 +4465,12 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
                 delta_val = 0.0
 
             dte = (exp_date - today).days
+            if dte < effective_min_dte or dte > effective_max_dte:
+                _reject(
+                    f"[{symbol}] Contract {contract_sym} rejected — DTE {dte} outside requested "
+                    f"{effective_min_dte}-{effective_max_dte} DTE search window."
+                )
+                continue
 
             # NO_QUOTE is a data-integrity reject, distinct from a genuine thin-liquidity
             # rejection: there's nothing to trade against at all, live or stale.
