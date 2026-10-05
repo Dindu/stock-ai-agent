@@ -163,15 +163,82 @@ def create_pine_exit_plan(side, entry_price, atr, bars, entry_bar=None):
     }
 
 
-def pine_exit_event(trade, bars):
+def _pine_late4_event(trade, frame, now=None):
+    plan = trade.get("pine_exit_plan") or {}
+    if plan.get("tp1_taken") or not isinstance(frame.index, pd.DatetimeIndex):
+        return None
+    completed = frame
+    if now is not None:
+        now_ts = pd.Timestamp(now)
+        if now_ts.tzinfo is None:
+            now_ts = now_ts.tz_localize("UTC")
+        else:
+            now_ts = now_ts.tz_convert("UTC")
+        index = completed.index
+        if index.tz is None:
+            index = index.tz_localize("UTC")
+        else:
+            index = index.tz_convert("UTC")
+        completed = completed.loc[index + pd.Timedelta(minutes=5) <= now_ts]
+    if len(completed) < 2:
+        return None
+
+    entry_bar = pd.Timestamp(plan.get("entry_bar", ""))
+    if entry_bar.tzinfo is None:
+        entry_bar = entry_bar.tz_localize("UTC")
+    else:
+        entry_bar = entry_bar.tz_convert("UTC")
+    completed_index = completed.index
+    if completed_index.tz is None:
+        completed_index = completed_index.tz_localize("UTC")
+    else:
+        completed_index = completed_index.tz_convert("UTC")
+    after_entry = completed.loc[completed_index > entry_bar]
+    if len(after_entry) < 4:
+        return None
+
+    check_bar = after_entry.index[-1]
+    if str(check_bar) == str(plan.get("last_late4_bar", "")):
+        return None
+    plan["last_late4_bar"] = str(check_bar)
+
+    features = _pine_base_series(completed)
+    closes = features["close"].iloc[-2:]
+    ema20 = features["ema20"].shift(1).iloc[-2:]
+    vwap = features["vwap"].shift(1).iloc[-2:]
+    side = str(trade.get("side", "")).upper()
+    if side == "CALL":
+        failed_twice = bool(((closes < ema20) & (closes < vwap)).all())
+        tp1_not_touched = float(after_entry["high"].max()) < float(plan["tp1"])
+    elif side == "PUT":
+        failed_twice = bool(((closes > ema20) & (closes > vwap)).all())
+        tp1_not_touched = float(after_entry["low"].min()) > float(plan["tp1"])
+    else:
+        return None
+    if failed_twice and tp1_not_touched:
+        exit_close = float(after_entry["close"].iloc[-1])
+        plan["late4_close"] = exit_close
+        return {
+            "kind": "EARLY_FAIL",
+            "reason": "PINE LATE4 EARLY FAIL",
+            "close_qty": int(trade.get("qty", 0) or 0),
+            "underlying_exit_price": exit_close,
+            "bar_time": str(check_bar),
+        }
+    return None
+
+
+def pine_exit_event(trade, bars, now=None):
     """Advance an open Pine-managed trade and return its next exit action."""
     plan = trade.get("pine_exit_plan") or {}
     frame = bars
     if not plan or frame is None or len(frame) < 4:
         return None
     bar_time = str(frame.index[-1])
-    if bar_time <= str(plan.get("entry_bar", "")) or bar_time == plan.get("last_bar"):
+    if bar_time <= str(plan.get("entry_bar", "")):
         return None
+    if bar_time == plan.get("last_bar"):
+        return _pine_late4_event(trade, frame, now=now)
     plan["last_bar"] = bar_time
     latest = frame.iloc[-1]
     high = float(latest["high"])
@@ -222,7 +289,7 @@ def pine_exit_event(trade, bars):
         close_qty = min(max(0, current_qty - 1), int(original_qty * 0.15 + 0.5))
         return {"kind": "TP2", "reason": "PINE TP2 1.50 ATR", "close_qty": close_qty}
 
-    return None
+    return _pine_late4_event(trade, frame, now=now)
 
 
 @dataclass

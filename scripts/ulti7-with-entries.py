@@ -1,7 +1,8 @@
 //@version=6
 // Volumatic VIDYA module (BigBeluga) is licensed under CC BY-NC-SA 4.0: https://creativecommons.org/licenses/by-nc-sa/4.0/
-indicator("ULTI-7 v9.5 [Diagnostic Segmentation]", "ULTI-7 v9.5", overlay=true, max_bars_back=4900, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+indicator("ULTI-7 v15 FINAL [Frozen + Enhanced Alerts]", "ULTI-7 v15 FINAL", overlay=true, max_bars_back=4900, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
 
+// ULTI-7 v15: V14 LATE4 winner is part of the real trade manager. Before TP1, after age >= 4 bars, two consecutive closes through both 5M EMA and VWAP exit early. Original entries, structure stop, scales, TP2, and runner remain unchanged.
 // ULTI-7 v6 execution enhancement: optimized for a 5M chart. One-shot regime reversals, stricter V0 reversals, post-runner re-arm, strict continuation, and TP2 runner management.
 // Mechanical merge of the seven supplied source modules. All module plots, labels, tables, zones, alerts, and calculations are retained; only declaration, namespacing, and legacy syntax are changed.
 
@@ -141,6 +142,15 @@ v94_show_blocked = input.bool(true, "Show Blocked Signal Counts", group="V9.4 Se
 // V9.5 diagnostics: no new entry filters. Segment realized expectancy by setup,
 // time bucket, and 5M trend alignment so future filters can target only weak regimes.
 v95_show_diagnostics = input.bool(true, "Show V9.5 Setup Segmentation", group="V9.5 Diagnostics")
+
+v96_unified_alerts = input.bool(true, "Enable One Unified Alert Stream", group="V9.6 Alerts")
+v96_include_levels = input.bool(true, "Include Entry / TP / SL Levels", group="V9.6 Alerts")
+v15_late4_enabled = input.bool(true, "Enable LATE4 Real Early Exit", group="V15 Risk Engine")
+v15_show_audit = input.bool(true, "Show V15 Real-State Summary", group="V15 Risk Engine")
+var int v15_early_fail_exits = 0
+var int v15_early_fail_call_exits = 0
+var int v15_early_fail_put_exits = 0
+var float v15_early_fail_sum_r = 0.0
 
 color_ema = input.color(color.blue, "EMA", group="Color Overrides")
 color_ema_ma = input.color(color.yellow, "EMA Smoothing", group="Color Overrides")
@@ -2137,6 +2147,11 @@ var bool visual_hit_tp1 = false
 var bool visual_hit_tp2 = false
 var bool visual_runner_active = false
 var int visual_entry_bar = na
+varip int v96_trade_id = 0
+varip bool v96_entry_sent = false
+varip bool v96_tp1_sent = false
+varip bool v96_tp2_sent = false
+varip bool v96_exit_sent = false
 var int v95_parity_entry_side = 0
 var int v95_parity_entry_setup = 0
 var int v95_parity_exit_code = 0
@@ -2146,6 +2161,32 @@ v95_parity_exit_code := 0
 
 f_v95_setup_code(_reason) =>
     str.contains(_reason, "REV") ? 1 : str.contains(_reason, "STRUCTURE") ? 2 : str.contains(_reason, "CONT") ? 3 : str.contains(_reason, "CONSENSUS") ? 4 : 5
+
+f_v96_alert_message(_event, _direction, _reason, _eventPrice, _entry, _tp1, _tp2, _sl) =>
+    _risk_ok = not na(v91_initial_risk) and v91_initial_risk > 0
+    _leg_r = _risk_ok ? ((_eventPrice - _entry) * v7_trade_dir) / v91_initial_risk : na
+    _tp1_r = _risk_ok ? ((_tp1 - _entry) * v7_trade_dir) / v91_initial_risk : na
+    _tp2_r = _risk_ok ? ((_tp2 - _entry) * v7_trade_dir) / v91_initial_risk : na
+    _total_pct = math.max(v93_tp1_scale_pct + v93_tp2_scale_pct + v93_runner_scale_pct, 0.0001)
+    _w1 = v93_tp1_scale_pct / _total_pct
+    _w2 = v93_tp2_scale_pct / _total_pct
+    _w3 = v93_runner_scale_pct / _total_pct
+    _trade_r = not _risk_ok ? na : not visual_hit_tp1 ? _leg_r : not visual_hit_tp2 ? (_w1 * _tp1_r + (_w2 + _w3) * _leg_r) : (_w1 * _tp1_r + _w2 * _tp2_r + _w3 * _leg_r)
+    _trade_r_txt = na(_trade_r) ? "NA" : str.tostring(_trade_r, "#.00") + "R"
+    _runner_r_txt = na(_leg_r) ? "NA" : str.tostring(_leg_r, "#.00") + "R"
+    _prefix = syminfo.ticker + " " + _direction + " | "
+    _event == "ENTRY" ? _prefix + "ENTRY @ " + str.tostring(_entry, format.mintick) + " | TP1 " + str.tostring(_tp1, format.mintick) + " | TP2 " + str.tostring(_tp2, format.mintick) + " | SL " + str.tostring(_sl, format.mintick) :
+     _event == "TP1" ? _prefix + "TP1 HIT @ " + str.tostring(_eventPrice, format.mintick) + " | 50% TAKEN" :
+     (_event == "TP2_RUNNER_START" or _event == "TP2") ? _prefix + "TP2 HIT @ " + str.tostring(_eventPrice, format.mintick) + " | 15% TAKEN | 35% RUNNER" :
+     _event == "RUNNER_EXIT" ? _prefix + "RUNNER EXIT @ " + str.tostring(_eventPrice, format.mintick) + " | Runner " + _runner_r_txt + " | TOTAL " + _trade_r_txt :
+     _event == "EARLY_FAIL_EXIT" ? _prefix + "LATE4 EXIT @ " + str.tostring(_eventPrice, format.mintick) + " | TOTAL " + _trade_r_txt :
+     _event == "SL" ? _prefix + "SL HIT @ " + str.tostring(_eventPrice, format.mintick) + " | TOTAL " + _trade_r_txt :
+     _event == "FINAL_TP" ? _prefix + "FINAL TP @ " + str.tostring(_eventPrice, format.mintick) + " | TOTAL " + _trade_r_txt :
+     _prefix + _event + " @ " + str.tostring(_eventPrice, format.mintick)
+
+f_v96_fire(_event, _direction, _reason, _eventPrice, _entry, _tp1, _tp2, _sl) =>
+    if v96_unified_alerts
+        alert(f_v96_alert_message(_event, _direction, _reason, _eventPrice, _entry, _tp1, _tp2, _sl), alert.freq_once_per_bar)
 
 v91_leg_r(price) =>
     not na(v91_initial_risk) and v91_initial_risk > 0 ? ((price - visual_entry_price) * v7_trade_dir) / v91_initial_risk : 0.0
@@ -2162,6 +2203,11 @@ v91_realized_r(exit_price) =>
 
 if visual_trade_labels_enabled and visual_position == "FLAT" and visual_long_entry
     visual_position := "LONG"
+    v96_trade_id += 1
+    v96_entry_sent := false
+    v96_tp1_sent := false
+    v96_tp2_sent := false
+    v96_exit_sent := false
     v95_parity_entry_side := 1
     v95_parity_entry_setup := v3_unified_enabled ? f_v95_setup_code(v3_call_reason) : 6
     visual_entry_price := close
@@ -2175,9 +2221,13 @@ if visual_trade_labels_enabled and visual_position == "FLAT" and visual_long_ent
     visual_hit_tp2 := false
     visual_runner_active := false
     visual_entry_bar := bar_index
+    v7_trade_dir := 1
     v7_total_entries += 1
     v7_call_entries += 1
     v7_trade_reason := v3_unified_enabled ? v3_call_reason : "RAW CALL"
+    if not v96_entry_sent
+        f_v96_fire("ENTRY", "CALL", v7_trade_reason, visual_entry_price, visual_entry_price, visual_tp1_price, visual_tp2_price, visual_sl_price)
+        v96_entry_sent := true
     v8_trade_tod := v8_tod_bucket()
     if v8_trade_tod == 1
         v8_tod1_e += 1
@@ -2236,6 +2286,11 @@ if visual_trade_labels_enabled and visual_position == "FLAT" and visual_long_ent
 
 if visual_trade_labels_enabled and visual_position == "FLAT" and visual_short_entry
     visual_position := "SHORT"
+    v96_trade_id += 1
+    v96_entry_sent := false
+    v96_tp1_sent := false
+    v96_tp2_sent := false
+    v96_exit_sent := false
     v95_parity_entry_side := -1
     v95_parity_entry_setup := v3_unified_enabled ? f_v95_setup_code(v3_put_reason) : 6
     visual_entry_price := close
@@ -2249,9 +2304,13 @@ if visual_trade_labels_enabled and visual_position == "FLAT" and visual_short_en
     visual_hit_tp2 := false
     visual_runner_active := false
     visual_entry_bar := bar_index
+    v7_trade_dir := -1
     v7_total_entries += 1
     v7_put_entries += 1
     v7_trade_reason := v3_unified_enabled ? v3_put_reason : "RAW PUT"
+    if not v96_entry_sent
+        f_v96_fire("ENTRY", "PUT", v7_trade_reason, visual_entry_price, visual_entry_price, visual_tp1_price, visual_tp2_price, visual_sl_price)
+        v96_entry_sent := true
     v8_trade_tod := v8_tod_bucket()
     if v8_trade_tod == 1
         v8_tod1_e += 1
@@ -2317,18 +2376,43 @@ if visual_trade_labels_enabled and visual_position == "LONG" and bar_index > vis
         v5_long_runner_stop = ta.lowest(low, v9_runner_lb)[1] - v9_runner_buf * visual_atr
         if not na(v5_long_runner_stop)
             visual_sl_price := math.max(visual_sl_price, v5_long_runner_stop)
-    if low <= visual_sl_price
-        v81_exit_fill_long = open < visual_sl_price ? open : visual_sl_price
+    v15_long_fail_now = close < v2_5_ema and close < v2_5_vwap
+    v15_long_fail_prev = close[1] < v2_5_ema[1] and close[1] < v2_5_vwap[1]
+    v15_long_struct_stop = low <= visual_sl_price
+    v15_long_early_exit = v15_late4_enabled and not visual_hit_tp1 and high < visual_tp1_price and bar_index - visual_entry_bar >= 4 and v15_long_fail_now and v15_long_fail_prev and not v15_long_struct_stop
+    if v15_long_struct_stop or v15_long_early_exit
+        v81_exit_fill_long = v15_long_early_exit ? close : (open < visual_sl_price ? open : visual_sl_price)
         if v7_show_mfe_mae and v7_trade_atr > 0
-            v7_trade_mae := math.max(v7_trade_mae, math.max((visual_entry_price - v81_exit_fill_long) / v7_trade_atr, 0.0))
-        if visual_runner_active
+            if v15_long_early_exit
+                v7_trade_mfe := math.max(v7_trade_mfe, math.max((high - visual_entry_price) / v7_trade_atr, 0.0))
+                v7_trade_mae := math.max(v7_trade_mae, math.max((visual_entry_price - low) / v7_trade_atr, 0.0))
+            else
+                v7_trade_mae := math.max(v7_trade_mae, math.max((visual_entry_price - v81_exit_fill_long) / v7_trade_atr, 0.0))
+        if v15_long_early_exit
+            v95_parity_exit_code := 7
+            if not v96_exit_sent
+                f_v96_fire("EARLY_FAIL_EXIT", "CALL", v7_trade_reason, v81_exit_fill_long, visual_entry_price, visual_tp1_price, visual_tp2_price, visual_sl_price)
+                v96_exit_sent := true
+            label.new(bar_index, low, "LATE4 EXIT", style=label.style_label_up, color=color.orange, textcolor=color.white, size=size.small)
+            v15_early_fail_exits += 1
+            v15_early_fail_call_exits += 1
+            if v5_post_loss_reset and v81_exit_fill_long < visual_entry_price
+                v5_loss_block_dir := 1
+                v5_loss_block_bar := bar_index
+        else if visual_runner_active
             v95_parity_exit_code := 5
+            if not v96_exit_sent
+                f_v96_fire("RUNNER_EXIT", "CALL", v7_trade_reason, v81_exit_fill_long, visual_entry_price, visual_tp1_price, visual_tp2_price, visual_sl_price)
+                v96_exit_sent := true
             label.new(bar_index, low, "RUNNER EXIT", style=label.style_label_up, color=color.orange, textcolor=color.white, size=size.small)
             if v6_rearm_after_runner
                 v6_runner_block_dir := 1
                 v6_runner_block_bar := bar_index
         else
             v95_parity_exit_code := 4
+            if not v96_exit_sent
+                f_v96_fire("SL", "CALL", v7_trade_reason, v81_exit_fill_long, visual_entry_price, visual_tp1_price, visual_tp2_price, visual_sl_price)
+                v96_exit_sent := true
             label.new(bar_index, low, "🛑 SL", style=label.style_label_up, color=color.red, textcolor=color.white, size=size.small)
             if v5_post_loss_reset and not visual_hit_tp1
                 v5_loss_block_dir := 1
@@ -2400,6 +2484,8 @@ if visual_trade_labels_enabled and visual_position == "LONG" and bar_index > vis
             if v8_runner_gain_raw > v8_runner_max_gain + 0.001
                 v91_runner_violations += 1
         v91_trade_r = v91_realized_r(v81_exit_fill_long)
+        if v15_long_early_exit
+            v15_early_fail_sum_r += v91_trade_r
         v91_expectancy_sum_r += v91_trade_r
         v91_expectancy_count += 1
         if v7_setup_is(v7_trade_reason, "REV")

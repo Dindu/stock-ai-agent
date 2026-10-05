@@ -79,7 +79,7 @@ def replay_python(bars, symbol):
             event = pine_exit_event(active_trade, current)
             if event:
                 kind = event["kind"]
-                exit_code = 5 if event["reason"] == "PINE RUNNER TRAIL" else 4 if kind == "STOP" else 6 if kind == "TP3" else 1 if kind == "TP1" else 2
+                exit_code = 7 if kind == "EARLY_FAIL" else 5 if event["reason"] == "PINE RUNNER TRAIL" else 4 if kind == "STOP" else 6 if kind == "TP3" else 1 if kind == "TP1" else 2
                 plan = active_trade["pine_exit_plan"]
                 if kind == "TP1":
                     active_trade["qty"] -= int(event["close_qty"])

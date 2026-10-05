@@ -7257,7 +7257,8 @@ def track_open_trades():
             except Exception as bars_error:
                 log(f"[{trade['underlying']}] Pine exit bars unavailable: {bars_error}")
             last_processed_pine_bar = pine_exit_plan.get("last_bar", "")
-            exit_event = pine_exit_event(trade, underlying_bars)
+            last_processed_late4_bar = pine_exit_plan.get("last_late4_bar", "")
+            exit_event = pine_exit_event(trade, underlying_bars, now=datetime.now(timezone.utc))
             if exit_event:
                 exit_kind = exit_event["kind"]
                 close_qty = int(exit_event.get("close_qty", 0) or 0)
@@ -7280,7 +7281,7 @@ def track_open_trades():
                     exit_event["reason"],
                     pnl_pct,
                     close_qty=close_qty,
-                    final_close=exit_kind in ("STOP", "TP3"),
+                    final_close=exit_kind in ("STOP", "TP3", "EARLY_FAIL"),
                 )
                 qty_after_exit = int(trade.get("qty", 0) or 0)
                 exit_filled = qty_after_exit < qty_before_exit or contract_sym not in _open_trades
@@ -7316,6 +7317,7 @@ def track_open_trades():
                     pine_exit_plan["runner_active"] = True
                 elif not exit_filled and contract_sym in _open_trades:
                     pine_exit_plan["last_bar"] = last_processed_pine_bar
+                    pine_exit_plan["last_late4_bar"] = last_processed_late4_bar
                 _save_pine_trade_state()
                 continue
             _save_pine_trade_state()
@@ -7836,10 +7838,19 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     if final_close and trade.get("strategy_authority") == "ULTI7_V95":
         pine_plan = trade.get("pine_exit_plan") or {}
         exit_reason = str(reason or "")
+        late4_close = _safe_float_num(pine_plan.get("late4_close"), 0.0)
+        late4_is_loss = (
+            exit_reason.startswith("PINE LATE4 EARLY FAIL")
+            and late4_close > 0
+            and (
+                (trade.get("side") == "CALL" and late4_close < float(pine_plan.get("entry_price", 0.0)))
+                or (trade.get("side") == "PUT" and late4_close > float(pine_plan.get("entry_price", 0.0)))
+            )
+        )
         ulti7_entry_engine.record_exit(
             trade.get("underlying"),
             trade.get("side", ""),
-            is_loss=exit_reason.startswith("PINE ATR/STRUCTURE STOP") and not bool(pine_plan.get("tp1_taken")),
+            is_loss=(exit_reason.startswith("PINE ATR/STRUCTURE STOP") and not bool(pine_plan.get("tp1_taken"))) or late4_is_loss,
             runner=exit_reason.startswith("PINE RUNNER TRAIL"),
             bar_time=pine_plan.get("last_bar"),
         )
@@ -7885,6 +7896,12 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         elif str(reason).startswith("PINE ATR/STRUCTURE STOP"):
             short_reason = "ULTI-7 INITIAL STOP" if not pine_plan.get("tp1_taken") else "ULTI-7 PROTECTED STOP"
             pine_exit_detail = f"Underlying stop `${float(pine_plan['stop']):.2f}` triggered."
+        elif str(reason).startswith("PINE LATE4 EARLY FAIL"):
+            short_reason = "ULTI-7 LATE4 EARLY EXIT"
+            pine_exit_detail = (
+                "Exited before TP1 after two completed 5-minute closes crossed both EMA20 and VWAP "
+                "against the position."
+            )
     is_partial = (not final_close and close_qty_int < current_qty)
     shown_dollar = _combined_dollar if (final_close and _combined_cost > 0) else ((exit_px - entry_px) * close_qty_int * 100.0)
     if abs(shown_dollar - int(round(shown_dollar))) < 0.005:
