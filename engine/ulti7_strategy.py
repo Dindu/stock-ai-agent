@@ -57,7 +57,8 @@ def _pine_base_series(frame):
     avg_loss = _wilder_rma(loss, 14)
     rs = avg_gain / avg_loss.replace(0.0, float("nan"))
     rsi = 100.0 - (100.0 / (1.0 + rs))
-    rsi = rsi.where(avg_loss != 0.0, 100.0).where(avg_gain != 0.0, 0.0)
+    rsi = rsi.where(avg_gain != 0.0, 0.0).where(avg_loss != 0.0, 100.0)
+    rsi = rsi.where(avg_gain.notna() & avg_loss.notna())
     return {
         "close": close,
         "ema9": close.ewm(span=9, adjust=False).mean(),
@@ -461,9 +462,6 @@ class Ulti7EntryEngine:
         short_volume_change = pd.Series(short_volume_avg).diff().to_numpy()
         highest_previous = frame["high"].rolling(5).max().shift(1).to_numpy()
         lowest_previous = frame["low"].rolling(5).min().shift(1).to_numpy()
-        last_signal = "Neutral"
-        last_signal_bar = -6
-        last_signal_trend = 0
         for i in range(1, count):
             trend = 1 if close[i] > ema20[i] and close[i] > vwap[i] else -1 if close[i] < ema20[i] and close[i] < vwap[i] else 0
             previous_high = last_high[i - 1]
@@ -486,17 +484,12 @@ class Ulti7EntryEngine:
             volatility_ok = volume.iloc[i] > long_volume_avg[i] and short_volume_change[i] > 0
             breakout_buy_ok = close[i] > highest_previous[i] if pd.notna(highest_previous[i]) else False
             breakout_sell_ok = close[i] < lowest_previous[i] if pd.notna(lowest_previous[i]) else False
-            distance_ok = i - last_signal_bar >= 5
-            buy_allowed = last_signal != "Buy" or (last_signal == "Buy" and trend != last_signal_trend and trend != 1)
-            sell_allowed = last_signal != "Sell" or (last_signal == "Sell" and trend != last_signal_trend and trend != -1)
-            buy = price_change > momentum_threshold and distance_ok and trend == 1 and trend != 0 and volatility_ok and breakout_buy_ok and buy_allowed
-            sell = price_change < -momentum_threshold and distance_ok and trend == -1 and trend != 0 and volatility_ok and breakout_sell_ok and sell_allowed
+            buy = price_change > momentum_threshold and trend == 1 and volatility_ok and breakout_buy_ok
+            sell = price_change < -momentum_threshold and trend == -1 and volatility_ok and breakout_sell_ok
             if buy:
                 smc_buy[i] = True
-                last_signal, last_signal_bar, last_signal_trend = "Buy", i, trend
             elif sell:
                 smc_sell[i] = True
-                last_signal, last_signal_bar, last_signal_trend = "Sell", i, trend
         return {
             "buy": pd.Series(smc_buy, index=frame.index),
             "sell": pd.Series(smc_sell, index=frame.index),
@@ -852,8 +845,18 @@ class PineV95EntryEngine(Ulti7EntryEngine):
         poki_call_series, poki_put_series = _poki_events(frame, atr)
         vidya_call_series, vidya_put_series, vidya_trend = _vidya_events(frame, features["atr200"])
         smc = self._smc_events(frame, features)
-        long_votes = int(bool(poki_call_series.iloc[-1] and call_ok)) + int(bool(smc["buy"].iloc[-1] and call_ok)) + int(bool(vidya_call_series.iloc[-1] and call_ok))
-        short_votes = int(bool(poki_put_series.iloc[-1] and put_ok)) + int(bool(smc["sell"].iloc[-1] and put_ok)) + int(bool(vidya_put_series.iloc[-1] and put_ok))
+        source_event_flags = {
+            "poki_call": bool(poki_call_series.iloc[-1]),
+            "poki_put": bool(poki_put_series.iloc[-1]),
+            "smc_call": bool(smc["buy"].iloc[-1]),
+            "smc_put": bool(smc["sell"].iloc[-1]),
+            "vidya_call": bool(vidya_call_series.iloc[-1]),
+            "vidya_put": bool(vidya_put_series.iloc[-1]),
+        }
+        raw_long_votes = sum(source_event_flags[f"{name}_call"] for name in ("poki", "smc", "vidya"))
+        raw_short_votes = sum(source_event_flags[f"{name}_put"] for name in ("poki", "smc", "vidya"))
+        long_votes = raw_long_votes if call_ok else 0
+        short_votes = raw_short_votes if put_ok else 0
         smc_choch_buy = bool(smc["choch_buy"].iloc[-1])
         smc_choch_sell = bool(smc["choch_sell"].iloc[-1])
         smc_bos_buy = bool(smc["bos_buy"].iloc[-1])
@@ -996,10 +999,19 @@ class PineV95EntryEngine(Ulti7EntryEngine):
             if selected_setup == "CONT":
                 state.continuation_side, state.continuation_age = "", 0
 
+        call_setup_flags = "/".join(name for name, enabled in zip(priorities, setup_flags["CALL"]) if enabled) or "-"
+        put_setup_flags = "/".join(name for name, enabled in zip(priorities, setup_flags["PUT"]) if enabled) or "-"
+        event_summary = (
+            f"Poki={int(source_event_flags['poki_call'])}/{int(source_event_flags['poki_put'])}, "
+            f"SMC={int(source_event_flags['smc_call'])}/{int(source_event_flags['smc_put'])}, "
+            f"VIDYA={int(source_event_flags['vidya_call'])}/{int(source_event_flags['vidya_put'])}"
+        )
         return result, (
-            f"setup={selected_setup or 'NONE'}, source_events={long_votes}/{short_votes}, "
-            f"MTF={call_mtf}/{put_mtf}, room={call_room:.2f}/{put_room:.2f} ATR, "
-            f"V2={'pass' if call_ok or put_ok else 'blocked'}"
+            f"setup={selected_setup or 'NONE'}, raw_votes={raw_long_votes}/{raw_short_votes}, "
+            f"eligible_votes={long_votes}/{short_votes}, events[{event_summary}], "
+            f"V2(call={call_ok},put={put_ok},quality={long_quality}/{short_quality},chop={chop},"
+            f"exhaust={call_exhausted}/{put_exhausted}), MTF={call_mtf}/{put_mtf}, "
+            f"room={call_room:.2f}/{put_room:.2f} ATR, candidates={call_setup_flags}/{put_setup_flags}"
         )
 
 
