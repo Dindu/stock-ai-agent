@@ -391,6 +391,7 @@ OPTION_ACCEPTABLE_DELTA_MIN = float(os.getenv("OPTION_ACCEPTABLE_DELTA_MIN", "0.
 OPTION_ACCEPTABLE_DELTA_MAX = float(os.getenv("OPTION_ACCEPTABLE_DELTA_MAX", "0.75"))
 # 0DTE fallback: permit lower-delta near-ATM contracts only with a fresh, tight quote.
 ZERO_DTE_FALLBACK_DELTA_MIN = float(os.getenv("ZERO_DTE_FALLBACK_DELTA_MIN", "0.20"))
+ZERO_DTE_UNKNOWN_DELTA_MAX_DISTANCE_PCT = float(os.getenv("ZERO_DTE_UNKNOWN_DELTA_MAX_DISTANCE_PCT", "0.0075"))
 # Below the acceptable band, only allow contracts with excellent liquidity — never on OI alone.
 OPTION_FALLBACK_DELTA_MIN = float(os.getenv("OPTION_FALLBACK_DELTA_MIN", "0.30"))
 OPTION_FALLBACK_MIN_VOLUME = float(os.getenv("OPTION_FALLBACK_MIN_VOLUME", "500"))
@@ -2016,17 +2017,22 @@ def option_candidate_rank(candidate):
 
 
 def _zero_dte_fallback_quote_ok(candidate, min_bid, max_spread_pct, now_utc=None):
-    """Allow a lower-delta 0DTE only when its near-ATM quote is live and tight."""
+    """Allow lower/unknown-delta 0DTE only when its near-ATM quote is live and tight."""
     delta_abs = abs(_safe_float_num(candidate.get("delta", 0.0), 0.0))
     if int(candidate.get("dte", -1)) != 0:
         return False
-    if not (ZERO_DTE_FALLBACK_DELTA_MIN <= delta_abs < OPTION_ACCEPTABLE_DELTA_MIN):
+    strike_distance = _safe_float_num(candidate.get("strike_distance_pct", 1.0), 1.0)
+    known_low_delta = ZERO_DTE_FALLBACK_DELTA_MIN <= delta_abs < OPTION_ACCEPTABLE_DELTA_MIN
+    missing_delta_near_atm = delta_abs == 0.0 and strike_distance <= ZERO_DTE_UNKNOWN_DELTA_MAX_DISTANCE_PCT
+    if not (known_low_delta or missing_delta_near_atm):
         return False
-    if _safe_float_num(candidate.get("bid", 0.0), 0.0) < float(min_bid):
+    bid = _safe_float_num(candidate.get("bid", 0.0), 0.0)
+    ask = _safe_float_num(candidate.get("ask", 0.0), 0.0)
+    if bid < float(min_bid) or ask <= 0.0 or ask < bid:
         return False
     if _safe_float_num(candidate.get("spread_pct", 1.0), 1.0) > float(max_spread_pct):
         return False
-    if _safe_float_num(candidate.get("strike_distance_pct", 1.0), 1.0) > OPTION_MAX_STRIKE_DISTANCE_PCT:
+    if strike_distance > OPTION_MAX_STRIKE_DISTANCE_PCT:
         return False
     quote_ts = candidate.get("quote_timestamp")
     if quote_ts is None:
@@ -4631,6 +4637,7 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
                     print(
                         f"[{symbol}] No contract in preferred delta band — using fresh near-ATM 0DTE fallback "
                         f"delta [{ZERO_DTE_FALLBACK_DELTA_MIN:.2f}, {OPTION_ACCEPTABLE_DELTA_MIN:.2f}) "
+                        f"or missing Greeks within {ZERO_DTE_UNKNOWN_DELTA_MAX_DISTANCE_PCT*100:.2f}% of spot "
                         "with standard spread/bid limits.",
                         flush=True,
                     )
