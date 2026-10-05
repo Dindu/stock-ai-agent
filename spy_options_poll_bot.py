@@ -389,6 +389,8 @@ TARGET_OPTION_DELTA_MAX = float(os.getenv("TARGET_OPTION_DELTA_MAX", "0.65"))
 # Hard floor/ceiling — contracts outside this band are never selected, regardless of OI/spread.
 OPTION_ACCEPTABLE_DELTA_MIN = float(os.getenv("OPTION_ACCEPTABLE_DELTA_MIN", "0.35"))
 OPTION_ACCEPTABLE_DELTA_MAX = float(os.getenv("OPTION_ACCEPTABLE_DELTA_MAX", "0.75"))
+# 0DTE fallback: permit lower-delta near-ATM contracts only with a fresh, tight quote.
+ZERO_DTE_FALLBACK_DELTA_MIN = float(os.getenv("ZERO_DTE_FALLBACK_DELTA_MIN", "0.20"))
 # Below the acceptable band, only allow contracts with excellent liquidity — never on OI alone.
 OPTION_FALLBACK_DELTA_MIN = float(os.getenv("OPTION_FALLBACK_DELTA_MIN", "0.30"))
 OPTION_FALLBACK_MIN_VOLUME = float(os.getenv("OPTION_FALLBACK_MIN_VOLUME", "500"))
@@ -2011,6 +2013,31 @@ def option_candidate_rank(candidate):
         + strike_distance_score * OPTION_RANK_STRIKE_DISTANCE_WEIGHT
     )
     return score
+
+
+def _zero_dte_fallback_quote_ok(candidate, min_bid, max_spread_pct, now_utc=None):
+    """Allow a lower-delta 0DTE only when its near-ATM quote is live and tight."""
+    delta_abs = abs(_safe_float_num(candidate.get("delta", 0.0), 0.0))
+    if int(candidate.get("dte", -1)) != 0:
+        return False
+    if not (ZERO_DTE_FALLBACK_DELTA_MIN <= delta_abs < OPTION_ACCEPTABLE_DELTA_MIN):
+        return False
+    if _safe_float_num(candidate.get("bid", 0.0), 0.0) < float(min_bid):
+        return False
+    if _safe_float_num(candidate.get("spread_pct", 1.0), 1.0) > float(max_spread_pct):
+        return False
+    if _safe_float_num(candidate.get("strike_distance_pct", 1.0), 1.0) > OPTION_MAX_STRIKE_DISTANCE_PCT:
+        return False
+    quote_ts = candidate.get("quote_timestamp")
+    if quote_ts is None:
+        return False
+    try:
+        timestamp = quote_ts if quote_ts.tzinfo else quote_ts.replace(tzinfo=timezone.utc)
+        now_utc = now_utc or datetime.now(timezone.utc)
+        quote_age_seconds = (now_utc - timestamp).total_seconds()
+    except Exception:
+        return False
+    return 0.0 <= quote_age_seconds <= LIQUIDITY_SUBSTITUTE_MAX_QUOTE_AGE_SECONDS
 
 
 def _score_trend_deltas(data, side):
@@ -4594,31 +4621,46 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
             if in_delta_band:
                 passed_candidates = in_delta_band
             else:
-                # Below the acceptable band, allow through only with excellent liquidity —
-                # never on OI alone (this is exactly how the SPY 0.13-delta contract got picked).
-                fallback_band = [
-                    c for c in passed_candidates
-                    if OPTION_FALLBACK_DELTA_MIN <= abs(_safe_float(c.get("delta", 0.0), 0.0)) < OPTION_ACCEPTABLE_DELTA_MIN
-                    and _safe_float(c.get("volume", 0.0), 0.0) >= OPTION_FALLBACK_MIN_VOLUME
-                    and _safe_float(c.get("open_interest", 0.0), 0.0) >= OPTION_FALLBACK_MIN_OI
-                    and _safe_float(c.get("spread_pct", 1.0), 1.0) <= OPTION_FALLBACK_MAX_SPREAD_PCT
+                quote_check_now = datetime.now(timezone.utc)
+                zero_dte_fallback = [
+                    candidate for candidate in passed_candidates
+                    if _zero_dte_fallback_quote_ok(candidate, min_bid, max_spread_pct, quote_check_now)
                 ]
-                if fallback_band:
+
+                if zero_dte_fallback:
                     print(
-                        f"[{symbol}] No contracts in preferred delta band — using fallback delta "
-                        f"[{OPTION_FALLBACK_DELTA_MIN:.2f}, {OPTION_ACCEPTABLE_DELTA_MIN:.2f}) contract with "
-                        f"excellent liquidity.",
+                        f"[{symbol}] No contract in preferred delta band — using fresh near-ATM 0DTE fallback "
+                        f"delta [{ZERO_DTE_FALLBACK_DELTA_MIN:.2f}, {OPTION_ACCEPTABLE_DELTA_MIN:.2f}) "
+                        "with standard spread/bid limits.",
                         flush=True,
                     )
-                    passed_candidates = fallback_band
+                    passed_candidates = zero_dte_fallback
                 else:
-                    print(
-                        f"[{symbol}] No contracts within acceptable delta band "
-                        f"[{OPTION_ACCEPTABLE_DELTA_MIN:.2f}, {OPTION_ACCEPTABLE_DELTA_MAX:.2f}] or fallback band "
-                        f"({len(passed_candidates)} candidate(s) rejected on delta) — skipping this contract search.",
-                        flush=True,
-                    )
-                    passed_candidates = []
+                    # Other expiries retain the stricter volume/OI fallback.
+                    fallback_band = [
+                        c for c in passed_candidates
+                        if OPTION_FALLBACK_DELTA_MIN <= abs(_safe_float(c.get("delta", 0.0), 0.0)) < OPTION_ACCEPTABLE_DELTA_MIN
+                        and _safe_float(c.get("volume", 0.0), 0.0) >= OPTION_FALLBACK_MIN_VOLUME
+                        and _safe_float(c.get("open_interest", 0.0), 0.0) >= OPTION_FALLBACK_MIN_OI
+                        and _safe_float(c.get("spread_pct", 1.0), 1.0) <= OPTION_FALLBACK_MAX_SPREAD_PCT
+                    ]
+                    if fallback_band:
+                        print(
+                            f"[{symbol}] No contracts in preferred delta band — using fallback delta "
+                            f"[{OPTION_FALLBACK_DELTA_MIN:.2f}, {OPTION_ACCEPTABLE_DELTA_MIN:.2f}) contract with "
+                            "excellent liquidity.",
+                            flush=True,
+                        )
+                        passed_candidates = fallback_band
+                    else:
+                        print(
+                            f"[{symbol}] No contracts within acceptable delta band "
+                            f"[{OPTION_ACCEPTABLE_DELTA_MIN:.2f}, {OPTION_ACCEPTABLE_DELTA_MAX:.2f}], "
+                            f"safe 0DTE fallback, or liquid fallback ({len(passed_candidates)} candidate(s) "
+                            "rejected on delta) — skipping this contract search.",
+                            flush=True,
+                        )
+                        passed_candidates = []
 
         if passed_candidates:
             # Prefer near-ATM contracts when available; fall back to full pool if not.
