@@ -75,7 +75,7 @@ v5_fast_rev_body_atr = input.float(0.45, "Fast REV Body / ATR", minval=0.20, ste
 v5_fast_rev_relvol = input.float(0.70, "Fast REV Relative Volume", minval=0.0, step=0.05, group="V5 Improvements")
 v5_fast_rev_break_lookback = input.int(3, "Fast REV Structure Lookback", minval=2, maxval=8, group="V5 Improvements")
 v5_post_loss_reset = input.bool(true, "Require Fresh Reset After SL", group="V5 Improvements")
-v5_runner_after_tp2 = input.bool(true, "Use Structure Runner After TP2", group="V5 Improvements")
+v5_runner_after_tp2 = false
 v5_runner_lookback = input.int(3, "Runner Structure Lookback", minval=2, maxval=10, group="V5 Improvements")
 v5_runner_buffer_atr = input.float(0.10, "Runner Structure Buffer / ATR", minval=0.0, step=0.05, group="V5 Improvements")
 
@@ -110,18 +110,18 @@ v91_adaptive_base_score = input.int(4, "Adaptive CONT Base Quality", minval=2, m
 v91_adaptive_midday_extra = input.int(1, "Adaptive CONT Midday Extra", minval=0, maxval=3, group="V9.1 Optimization")
 v91_adaptive_counter_extra = input.int(1, "Adaptive Counter-Trend Extra", minval=0, maxval=3, group="V9.1 Optimization")
 v91_adaptive_relvol_floor = input.float(0.85, "Adaptive CONT Relative Volume Floor", minval=0.0, step=0.05, group="V9.1 Optimization")
-v91_tp1_scale_pct = input.float(50.0, "Expectancy: TP1 Scale %", minval=0.0, maxval=100.0, step=5.0, group="V9.1 Expectancy")
-v91_tp2_scale_pct = input.float(15.0, "Expectancy: TP2 Scale %", minval=0.0, maxval=100.0, step=5.0, group="V9.1 Expectancy")
-v91_runner_scale_pct = input.float(35.0, "Expectancy: Runner Scale %", minval=0.0, maxval=100.0, step=5.0, group="V9.1 Expectancy")
+v91_tp1_scale_pct = 75.0
+v91_tp2_scale_pct = 25.0
+v91_runner_scale_pct = 0.0
 
 // V9.3 compatibility presets (retained under V9.4). These let us test one change at a time
 // while keeping the audited V9.2 accounting/runner math unchanged.
-v93_preset = input.string("Adaptive CONT", "Optimization Preset", options=["Baseline", "Adaptive CONT", "Adaptive + Wider Runner", "Adaptive + Wider + 60/20/20"], group="V9.3 Optimization")
+v93_preset = input.string("Adaptive CONT", "Optimization Preset", options=["Baseline", "Adaptive CONT"], group="V9.3 Optimization")
 v93_cont_mode = v93_preset == "Baseline" ? "Baseline" : "Adaptive"
-v93_runner_profile = (v93_preset == "Adaptive + Wider Runner" or v93_preset == "Adaptive + Wider + 60/20/20") ? "Wider" : "Current"
-v93_tp1_scale_pct = v93_preset == "Adaptive + Wider + 60/20/20" ? 60.0 : v91_tp1_scale_pct
-v93_tp2_scale_pct = v93_preset == "Adaptive + Wider + 60/20/20" ? 20.0 : v91_tp2_scale_pct
-v93_runner_scale_pct = v93_preset == "Adaptive + Wider + 60/20/20" ? 20.0 : v91_runner_scale_pct
+v93_runner_profile = "Current"
+v93_tp1_scale_pct = 75.0
+v93_tp2_scale_pct = 25.0
+v93_runner_scale_pct = 0.0
 
 // V9.4: setup-specific quality layer. STRUCTURE is intentionally untouched.
 // REV requires a genuine direction-changing close/structure confirmation.
@@ -1850,7 +1850,7 @@ var int v7_tp2_hits = 0
 var int v7_runner_exits = 0
 var int v7_sl_before_tp1 = 0
 var int v7_tp1_only_closes = 0
-var int v7_fixed_tp3_closes = 0
+var int v7_fixed_target_closes = 0
 var int v7_with_trend_entries = 0
 var int v7_counter_trend_entries = 0
 var int v7_neutral_entries = 0
@@ -2007,7 +2007,7 @@ if v7_reset_daily and v7_new_day
     v7_runner_exits := 0
     v7_sl_before_tp1 := 0
     v7_tp1_only_closes := 0
-    v7_fixed_tp3_closes := 0
+    v7_fixed_target_closes := 0
     v7_with_trend_entries := 0
     v7_counter_trend_entries := 0
     v7_neutral_entries := 0
@@ -2182,8 +2182,8 @@ f_v96_alert_message(_event, _direction, _reason, _eventPrice, _entry, _tp1, _tp2
     _runner_r_txt = na(_leg_r) ? "NA" : str.tostring(_leg_r, "#.00") + "R"
     _prefix = syminfo.ticker + " " + _direction + " | "
     v96_shadow_json ? _shadow_json : _event == "ENTRY" ? _prefix + "ENTRY @ " + str.tostring(_entry, format.mintick) + " | TP1 " + str.tostring(_tp1, format.mintick) + " | TP2 " + str.tostring(_tp2, format.mintick) + " | SL " + str.tostring(_sl, format.mintick) :
-     _event == "TP1" ? _prefix + "TP1 HIT @ " + str.tostring(_eventPrice, format.mintick) + " | 50% TAKEN" :
-     (_event == "TP2_RUNNER_START" or _event == "TP2") ? _prefix + "TP2 HIT @ " + str.tostring(_eventPrice, format.mintick) + " | 15% TAKEN | 35% RUNNER" :
+    _event == "TP1" ? _prefix + "TP1 HIT @ " + str.tostring(_eventPrice, format.mintick) + " | 75% TAKEN" :
+    (_event == "TP2_RUNNER_START" or _event == "TP2") ? _prefix + "TP2 HIT @ " + str.tostring(_eventPrice, format.mintick) + " | REMAINING 25% CLOSED" :
      _event == "RUNNER_EXIT" ? _prefix + "RUNNER EXIT @ " + str.tostring(_eventPrice, format.mintick) + " | Runner " + _runner_r_txt + " | TOTAL " + _trade_r_txt :
      _event == "EARLY_FAIL_EXIT" ? _prefix + "LATE4 EXIT @ " + str.tostring(_eventPrice, format.mintick) + " | TOTAL " + _trade_r_txt :
      _event == "SL" ? _prefix + "SL HIT @ " + str.tostring(_eventPrice, format.mintick) + " | TOTAL " + _trade_r_txt :
@@ -2592,7 +2592,10 @@ if visual_trade_labels_enabled and visual_position == "LONG" and bar_index > vis
         if visual_hit_tp1 and not visual_hit_tp2 and high >= visual_tp2_price
             visual_hit_tp2 := true
             v95_parity_exit_code := v95_parity_exit_code == 1 ? 3 : 2
-            visual_runner_active := v5_runner_after_tp2
+            visual_runner_active := false
+            if not v96_tp2_sent
+                f_v96_fire("TP2", "CALL", v7_trade_reason, visual_tp2_price, visual_entry_price, visual_tp1_price, visual_tp2_price, visual_sl_price)
+                v96_tp2_sent := true
             if not v7_trade_counted_tp2
                 v7_trade_counted_tp2 := true
                 v7_tp2_hits += 1
@@ -2608,11 +2611,12 @@ if visual_trade_labels_enabled and visual_position == "LONG" and bar_index > vis
                     v8_context_tp2 += 1
                 v8_runner_tp2_price := visual_tp2_price
                 v8_runner_best_price := visual_tp2_price
-            label.new(bar_index, high, v5_runner_after_tp2 ? "TP2 + RUNNER" : "TP2", style=label.style_label_down, color=color.new(color.teal, 10), textcolor=color.white, size=size.small)
-        if not v5_runner_after_tp2 and high >= visual_tp3_price
-            v95_parity_exit_code := 6
-            label.new(bar_index, high, "🎯 TP", style=label.style_label_down, color=color.green, textcolor=color.white, size=size.normal)
-            v7_fixed_tp3_closes += 1
+            label.new(bar_index, high, "TP2", style=label.style_label_down, color=color.new(color.teal, 10), textcolor=color.white, size=size.small)
+        if not v5_runner_after_tp2 and visual_hit_tp2 and high >= visual_tp2_price
+            if v95_parity_exit_code == 0
+                v95_parity_exit_code := 2
+            label.new(bar_index, high, "TP2 EXIT", style=label.style_label_down, color=color.green, textcolor=color.white, size=size.normal)
+            v7_fixed_target_closes += 1
             v7_closed_trades += 1
             if v7_show_mfe_mae
                 v7_sum_mfe_atr += v7_trade_mfe
@@ -2637,7 +2641,7 @@ if visual_trade_labels_enabled and visual_position == "LONG" and bar_index > vis
                     v8_context_mfe_sum += v7_trade_mfe
                     v8_context_mae_sum += v7_trade_mae
                     v8_context_closed += 1
-            v91_trade_r = v91_realized_r(visual_tp3_price)
+            v91_trade_r = v91_realized_r(visual_tp2_price)
             v91_expectancy_sum_r += v91_trade_r
             v91_expectancy_count += 1
             if v7_setup_is(v7_trade_reason, "REV")
@@ -2837,7 +2841,10 @@ if visual_trade_labels_enabled and visual_position == "SHORT" and bar_index > vi
         if visual_hit_tp1 and not visual_hit_tp2 and low <= visual_tp2_price
             visual_hit_tp2 := true
             v95_parity_exit_code := v95_parity_exit_code == 1 ? 3 : 2
-            visual_runner_active := v5_runner_after_tp2
+            visual_runner_active := false
+            if not v96_tp2_sent
+                f_v96_fire("TP2", "PUT", v7_trade_reason, visual_tp2_price, visual_entry_price, visual_tp1_price, visual_tp2_price, visual_sl_price)
+                v96_tp2_sent := true
             if not v7_trade_counted_tp2
                 v7_trade_counted_tp2 := true
                 v7_tp2_hits += 1
@@ -2853,11 +2860,12 @@ if visual_trade_labels_enabled and visual_position == "SHORT" and bar_index > vi
                     v8_context_tp2 += 1
                 v8_runner_tp2_price := visual_tp2_price
                 v8_runner_best_price := visual_tp2_price
-            label.new(bar_index, low, v5_runner_after_tp2 ? "TP2 + RUNNER" : "TP2", style=label.style_label_up, color=color.new(color.teal, 10), textcolor=color.white, size=size.small)
-        if not v5_runner_after_tp2 and low <= visual_tp3_price
-            v95_parity_exit_code := 6
-            label.new(bar_index, low, "🎯 TP", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.normal)
-            v7_fixed_tp3_closes += 1
+            label.new(bar_index, low, "TP2", style=label.style_label_up, color=color.new(color.teal, 10), textcolor=color.white, size=size.small)
+        if not v5_runner_after_tp2 and visual_hit_tp2 and low <= visual_tp2_price
+            if v95_parity_exit_code == 0
+                v95_parity_exit_code := 2
+            label.new(bar_index, low, "TP2 EXIT", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.normal)
+            v7_fixed_target_closes += 1
             v7_closed_trades += 1
             if v7_show_mfe_mae
                 v7_sum_mfe_atr += v7_trade_mfe
@@ -2882,7 +2890,7 @@ if visual_trade_labels_enabled and visual_position == "SHORT" and bar_index > vi
                     v8_context_mfe_sum += v7_trade_mfe
                     v8_context_mae_sum += v7_trade_mae
                     v8_context_closed += 1
-            v91_trade_r = v91_realized_r(visual_tp3_price)
+            v91_trade_r = v91_realized_r(visual_tp2_price)
             v91_expectancy_sum_r += v91_trade_r
             v91_expectancy_count += 1
             if v7_setup_is(v7_trade_reason, "REV")

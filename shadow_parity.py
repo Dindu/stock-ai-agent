@@ -159,12 +159,16 @@ class ShadowRunner:
                     if same_bar_tp2:
                         self.active_trade["qty"] -= int(same_bar_tp2["close_qty"])
                         plan["tp2_taken"] = True
-                        plan["runner_active"] = True
+                        plan["runner_active"] = not bool(same_bar_tp2.get("final_close"))
                         exit_code = 3
+                        if same_bar_tp2.get("final_close"):
+                            self.active_trade = None
                 elif event["kind"] == "TP2":
                     self.active_trade["qty"] -= int(event["close_qty"])
                     plan["tp2_taken"] = True
-                    plan["runner_active"] = True
+                    plan["runner_active"] = not bool(event.get("final_close"))
+                    if event.get("final_close"):
+                        self.active_trade = None
                 else:
                     side = self.active_trade["side"]
                     if event["reason"] == "PINE ATR/STRUCTURE STOP" and not plan.get("tp1_taken"):

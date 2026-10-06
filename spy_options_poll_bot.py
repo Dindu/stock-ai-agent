@@ -7313,6 +7313,19 @@ def track_open_trades():
                 close_qty = int(exit_event.get("close_qty", 0) or 0)
                 if close_qty <= 0 and exit_kind in ("TP1", "TP2"):
                     if exit_kind == "TP1":
+                        same_bar_tp2 = exit_event.get("same_bar_tp2") or {}
+                        tp2_qty = int(same_bar_tp2.get("close_qty", 0) or 0)
+                        if same_bar_tp2.get("final_close") and tp2_qty > 0:
+                            close_trade(
+                                trade,
+                                current_price,
+                                same_bar_tp2["reason"],
+                                pnl_pct,
+                                close_qty=tp2_qty,
+                                final_close=True,
+                            )
+                            _save_pine_trade_state()
+                            continue
                         pine_exit_plan["tp1_taken"] = True
                         entry_underlying = float(pine_exit_plan["entry_price"])
                         atr = float(pine_exit_plan["atr"])
@@ -7330,7 +7343,7 @@ def track_open_trades():
                     exit_event["reason"],
                     pnl_pct,
                     close_qty=close_qty,
-                    final_close=exit_kind in ("STOP", "TP3", "EARLY_FAIL"),
+                    final_close=bool(exit_event.get("final_close")) or exit_kind in ("STOP", "TP3", "EARLY_FAIL"),
                 )
                 qty_after_exit = int(trade.get("qty", 0) or 0)
                 exit_filled = qty_after_exit < qty_before_exit or contract_sym not in _open_trades
@@ -7353,17 +7366,17 @@ def track_open_trades():
                                 same_bar_tp2["reason"],
                                 pnl_pct,
                                 close_qty=tp2_qty,
-                                final_close=False,
+                                final_close=bool(same_bar_tp2.get("final_close")),
                             )
                             tp2_filled = int(trade.get("qty", 0) or 0) < qty_before_tp2
                             if tp2_filled:
                                 pine_exit_plan["tp2_taken"] = True
-                                pine_exit_plan["runner_active"] = True
+                                pine_exit_plan["runner_active"] = not bool(pine_exit_plan.get("tp2_close_all"))
                             elif contract_sym in _open_trades:
                                 pine_exit_plan["last_bar"] = last_processed_pine_bar
                 elif exit_filled and exit_kind == "TP2" and contract_sym in _open_trades:
                     pine_exit_plan["tp2_taken"] = True
-                    pine_exit_plan["runner_active"] = True
+                    pine_exit_plan["runner_active"] = not bool(pine_exit_plan.get("tp2_close_all"))
                 elif not exit_filled and contract_sym in _open_trades:
                     pine_exit_plan["last_bar"] = last_processed_pine_bar
                     pine_exit_plan["last_late4_bar"] = last_processed_late4_bar
@@ -7930,7 +7943,7 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
         if str(reason).startswith("PINE TP1"):
             short_reason = "ULTI-7 SPOT TP1 (+0.75 ATR)"
             pine_exit_detail = (
-                f"Spot TP1 `${float(pine_plan['tp1']):.2f}` reached; sold about 50%. "
+                f"Spot TP1 `${float(pine_plan['tp1']):.2f}` reached; sold about 75%. "
                 "Stop moves to entry +/-0.05 ATR."
             )
         elif str(reason).startswith("PINE TP2"):
@@ -8302,10 +8315,10 @@ def try_open_paper_trade(symbol, side, option, data):
             f"MTF `{pine_entry_decision.get('call_mtf', 0)}/{pine_entry_decision.get('put_mtf', 0)}`"
         )
         target_line = (
-            f"\U0001f3af Spot TP1 `${float(pine_plan['tp1']):.2f}` (50%) · "
-            f"TP2 `${float(pine_plan['tp2']):.2f}` (15%)\n"
+            f"\U0001f3af Spot TP1 `${float(pine_plan['tp1']):.2f}` (75%) · "
+            f"TP2 `${float(pine_plan['tp2']):.2f}` (remaining 25%)\n"
             f"\U0001f6e1 Spot SL `${float(pine_plan['stop']):.2f}` · "
-            "runner trails 3 bars / 0.10 ATR after TP2"
+            "all remaining contracts close at TP2"
         )
     else:
         strategy_line = (

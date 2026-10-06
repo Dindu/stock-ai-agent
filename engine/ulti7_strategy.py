@@ -160,6 +160,7 @@ def create_pine_exit_plan(side, entry_price, atr, bars, entry_bar=None):
         "tp1_taken": False,
         "tp2_taken": False,
         "runner_active": False,
+        "tp2_close_all": True,
         "last_bar": "",
     }
 
@@ -234,6 +235,14 @@ def pine_exit_event(trade, bars, now=None):
     bar_time = str(frame.index[-1])
     if bar_time <= str(plan.get("entry_bar", "")):
         return None
+    if plan.get("tp2_taken") and plan.get("tp2_close_all"):
+        plan["runner_active"] = False
+        return {
+            "kind": "TP2",
+            "reason": "PINE TP2 FINAL EXIT",
+            "close_qty": int(trade.get("qty", 0) or 0),
+            "final_close": True,
+        }
     if bar_time == plan.get("last_bar"):
         return _pine_late4_event(trade, frame, now=now)
     plan["last_bar"] = bar_time
@@ -268,21 +277,37 @@ def pine_exit_event(trade, bars, now=None):
     if not plan.get("tp1_taken") and hit_tp1:
         original_qty = int(trade.get("pine_original_qty", trade.get("qty", 0)) or 0)
         current_qty = int(trade.get("qty", 0) or 0)
-        close_qty = min(max(0, current_qty - 1), int(original_qty * 0.50 + 0.5))
+        tp1_fraction = 0.75 if plan.get("tp2_close_all") else 0.50
+        close_qty = min(max(0, current_qty - 1), int(original_qty * tp1_fraction + 0.5))
         event = {"kind": "TP1", "reason": "PINE TP1 0.75 ATR", "close_qty": close_qty}
         if hit_tp2:
             remaining_qty = max(0, current_qty - close_qty)
-            tp2_qty = min(max(0, remaining_qty - 1), int(original_qty * 0.15 + 0.5))
-            event["same_bar_tp2"] = {
-                "kind": "TP2",
-                "reason": "PINE TP2 1.50 ATR",
-                "close_qty": tp2_qty,
-            }
+            if plan.get("tp2_close_all"):
+                event["same_bar_tp2"] = {
+                    "kind": "TP2",
+                    "reason": "PINE TP2 FINAL EXIT",
+                    "close_qty": remaining_qty,
+                    "final_close": True,
+                }
+            else:
+                tp2_qty = min(max(0, remaining_qty - 1), int(original_qty * 0.15 + 0.5))
+                event["same_bar_tp2"] = {
+                    "kind": "TP2",
+                    "reason": "PINE TP2 1.50 ATR",
+                    "close_qty": tp2_qty,
+                }
         return event
 
     if plan.get("tp1_taken") and not plan.get("tp2_taken") and hit_tp2:
-        original_qty = int(trade.get("pine_original_qty", trade.get("qty", 0)) or 0)
         current_qty = int(trade.get("qty", 0) or 0)
+        if plan.get("tp2_close_all"):
+            return {
+                "kind": "TP2",
+                "reason": "PINE TP2 FINAL EXIT",
+                "close_qty": current_qty,
+                "final_close": True,
+            }
+        original_qty = int(trade.get("pine_original_qty", trade.get("qty", 0)) or 0)
         close_qty = min(max(0, current_qty - 1), int(original_qty * 0.15 + 0.5))
         return {"kind": "TP2", "reason": "PINE TP2 1.50 ATR", "close_qty": close_qty}
 
