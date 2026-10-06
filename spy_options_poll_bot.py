@@ -7299,6 +7299,11 @@ def track_open_trades():
 
         pine_exit_plan = trade.get("pine_exit_plan")
         if pine_exit_plan and trade.get("strategy_mode") != "SWING":
+            stop_pct = float(trade.get("stop_pct", STOP_LOSS_PCT) or STOP_LOSS_PCT)
+            if pnl_pct <= -stop_pct:
+                close_trade(trade, current_price, "EMERGENCY STOP LOSS", pnl_pct)
+                continue
+
             underlying_bars = None
             try:
                 bars_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
