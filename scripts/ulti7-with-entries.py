@@ -1823,7 +1823,7 @@ f_render_v2_debug()
 // This mirrors the ScalpRot TP1/TP2/final-TP/SL labels for the underlying chart.
 // It does not place orders, create alerts, or change the existing module logic.
 visual_trade_labels_enabled = input.bool(true, "Show TP/SL Trade Labels", group="Trade Labels")
-visual_tp1_atr = input.float(0.75, "TP1 ATR Multiplier", minval=0.0, step=0.25, group="Trade Labels")
+visual_tp1_atr = input.float(1.00, "TP1 ATR Multiplier", minval=0.0, step=0.25, group="Trade Labels")
 visual_tp2_atr = input.float(1.50, "TP2 ATR Multiplier", minval=0.0, step=0.25, group="Trade Labels")
 visual_tp3_atr = input.float(2.25, "Final TP ATR Multiplier", minval=0.0, step=0.25, group="Trade Labels")
 visual_sl_atr = input.float(0.50, "Stop Loss ATR Multiplier", minval=0.0, step=0.25, group="Trade Labels")

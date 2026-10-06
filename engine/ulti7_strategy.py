@@ -154,7 +154,7 @@ def create_pine_exit_plan(side, entry_price, atr, bars, entry_bar=None):
         "stop": stop,
         "initial_stop": stop,
         "initial_risk": abs(entry_price - stop),
-        "tp1": entry_price + direction * 0.75 * atr,
+        "tp1": entry_price + direction * 1.00 * atr,
         "tp2": entry_price + direction * 1.50 * atr,
         "tp3": entry_price + direction * 2.25 * atr,
         "tp1_taken": False,
@@ -279,7 +279,7 @@ def pine_exit_event(trade, bars, now=None):
         current_qty = int(trade.get("qty", 0) or 0)
         tp1_fraction = 0.75 if plan.get("tp2_close_all") else 0.50
         close_qty = min(max(0, current_qty - 1), int(original_qty * tp1_fraction + 0.5))
-        event = {"kind": "TP1", "reason": "PINE TP1 0.75 ATR", "close_qty": close_qty}
+        event = {"kind": "TP1", "reason": "PINE TP1 1.00 ATR", "close_qty": close_qty}
         if hit_tp2:
             remaining_qty = max(0, current_qty - close_qty)
             if plan.get("tp2_close_all"):
@@ -697,7 +697,7 @@ class Ulti7EntryEngine:
         if selected_side:
             exit_plan = create_pine_exit_plan(selected_side, price, atr, frame, bar_time)
             exit_plan["setup_type"] = selected_setup
-            result = {"side": selected_side, "setup": selected_setup, "long_votes": long_votes, "short_votes": short_votes, "call_mtf": call_mtf, "put_mtf": put_mtf, "atr": atr, "tp1_atr": 0.75, "tp2_atr": 1.50, "tp3_atr": 2.25, "entry_underlying": price, "entry_bar": str(bar_time), "exit_plan": exit_plan}
+            result = {"side": selected_side, "setup": selected_setup, "long_votes": long_votes, "short_votes": short_votes, "call_mtf": call_mtf, "put_mtf": put_mtf, "atr": atr, "tp1_atr": 1.00, "tp2_atr": 1.50, "tp3_atr": 2.25, "entry_underlying": price, "entry_bar": str(bar_time), "exit_plan": exit_plan}
             state.last_entry_age = state.age
             state.ready_side = ""
             if selected_setup == "REV": state.last_reversal_side = selected_side

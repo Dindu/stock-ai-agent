@@ -7941,7 +7941,7 @@ def close_trade(trade, exit_price, reason, pnl_pct, close_qty=None, final_close=
     pine_exit_detail = ""
     if trade.get("strategy_authority") == "ULTI7_V95" and pine_plan:
         if str(reason).startswith("PINE TP1"):
-            short_reason = "ULTI-7 SPOT TP1 (+0.75 ATR)"
+            short_reason = "ULTI-7 SPOT TP1 (+1.00 ATR)"
             pine_exit_detail = (
                 f"Spot TP1 `${float(pine_plan['tp1']):.2f}` reached; sold about 75%. "
                 "Stop moves to entry +/-0.05 ATR."
