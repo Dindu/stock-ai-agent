@@ -8303,14 +8303,14 @@ def try_open_paper_trade(symbol, side, option, data):
         trigger_compact = "RETEST CONFIRMED"
     elif trigger_raw == "MOMENTUM_COMPRESSION":
         trigger_compact = "COMPRESSION BREAK"
-    elif trigger_raw == "PINE_V95":
-        trigger_compact = "ULTI-7 V9.5"
+    elif trigger_raw in ("PINE_V95", "PINE_V15"):
+        trigger_compact = "ULTI-7 V15"
     else:
         trigger_compact = "SNIPER CONFIRMED"
 
     if pine_managed:
         strategy_line = (
-            f"\U0001f9ed **ULTI-7 V9.5** · `{setup_compact}` · "
+            f"\U0001f9ed **ULTI-7 V15** · `{setup_compact}` · "
             f"Src `{pine_entry_decision.get('long_votes', 0)}/{pine_entry_decision.get('short_votes', 0)}` · "
             f"MTF `{pine_entry_decision.get('call_mtf', 0)}/{pine_entry_decision.get('put_mtf', 0)}`"
         )
@@ -8734,7 +8734,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     )
     _save_pine_trade_state()
     if not pine_decision:
-        log(f"[{symbol}] ULTI-7 V9.5 entry: no candidate — {pine_reason}.")
+        log(f"[{symbol}] ULTI-7 V15 entry: no candidate — {pine_reason}.")
         _record_entry_block("ulti7_entry_engine")
         return
 
@@ -8748,7 +8748,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     data["pine_entry_approved"] = True
     data["strategy_authority"] = "ULTI7_V95"
     log(
-        f"[{symbol}] ULTI-7 V9.5 selected {pine_decision['setup']} {side} — "
+        f"[{symbol}] ULTI-7 V15 selected {pine_decision['setup']} {side} — "
         f"{pine_reason}; source_votes={pine_decision['long_votes']}/{pine_decision['short_votes']} "
         f"MTF={pine_decision['call_mtf']}/{pine_decision['put_mtf']}."
     )
@@ -9107,7 +9107,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
             data["one_minute_entry_confirmed"] = False
             log(f"[{symbol}] 1m sniper evaluation failed: {type(e).__name__}: {e}")
     elif data.get("pine_entry_approved"):
-        data["one_minute_trigger"] = "PINE_V95"
+        data["one_minute_trigger"] = "PINE_V15"
         data["one_minute_entry_confirmed"] = True
     else:
         data["one_minute_trigger"] = "DISABLED" if not ONE_MINUTE_ENTRY_ENABLED else ""

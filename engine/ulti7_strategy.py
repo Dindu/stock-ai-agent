@@ -1,4 +1,4 @@
-"""Python execution-layer port of the ULTI-7 V9.5 entry state machine.
+"""Python execution-layer implementation of ULTI-7 V15-parity signal logic.
 
 This module returns an underlying-market entry decision only. The caller keeps
 ownership of option selection, broker orders, fills, and trade accounting.
@@ -712,7 +712,7 @@ class Ulti7EntryEngine:
 
 
 class PineV95EntryEngine(Ulti7EntryEngine):
-    """Deterministic 5-minute implementation of the saved ULTI-7 V9.5 defaults."""
+    """Deterministic 5-minute entry engine aligned against ULTI-7 V15."""
 
     def record_exit(self, symbol, side, is_loss=False, runner=False, bar_time=None):
         with self._state_lock:
