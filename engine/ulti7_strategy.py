@@ -208,14 +208,10 @@ def _pine_late4_event(trade, frame, now=None):
     ema20 = features["ema20"].shift(1).iloc[-2:]
     vwap = features["vwap"].shift(1).iloc[-2:]
     side = str(trade.get("side", "")).upper()
-    if side == "CALL":
-        failed_twice = bool(((closes < ema20) & (closes < vwap)).all())
-        tp1_not_touched = float(after_entry["high"].max()) < float(plan["tp1"])
-    elif side == "PUT":
-        failed_twice = bool(((closes > ema20) & (closes > vwap)).all())
-        tp1_not_touched = float(after_entry["low"].min()) > float(plan["tp1"])
-    else:
+    if side != "CALL":
         return None
+    failed_twice = bool(((closes < ema20) & (closes < vwap)).all())
+    tp1_not_touched = float(after_entry["high"].max()) < float(plan["tp1"])
     if failed_twice and tp1_not_touched:
         exit_close = float(after_entry["close"].iloc[-1])
         plan["late4_close"] = exit_close
@@ -459,7 +455,14 @@ class Ulti7EntryEngine:
         bos_sell = [False] * count
         long_volume_avg = volume.rolling(50).mean().to_numpy()
         short_volume_avg = volume.rolling(5).mean().to_numpy()
-        short_volume_change = pd.Series(short_volume_avg).diff().to_numpy()
+        smc_volume_condition = [False] * count
+        previous_evaluated_short_volume = float("nan")
+        for i in range(count):
+            volume_above_average = volume.iloc[i] > long_volume_avg[i]
+            if volume_above_average:
+                short_volume_change = short_volume_avg[i] - previous_evaluated_short_volume
+                smc_volume_condition[i] = pd.notna(short_volume_change) and short_volume_change > 0
+                previous_evaluated_short_volume = short_volume_avg[i]
         highest_previous = frame["high"].rolling(5).max().shift(1).to_numpy()
         lowest_previous = frame["low"].rolling(5).min().shift(1).to_numpy()
         for i in range(1, count):
@@ -481,7 +484,7 @@ class Ulti7EntryEngine:
                 continue
             price_change = (close[i] - close[i - 1]) / close[i - 1] * 100.0
             momentum_threshold = 0.01 * (1.0 + (atr[i] / close[i]) * 2.0)
-            volatility_ok = volume.iloc[i] > long_volume_avg[i] and short_volume_change[i] > 0
+            volatility_ok = smc_volume_condition[i]
             breakout_buy_ok = close[i] > highest_previous[i] if pd.notna(highest_previous[i]) else False
             breakout_sell_ok = close[i] < lowest_previous[i] if pd.notna(lowest_previous[i]) else False
             buy = price_change > momentum_threshold and trend == 1 and volatility_ok and breakout_buy_ok

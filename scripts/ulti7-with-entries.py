@@ -145,6 +145,7 @@ v95_show_diagnostics = input.bool(true, "Show V9.5 Setup Segmentation", group="V
 
 v96_unified_alerts = input.bool(true, "Enable One Unified Alert Stream", group="V9.6 Alerts")
 v96_include_levels = input.bool(true, "Include Entry / TP / SL Levels", group="V9.6 Alerts")
+v96_shadow_json = input.bool(false, "Use Timestamped JSON For Shadow Parity", group="V9.6 Alerts")
 v15_late4_enabled = input.bool(true, "Enable LATE4 Real Early Exit", group="V15 Risk Engine")
 v15_show_audit = input.bool(true, "Show V15 Real-State Summary", group="V15 Risk Engine")
 var int v15_early_fail_exits = 0
@@ -2155,14 +2156,19 @@ varip bool v96_exit_sent = false
 var int v95_parity_entry_side = 0
 var int v95_parity_entry_setup = 0
 var int v95_parity_exit_code = 0
+float v95_parity_runner_candidate = na
+float v95_parity_stop_pre_exit = na
+bool v95_parity_stop_hit = false
 v95_parity_entry_side := 0
 v95_parity_entry_setup := 0
 v95_parity_exit_code := 0
 
 f_v95_setup_code(_reason) =>
-    str.contains(_reason, "REV") ? 1 : str.contains(_reason, "STRUCTURE") ? 2 : str.contains(_reason, "CONT") ? 3 : str.contains(_reason, "CONSENSUS") ? 4 : 5
+    str.contains(_reason, "REV") ? 1 : str.contains(_reason, "STRUCTURE") ? 2 : str.contains(_reason, "CONSENSUS") ? 4 : str.contains(_reason, "CONTEXT") ? 5 : str.contains(_reason, "CONT") ? 3 : 5
 
 f_v96_alert_message(_event, _direction, _reason, _eventPrice, _entry, _tp1, _tp2, _sl) =>
+    _setup = _event == "ENTRY" ? f_v95_setup_code(_reason) : 0
+    _shadow_json = "{\"event\":\"" + _event + "\",\"symbol\":\"" + syminfo.ticker + "\",\"timeframe\":\"" + timeframe.period + "\",\"bar_time_ms\":" + str.tostring(time) + ",\"trade_id\":" + str.tostring(v96_trade_id) + ",\"direction\":\"" + _direction + "\",\"setup\":" + str.tostring(_setup) + ",\"event_price\":" + str.tostring(_eventPrice, format.mintick) + ",\"entry\":" + str.tostring(_entry, format.mintick) + ",\"tp1\":" + str.tostring(_tp1, format.mintick) + ",\"tp2\":" + str.tostring(_tp2, format.mintick) + ",\"stop\":" + str.tostring(_sl, format.mintick) + "}"
     _risk_ok = not na(v91_initial_risk) and v91_initial_risk > 0
     _leg_r = _risk_ok ? ((_eventPrice - _entry) * v7_trade_dir) / v91_initial_risk : na
     _tp1_r = _risk_ok ? ((_tp1 - _entry) * v7_trade_dir) / v91_initial_risk : na
@@ -2175,7 +2181,7 @@ f_v96_alert_message(_event, _direction, _reason, _eventPrice, _entry, _tp1, _tp2
     _trade_r_txt = na(_trade_r) ? "NA" : str.tostring(_trade_r, "#.00") + "R"
     _runner_r_txt = na(_leg_r) ? "NA" : str.tostring(_leg_r, "#.00") + "R"
     _prefix = syminfo.ticker + " " + _direction + " | "
-    _event == "ENTRY" ? _prefix + "ENTRY @ " + str.tostring(_entry, format.mintick) + " | TP1 " + str.tostring(_tp1, format.mintick) + " | TP2 " + str.tostring(_tp2, format.mintick) + " | SL " + str.tostring(_sl, format.mintick) :
+    v96_shadow_json ? _shadow_json : _event == "ENTRY" ? _prefix + "ENTRY @ " + str.tostring(_entry, format.mintick) + " | TP1 " + str.tostring(_tp1, format.mintick) + " | TP2 " + str.tostring(_tp2, format.mintick) + " | SL " + str.tostring(_sl, format.mintick) :
      _event == "TP1" ? _prefix + "TP1 HIT @ " + str.tostring(_eventPrice, format.mintick) + " | 50% TAKEN" :
      (_event == "TP2_RUNNER_START" or _event == "TP2") ? _prefix + "TP2 HIT @ " + str.tostring(_eventPrice, format.mintick) + " | 15% TAKEN | 35% RUNNER" :
      _event == "RUNNER_EXIT" ? _prefix + "RUNNER EXIT @ " + str.tostring(_eventPrice, format.mintick) + " | Runner " + _runner_r_txt + " | TOTAL " + _trade_r_txt :
@@ -2186,7 +2192,10 @@ f_v96_alert_message(_event, _direction, _reason, _eventPrice, _entry, _tp1, _tp2
 
 f_v96_fire(_event, _direction, _reason, _eventPrice, _entry, _tp1, _tp2, _sl) =>
     if v96_unified_alerts
-        alert(f_v96_alert_message(_event, _direction, _reason, _eventPrice, _entry, _tp1, _tp2, _sl), alert.freq_once_per_bar)
+        if v96_shadow_json
+            alert(f_v96_alert_message(_event, _direction, _reason, _eventPrice, _entry, _tp1, _tp2, _sl), alert.freq_all)
+        else
+            alert(f_v96_alert_message(_event, _direction, _reason, _eventPrice, _entry, _tp1, _tp2, _sl), alert.freq_once_per_bar)
 
 v91_leg_r(price) =>
     not na(v91_initial_risk) and v91_initial_risk > 0 ? ((price - visual_entry_price) * v7_trade_dir) / v91_initial_risk : 0.0
@@ -2367,18 +2376,24 @@ if visual_trade_labels_enabled and visual_position == "FLAT" and visual_short_en
     if v3_unified_enabled
         label.new(bar_index, high, v3_put_reason + "\nV" + str.tostring(v3_short_votes) + " MTF" + str.tostring(v2_put_mtf_score) + "/4", style=label.style_label_down, color=color_signal_sell, textcolor=color.white, size=size.small)
 
+v9_runner_lb = v93_runner_profile == "Wider" ? 5 : v93_runner_profile == "Tighter" ? 2 : v5_runner_lookback
+v9_runner_buf = v93_runner_profile == "Wider" ? math.max(v5_runner_buffer_atr, 0.15) : v93_runner_profile == "Tighter" ? math.min(v5_runner_buffer_atr, 0.05) : v5_runner_buffer_atr
+v9_runner_low = ta.lowest(low, v9_runner_lb)[1]
+v9_runner_high = ta.highest(high, v9_runner_lb)[1]
+
 if visual_trade_labels_enabled and visual_position == "LONG" and bar_index > visual_entry_bar
     // After TP2, trail behind completed 5M structure instead of forcing a fixed final exit.
     if visual_hit_tp2 and v5_runner_after_tp2
         visual_runner_active := true
-        v9_runner_lb = v93_runner_profile == "Wider" ? 5 : v93_runner_profile == "Tighter" ? 2 : v5_runner_lookback
-        v9_runner_buf = v93_runner_profile == "Wider" ? math.max(v5_runner_buffer_atr, 0.15) : v93_runner_profile == "Tighter" ? math.min(v5_runner_buffer_atr, 0.05) : v5_runner_buffer_atr
-        v5_long_runner_stop = ta.lowest(low, v9_runner_lb)[1] - v9_runner_buf * visual_atr
+        v5_long_runner_stop = v9_runner_low - v9_runner_buf * visual_atr
+        v95_parity_runner_candidate := v5_long_runner_stop
         if not na(v5_long_runner_stop)
             visual_sl_price := math.max(visual_sl_price, v5_long_runner_stop)
     v15_long_fail_now = close < v2_5_ema and close < v2_5_vwap
     v15_long_fail_prev = close[1] < v2_5_ema[1] and close[1] < v2_5_vwap[1]
     v15_long_struct_stop = low <= visual_sl_price
+    v95_parity_stop_pre_exit := visual_sl_price
+    v95_parity_stop_hit := v15_long_struct_stop
     v15_long_early_exit = v15_late4_enabled and not visual_hit_tp1 and high < visual_tp1_price and bar_index - visual_entry_bar >= 4 and v15_long_fail_now and v15_long_fail_prev and not v15_long_struct_stop
     if v15_long_struct_stop or v15_long_early_exit
         v81_exit_fill_long = v15_long_early_exit ? close : (open < visual_sl_price ? open : visual_sl_price)
@@ -2648,9 +2663,7 @@ if visual_trade_labels_enabled and visual_position == "SHORT" and bar_index > vi
     // After TP2, trail behind completed 5M structure instead of forcing a fixed final exit.
     if visual_hit_tp2 and v5_runner_after_tp2
         visual_runner_active := true
-        v9_runner_lb = v93_runner_profile == "Wider" ? 5 : v93_runner_profile == "Tighter" ? 2 : v5_runner_lookback
-        v9_runner_buf = v93_runner_profile == "Wider" ? math.max(v5_runner_buffer_atr, 0.15) : v93_runner_profile == "Tighter" ? math.min(v5_runner_buffer_atr, 0.05) : v5_runner_buffer_atr
-        v5_short_runner_stop = ta.highest(high, v9_runner_lb)[1] + v9_runner_buf * visual_atr
+        v5_short_runner_stop = v9_runner_high + v9_runner_buf * visual_atr
         if not na(v5_short_runner_stop)
             visual_sl_price := math.min(visual_sl_price, v5_short_runner_stop)
     if high >= visual_sl_price
@@ -3180,6 +3193,116 @@ f_render_v8_deep() =>
 
 f_render_v8_deep()
 
-plot(v95_parity_entry_side, "V95 Parity Entry Side", display=display.data_window)
-plot(v95_parity_entry_setup, "V95 Parity Entry Setup", display=display.data_window)
-plot(v95_parity_exit_code, "V95 Parity Exit Code", display=display.data_window)
+// Pine Logs parity export. Use the 5-minute chart and copy these records from Pine Logs.
+// Entry side: 1=CALL, -1=PUT. Setup: 1=REV, 2=STRUCTURE, 3=CONT,
+// 4=CONSENSUS, 5=CONTEXT, 6=RAW. Exit: 1=TP1, 2=TP2, 3=TP1+TP2 same bar,
+// 4=SL, 5=RUNNER, 6=FINAL_TP, 7=LATE4.
+// Context bits: 1=confirmed, 2/4=5M bull/bear, 8/16=15M bull/bear,
+// 32/64=CALL/PUT MTF pass, 128/256=CALL/PUT execution pass, 512=chop,
+// 1024/2048=CALL/PUT exhaustion, 4096/8192=CALL/PUT expansion override,
+// 16384/32768=CALL/PUT room pass.
+v95_parity_context_flags =
+         (barstate.isconfirmed ? 1 : 0)
+     + (v2_5_bull ? 2 : 0)
+     + (v2_5_bear ? 4 : 0)
+     + (v2_15_bull ? 8 : 0)
+     + (v2_15_bear ? 16 : 0)
+     + (v2_call_mtf_ok ? 32 : 0)
+     + (v2_put_mtf_ok ? 64 : 0)
+     + (v2_long_ok ? 128 : 0)
+     + (v2_short_ok ? 256 : 0)
+     + (v2_chop ? 512 : 0)
+     + (v2_bull_exhaustion ? 1024 : 0)
+     + (v2_bear_exhaustion ? 2048 : 0)
+     + (v2_expansion_call_override ? 4096 : 0)
+     + (v2_expansion_put_override ? 8192 : 0)
+     + (v2_room_call_ok ? 16384 : 0)
+     + (v2_room_put_ok ? 32768 : 0)
+
+// Setup bits: 1/2=READY CALL/PUT, 4/8=CONT armed CALL/PUT,
+// 16/32=REV, 64/128=STRUCTURE, 256/512=CONT, 1024/2048=CONSENSUS,
+// 4096/8192=CONTEXT, 16384/32768=candidate, 65536/131072=entry CALL/PUT.
+v95_parity_setup_flags =
+         (v3_ready_dir == 1 ? 1 : 0)
+     + (v3_ready_dir == -1 ? 2 : 0)
+     + (v4_cont_call_armed ? 4 : 0)
+     + (v4_cont_put_armed ? 8 : 0)
+     + (v6_reversal_call ? 16 : 0)
+     + (v6_reversal_put ? 32 : 0)
+     + (v3_structure_call ? 64 : 0)
+     + (v3_structure_put ? 128 : 0)
+     + (v9_cont_call ? 256 : 0)
+     + (v9_cont_put ? 512 : 0)
+     + (v3_consensus_call ? 1024 : 0)
+     + (v3_consensus_put ? 2048 : 0)
+     + (v3_context_call ? 4096 : 0)
+     + (v3_context_put ? 8192 : 0)
+     + (v3_call_candidate ? 16384 : 0)
+     + (v3_put_candidate ? 32768 : 0)
+     + (v3_entry_call ? 65536 : 0)
+     + (v3_entry_put ? 131072 : 0)
+
+// Trade bits: 1/2=LONG/SHORT, 4/8=TP1/TP2, 16=runner,
+// 32/64/128/256=entry/TP1/TP2/exit alert sent. Latched bits are zeroed while flat.
+v95_parity_has_trade_state = visual_position != "FLAT" or v95_parity_exit_code != 0
+v95_parity_trade_flags =
+         (visual_position == "LONG" ? 1 : 0)
+         + (visual_position == "SHORT" ? 2 : 0)
+         + (v95_parity_has_trade_state and visual_hit_tp1 ? 4 : 0)
+         + (v95_parity_has_trade_state and visual_hit_tp2 ? 8 : 0)
+         + (v95_parity_has_trade_state and visual_runner_active ? 16 : 0)
+         + (v95_parity_has_trade_state and v96_entry_sent ? 32 : 0)
+         + (v95_parity_has_trade_state and v96_tp1_sent ? 64 : 0)
+         + (v95_parity_has_trade_state and v96_tp2_sent ? 128 : 0)
+         + (v95_parity_has_trade_state and v96_exit_sent ? 256 : 0)
+
+// Source bits: 1/2=Poki CALL/PUT, 4/8=SMC CALL/PUT, 16/32=VIDYA CALL/PUT.
+v95_parity_source_flags =
+         (v3_poki_long ? 1 : 0)
+         + (v3_poki_short ? 2 : 0)
+         + (v3_smc_long ? 4 : 0)
+         + (v3_smc_short ? 8 : 0)
+         + (v3_vidya_long ? 16 : 0)
+         + (v3_vidya_short ? 32 : 0)
+
+// SMC bits: 1/2=BUY/SELL condition, 4/8=BUY/SELL repeated-signal allowed,
+// 16/32=BUY/SELL trend, 64/128=BUY/SELL lower-TF, 256/512=BUY/SELL volume,
+// 1024/2048=BUY/SELL breakout, 4096/8192=BUY/SELL CHoCH,
+// 16384/32768=BUY/SELL BOS.
+v95_parity_smc_flags =
+         (smc_buy_condition ? 1 : 0)
+         + (smc_sell_condition ? 2 : 0)
+         + (smc_buy_allowed ? 4 : 0)
+         + (smc_sell_allowed ? 8 : 0)
+         + (smc_buy_trend_ok ? 16 : 0)
+         + (smc_sell_trend_ok ? 32 : 0)
+         + (smc_buy_lower_tf_ok ? 64 : 0)
+         + (smc_sell_lower_tf_ok ? 128 : 0)
+         + (smc_buy_volume_ok ? 256 : 0)
+         + (smc_sell_volume_ok ? 512 : 0)
+         + (smc_buy_breakout_ok ? 1024 : 0)
+         + (smc_sell_breakout_ok ? 2048 : 0)
+         + (smc_choch_buy ? 4096 : 0)
+         + (smc_choch_sell ? 8192 : 0)
+         + (smc_bos_buy ? 16384 : 0)
+         + (smc_bos_sell ? 32768 : 0)
+
+v95_parity_ready_age = na(v3_ready_bar) ? 0 : bar_index - v3_ready_bar
+v95_parity_has_trade_levels = v95_parity_has_trade_state
+
+v95_parity_header = "V15P_HEADER|symbol|timeframe|time_ms|open|high|low|close|volume|ema|vwap|ema5|vwap5|atr5|trade_atr|call_mtf|put_mtf|call_room|put_room|extension|ema_vwap_width|churn|body_atr|rel_vol|momentum_call|momentum_put|pattern_call|pattern_put|vwap_extension_pct|votes_call|votes_put|ready_dir|ready_age|context_flags|setup_flags|trade_flags|entry_side|entry_setup|exit_code|entry_price|tp1|tp2|tp3|stop|source_flags|smc_flags|smc_volume_filter_enabled|smc_volume_long_length|smc_volume_short_length|smc_volume_avg_long|smc_volume_short_sma|smc_volume_short_change|smc_volume_condition|runner_stop_candidate|stop_pre_exit|stop_hit"
+v95_parity_row_a = "V15P|" + syminfo.ticker + "|" + timeframe.period + "|" + str.tostring(time) + "|" + str.tostring(open) + "|" + str.tostring(high) + "|" + str.tostring(low) + "|" + str.tostring(close) + "|" + str.tostring(volume)
+v95_parity_row_b = "|" + str.tostring(ema_out) + "|" + str.tostring(vwap_vwapValue) + "|" + str.tostring(v2_5_ema) + "|" + str.tostring(v2_5_vwap) + "|" + str.tostring(v2_5_atr) + "|" + str.tostring(visual_atr) + "|" + str.tostring(v2_call_mtf_score) + "|" + str.tostring(v2_put_mtf_score) + "|" + str.tostring(v2_call_room) + "|" + str.tostring(v2_put_room) + "|" + str.tostring(v2_extension) + "|" + str.tostring(v2_ema_vwap_width) + "|" + str.tostring(v2_churn_return)
+v95_parity_row_c = "|" + str.tostring(v2_1_body_atr) + "|" + str.tostring(v2_1_rel_vol) + "|" + str.tostring(entry_quality_momentum_bull) + "|" + str.tostring(entry_quality_momentum_bear) + "|" + str.tostring(entry_quality_pattern_bull) + "|" + str.tostring(entry_quality_pattern_bear) + "|" + str.tostring(entry_quality_vwap_extension) + "|" + str.tostring(v3_long_votes) + "|" + str.tostring(v3_short_votes) + "|" + str.tostring(v3_ready_dir) + "|" + str.tostring(v95_parity_ready_age)
+v95_parity_row_d = "|" + str.tostring(v95_parity_context_flags) + "|" + str.tostring(v95_parity_setup_flags) + "|" + str.tostring(v95_parity_trade_flags) + "|" + str.tostring(v95_parity_entry_side) + "|" + str.tostring(v95_parity_entry_setup) + "|" + str.tostring(v95_parity_exit_code)
+v95_parity_row_e = "|" + str.tostring(v95_parity_has_trade_levels ? visual_entry_price : na) + "|" + str.tostring(v95_parity_has_trade_levels ? visual_tp1_price : na) + "|" + str.tostring(v95_parity_has_trade_levels ? visual_tp2_price : na) + "|" + str.tostring(v95_parity_has_trade_levels ? visual_tp3_price : na) + "|" + str.tostring(v95_parity_has_trade_levels ? visual_sl_price : na)
+v95_parity_row_f = "|" + str.tostring(v95_parity_source_flags) + "|" + str.tostring(v95_parity_smc_flags)
+v95_parity_row_g = "|" + str.tostring(smc_use_volume_filter) + "|" + str.tostring(smc_volumeLongPeriod) + "|" + str.tostring(smc_volumeShortPeriod) + "|" + str.tostring(smc_volAvg50) + "|" + str.tostring(smc_volShort) + "|" + str.tostring(ta.change(smc_volShort)) + "|" + str.tostring(smc_volCondition) + "|" + str.tostring(v95_parity_runner_candidate) + "|" + str.tostring(v95_parity_stop_pre_exit) + "|" + str.tostring(v95_parity_stop_hit)
+
+if barstate.islastconfirmedhistory and timeframe.isminutes and timeframe.multiplier == 5
+    log.info(v95_parity_header)
+if barstate.isconfirmed and timeframe.isminutes and timeframe.multiplier == 5
+    log.info(v95_parity_row_a + v95_parity_row_b + v95_parity_row_c + v95_parity_row_d + v95_parity_row_e + v95_parity_row_f + v95_parity_row_g)
+if v96_shadow_json and barstate.isconfirmed and timeframe.isminutes and timeframe.multiplier == 5
+    v96_shadow_bar_message = "{\"event\":\"BAR\",\"symbol\":\"" + syminfo.ticker + "\",\"timeframe\":\"" + timeframe.period + "\",\"bar_time_ms\":" + str.tostring(time) + ",\"open\":" + str.tostring(open, format.mintick) + ",\"high\":" + str.tostring(high, format.mintick) + ",\"low\":" + str.tostring(low, format.mintick) + ",\"close\":" + str.tostring(close, format.mintick) + ",\"volume\":" + str.tostring(volume) + ",\"entry_side\":" + str.tostring(v95_parity_entry_side) + ",\"entry_setup\":" + str.tostring(v95_parity_entry_setup) + ",\"exit_code\":" + str.tostring(v95_parity_exit_code) + ",\"trade_flags\":" + str.tostring(v95_parity_trade_flags) + "}"
+    alert(v96_shadow_bar_message, alert.freq_all)
