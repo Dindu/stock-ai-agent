@@ -338,8 +338,10 @@ ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
 # Paper-trading execution. When ENABLE_ALPACA_PAPER_TRADING=1 the bot will
 # submit a paper-account market BUY when a STRONG signal fires, then poll the
 # option price each cycle and submit a paper-account market SELL at +20% / -20%.
-# Set to 0 to keep the bot in pure alert mode (no orders submitted, no tracking).
+# V15_SIGNAL_ALERT_ONLY sends raw scanner signals without new contract lookup or orders.
+# Existing paper positions can still be managed until closed.
 ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "1"
+V15_SIGNAL_ALERT_ONLY = os.getenv("V15_SIGNAL_ALERT_ONLY", "1") == "1"
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))  # take-profit at +20%
 FINAL_PROFIT_TARGET_PCT = float(os.getenv("FINAL_PROFIT_TARGET_PCT", "0.30"))  # close remaining contracts at +30%
 STOP_LOSS_PCT     = 0.20  # fixed option-premium stop for every active trade
@@ -567,6 +569,7 @@ central = pytz.timezone("America/Chicago")
 # Track which (symbol, side) pairs already alerted today so we never duplicate.
 # Reset automatically when the trading date changes.
 _alerted_today = {"date": None, "keys": set()}
+_v15_signal_alerts = {"date": None, "keys": set()}
 # Per-symbol prev-day high/low cache.
 _pdh_pdl_cache: "dict[str, dict]" = {sym: {"date": None, "pdh": None, "pdl": None} for sym in SYMBOLS}
 
@@ -3015,6 +3018,8 @@ def entry_candidate_rank(candidate):
 
 def execute_ranked_candidates(candidates):
     """Execute only the highest-ranked valid candidates from a shared scan."""
+    if V15_SIGNAL_ALERT_ONLY:
+        return
     if not candidates:
         return
 
@@ -8149,6 +8154,9 @@ def _refresh_option_quote_before_execution(symbol, option):
 
 def try_open_paper_trade(symbol, side, option, data):
     """Open a paper trade if trading is enabled and we have capacity. Returns True if opened."""
+    if V15_SIGNAL_ALERT_ONLY:
+        log(f"[{symbol}] V15 alert-only mode: paper entry blocked.")
+        return False
     if not ENABLE_ALPACA_PAPER_TRADING:
         return False
 
@@ -8409,7 +8417,7 @@ def run_symbol_swing(client, symbol):
 
 def maybe_run_swing_scan(client, now_ct=None):
     """Run the swing scan at most once per trading day, near market open."""
-    if not SWING_MODE:
+    if not SWING_MODE or V15_SIGNAL_ALERT_ONLY:
         return
     now_ct = now_ct or datetime.now(central)
     today = now_ct.date()
@@ -8757,6 +8765,32 @@ def run_symbol(client, symbol, prefetched_bars=None):
         f"{pine_reason}; source_votes={pine_decision['long_votes']}/{pine_decision['short_votes']} "
         f"MTF={pine_decision['call_mtf']}/{pine_decision['put_mtf']}."
     )
+
+    if V15_SIGNAL_ALERT_ONLY:
+        now_ct = datetime.now(central)
+        if _v15_signal_alerts["date"] != now_ct.date():
+            _v15_signal_alerts.update(date=now_ct.date(), keys=set())
+        bar_time = pine_decision["entry_bar"]
+        alert_key = (symbol, bar_time, pine_decision["setup"], side)
+        if alert_key not in _v15_signal_alerts["keys"]:
+            bar_ct = pd.Timestamp(bar_time)
+            bar_ct = bar_ct.tz_localize("UTC") if bar_ct.tzinfo is None else bar_ct.tz_convert("UTC")
+            message = (
+                f"**V15 SCAN SIGNAL (alert only) — {symbol} {pine_decision['setup']} {side}**\n"
+                f"5m bar: `{bar_ct.tz_convert(central):%Y-%m-%d %H:%M} CT` · "
+                f"Detected: `{now_ct:%H:%M:%S} CT`\n"
+                f"Source votes: `{pine_decision['long_votes']}/{pine_decision['short_votes']}` · "
+                f"MTF: `{pine_decision['call_mtf']}/{pine_decision['put_mtf']}`\n"
+                "No contract selected or paper order placed."
+            )
+            sent = send_discord(message, color=DISCORD_COLOR_CALL if side == "CALL" else DISCORD_COLOR_PUT,
+                                wait_for_response=True, webhook_url=DISCORD_WEBHOOK_LIVE_TRADES_URL)
+            if isinstance(sent, dict) and sent.get("id"):
+                _v15_signal_alerts["keys"].add(alert_key)
+                log(f"[{symbol}] V15 scan alert: {pine_decision['setup']} {side} bar={bar_time} (no contract/order).")
+            else:
+                log(f"[{symbol}] V15 scan alert delivery unconfirmed; will retry on next scan.")
+        return
 
     closing_block_minutes = closing_no_trade_minutes_remaining()
     if closing_block_minutes > 0:
@@ -9345,7 +9379,9 @@ def main():
     # Always init TradingClient — needed for GetOptionContractsRequest even when paper
     # trading is disabled.  Order submission is gated separately by ENABLE_ALPACA_PAPER_TRADING.
     _trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
-    if ENABLE_ALPACA_PAPER_TRADING:
+    if V15_SIGNAL_ALERT_ONLY:
+        log("V15 ALERT ONLY — scan signals go to Discord; no new contracts or paper entries. Existing positions remain managed.")
+    elif ENABLE_ALPACA_PAPER_TRADING:
         log("Paper trading ENABLED — Alpaca paper TradingClient initialized.")
     else:
         log("Paper trading DISABLED — real-trades-only mode, no Discord/Sheets for setups (TradingClient used for option contract lookup only).")
