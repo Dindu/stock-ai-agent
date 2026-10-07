@@ -92,6 +92,11 @@ TIER_LIQUIDITY_THRESHOLDS = {
 }
 DEFAULT_SYMBOLS = "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,TSLA,AMD,PLTR,GOOGL,AVGO,ADBE,HOOD,ORCL"
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
+V15_SIGNAL_ALERT_ONLY = os.getenv("V15_SIGNAL_ALERT_ONLY", "1") == "1"
+if V15_SIGNAL_ALERT_ONLY:
+    # SPX is an index, not a stock on the Alpaca IEX stock-bars/trades feed.
+    alert_symbols = [s.strip().upper() for s in os.getenv("V15_ALERT_SYMBOLS", "SPY,QQQ,IWM,SPX").split(",") if s.strip()]
+    SYMBOLS = list(dict.fromkeys(s for s in alert_symbols if s != "SPX"))
 ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")
 ALPACA_TRADING_BASE_URL = os.getenv("ALPACA_TRADING_BASE_URL", "https://paper-api.alpaca.markets")
 ENABLE_TRENDING_STOCKS = os.getenv("ENABLE_TRENDING_STOCKS", "10") == "1"
@@ -341,7 +346,6 @@ ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
 # V15_SIGNAL_ALERT_ONLY sends raw scanner signals without new contract lookup or orders.
 # Existing paper positions can still be managed until closed.
 ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "1"
-V15_SIGNAL_ALERT_ONLY = os.getenv("V15_SIGNAL_ALERT_ONLY", "1") == "1"
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))  # take-profit at +20%
 FINAL_PROFIT_TARGET_PCT = float(os.getenv("FINAL_PROFIT_TARGET_PCT", "0.30"))  # close remaining contracts at +30%
 STOP_LOSS_PCT     = 0.20  # fixed option-premium stop for every active trade
@@ -8462,10 +8466,11 @@ def run_cycle(client):
     # Entry scan first (symbol loop), then exit management in the same cycle.
     # This keeps the flow aligned with: entry -> check exit -> exit.
     symbols_to_scan = list(SYMBOLS)
-    trending_symbols, _ = get_trending_symbols(client, SYMBOLS)
-    for sym in trending_symbols:
-        if sym not in symbols_to_scan:
-            symbols_to_scan.append(sym)
+    if not V15_SIGNAL_ALERT_ONLY:
+        trending_symbols, _ = get_trending_symbols(client, SYMBOLS)
+        for sym in trending_symbols:
+            if sym not in symbols_to_scan:
+                symbols_to_scan.append(sym)
 
     symbols_to_scan = _order_symbols_by_priority(symbols_to_scan)
     prefetched_bars = prefetch_bars_parallel(client, symbols_to_scan)
@@ -8616,13 +8621,14 @@ def run_websocket_cycle(client):
         # Include trending symbols here so websocket mode keeps parity with polling mode.
         if now_ct >= next_full_scan_at:
             full_scan_symbols = list(SYMBOLS)
-            try:
-                trending_symbols, _ = get_trending_symbols(client, SYMBOLS)
-                for tsym in trending_symbols:
-                    if tsym not in full_scan_symbols:
-                        full_scan_symbols.append(tsym)
-            except Exception as e:
-                log(f"Trending refresh warning (websocket full scan): {e}")
+            if not V15_SIGNAL_ALERT_ONLY:
+                try:
+                    trending_symbols, _ = get_trending_symbols(client, SYMBOLS)
+                    for tsym in trending_symbols:
+                        if tsym not in full_scan_symbols:
+                            full_scan_symbols.append(tsym)
+                except Exception as e:
+                    log(f"Trending refresh warning (websocket full scan): {e}")
 
             for sym in full_scan_symbols:
                 if sym not in symbols_to_run:
@@ -9381,6 +9387,8 @@ def main():
     _trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
     if V15_SIGNAL_ALERT_ONLY:
         log("V15 ALERT ONLY — scan signals go to Discord; no new contracts or paper entries. Existing positions remain managed.")
+        if "SPX" in alert_symbols:
+            log("[SPX] Scan unavailable: Alpaca IEX stock bars/trades do not provide a verified SPX index feed; no SPX signal will be emitted.")
     elif ENABLE_ALPACA_PAPER_TRADING:
         log("Paper trading ENABLED — Alpaca paper TradingClient initialized.")
     else:
