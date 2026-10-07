@@ -8782,12 +8782,10 @@ def run_symbol(client, symbol, prefetched_bars=None):
             bar_ct = pd.Timestamp(bar_time)
             bar_ct = bar_ct.tz_localize("UTC") if bar_ct.tzinfo is None else bar_ct.tz_convert("UTC")
             message = (
-                f"**V15 SCAN SIGNAL (alert only) — {symbol} {pine_decision['setup']} {side}**\n"
-                f"5m bar: `{bar_ct.tz_convert(central):%Y-%m-%d %H:%M} CT` · "
-                f"Detected: `{now_ct:%H:%M:%S} CT`\n"
-                f"Source votes: `{pine_decision['long_votes']}/{pine_decision['short_votes']}` · "
-                f"MTF: `{pine_decision['call_mtf']}/{pine_decision['put_mtf']}`\n"
-                "No contract selected or paper order placed."
+                f"**{symbol} {side} | ENTRY @ ${pine_decision['entry_underlying']:.2f}**\n"
+                f"V15 `{pine_decision['setup']}` · Signal bar `{bar_ct.tz_convert(central):%Y-%m-%d %H:%M} CT` · "
+                f"Detected `{now_ct:%H:%M:%S} CT`\n"
+                "Contracts: `0` (scan alert only; no order)"
             )
             sent = send_discord(message, color=DISCORD_COLOR_CALL if side == "CALL" else DISCORD_COLOR_PUT,
                                 wait_for_response=True, webhook_url=DISCORD_WEBHOOK_LIVE_TRADES_URL)
