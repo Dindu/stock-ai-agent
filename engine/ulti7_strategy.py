@@ -479,15 +479,10 @@ class Ulti7EntryEngine:
         bos_buy = [False] * count
         bos_sell = [False] * count
         long_volume_avg = volume.rolling(50).mean().to_numpy()
-        short_volume_avg = volume.rolling(5).mean().to_numpy()
-        smc_volume_condition = [False] * count
-        previous_evaluated_short_volume = float("nan")
-        for i in range(count):
-            volume_above_average = volume.iloc[i] > long_volume_avg[i]
-            if volume_above_average:
-                short_volume_change = short_volume_avg[i] - previous_evaluated_short_volume
-                smc_volume_condition[i] = pd.notna(short_volume_change) and short_volume_change > 0
-                previous_evaluated_short_volume = short_volume_avg[i]
+        short_volume_avg = volume.rolling(5).mean()
+        smc_volume_condition = (
+            volume.to_numpy() > long_volume_avg
+        ) & (short_volume_avg.diff().to_numpy() > 0)
         highest_previous = frame["high"].rolling(5).max().shift(1).to_numpy()
         lowest_previous = frame["low"].rolling(5).min().shift(1).to_numpy()
         for i in range(1, count):
@@ -509,7 +504,7 @@ class Ulti7EntryEngine:
                 continue
             price_change = (close[i] - close[i - 1]) / close[i - 1] * 100.0
             momentum_threshold = 0.01 * (1.0 + (atr[i] / close[i]) * 2.0)
-            volatility_ok = smc_volume_condition[i]
+            volatility_ok = bool(smc_volume_condition[i])
             breakout_buy_ok = close[i] > highest_previous[i] if pd.notna(highest_previous[i]) else False
             breakout_sell_ok = close[i] < lowest_previous[i] if pd.notna(lowest_previous[i]) else False
             buy = price_change > momentum_threshold and trend == 1 and volatility_ok and breakout_buy_ok
@@ -525,6 +520,7 @@ class Ulti7EntryEngine:
             "choch_sell": pd.Series(choch_sell, index=frame.index),
             "bos_buy": pd.Series(bos_buy, index=frame.index),
             "bos_sell": pd.Series(bos_sell, index=frame.index),
+            "volume_condition": pd.Series(smc_volume_condition, index=frame.index),
         }
 
     def evaluate(self, symbol, bars, data, confluence, now=None):
