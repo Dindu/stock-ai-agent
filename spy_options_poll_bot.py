@@ -8712,6 +8712,25 @@ def run_websocket_cycle(client):
         time.sleep(loop_sleep)
 
 
+def format_v15_scan_alert(symbol, decision, data, detected_at):
+    side = decision["side"]
+    setup = decision["setup"]
+    entry = float(decision["entry_underlying"])
+    plan = decision.get("exit_plan") or {}
+    bar_time = pd.Timestamp(decision["entry_bar"])
+    bar_time = bar_time.tz_localize("UTC") if bar_time.tzinfo is None else bar_time.tz_convert("UTC")
+    bar_ct = bar_time.tz_convert(central)
+    levels = "Levels unavailable"
+    if all(plan.get(key) is not None for key in ("tp1", "tp2", "stop")):
+        levels = (
+            f"TP1 `${float(plan['tp1']):.2f}` | TP2 `${float(plan['tp2']):.2f}` | SL `${float(plan['stop']):.2f}`"
+        )
+    return (
+        f"**{symbol} {side} | SPOT ENTRY ${entry:.2f}** · `{setup}`\n"
+        f"{levels} · Bar `{bar_ct:%H:%M} CT`"
+    )
+
+
 def run_symbol(client, symbol, prefetched_bars=None):
     bars = prefetched_bars if prefetched_bars is not None else fetch_bars(client, symbol)
     log(f"[{symbol}] Fetched {len(bars)} bars.")
@@ -8779,14 +8798,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
         bar_time = pine_decision["entry_bar"]
         alert_key = (symbol, bar_time, pine_decision["setup"], side)
         if alert_key not in _v15_signal_alerts["keys"]:
-            bar_ct = pd.Timestamp(bar_time)
-            bar_ct = bar_ct.tz_localize("UTC") if bar_ct.tzinfo is None else bar_ct.tz_convert("UTC")
-            message = (
-                f"**{symbol} {side} | ENTRY @ ${pine_decision['entry_underlying']:.2f}**\n"
-                f"V15 `{pine_decision['setup']}` · Signal bar `{bar_ct.tz_convert(central):%Y-%m-%d %H:%M} CT` · "
-                f"Detected `{now_ct:%H:%M:%S} CT`\n"
-                "Contracts: `0` (scan alert only; no order)"
-            )
+            message = format_v15_scan_alert(symbol, pine_decision, data, now_ct)
             sent = send_discord(message, color=DISCORD_COLOR_CALL if side == "CALL" else DISCORD_COLOR_PUT,
                                 wait_for_response=True, webhook_url=DISCORD_WEBHOOK_LIVE_TRADES_URL)
             if isinstance(sent, dict) and sent.get("id"):
