@@ -95,7 +95,7 @@ SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).spli
 V15_SIGNAL_ALERT_ONLY = os.getenv("V15_SIGNAL_ALERT_ONLY", "1") == "1"
 if V15_SIGNAL_ALERT_ONLY:
     # SPX is an index, not a stock on the Alpaca IEX stock-bars/trades feed.
-    alert_symbols = [s.strip().upper() for s in os.getenv("V15_ALERT_SYMBOLS", "SPY,QQQ,IWM,SPX").split(",") if s.strip()]
+    alert_symbols = [s.strip().upper() for s in os.getenv("V15_ALERT_SYMBOLS", "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,TSLA,AMD,PLTR,GOOGL,MU").split(",") if s.strip()]
     SYMBOLS = list(dict.fromkeys(s for s in alert_symbols if s != "SPX"))
 ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")
 ALPACA_TRADING_BASE_URL = os.getenv("ALPACA_TRADING_BASE_URL", "https://paper-api.alpaca.markets")
