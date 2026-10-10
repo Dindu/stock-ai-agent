@@ -25,16 +25,28 @@ class SmcPineParityTests(unittest.TestCase):
             index=index,
         )
 
-    def test_smc_volume_change_uses_immediately_previous_bar(self):
-        volume = [1000.0] * 60 + [0.0, 1100.0]
+    def test_smc_volume_change_uses_previous_bar_where_lazy_call_ran(self):
+        volume = [1000.0] * 60 + [3000.0, 0.0, 0.0, 1100.0]
         bars = self._bars(volume)
         result = PineV95EntryEngine._smc_events(bars, _pine_base_series(bars))
-        expected = (bars["volume"] > bars["volume"].rolling(50).mean()) & (bars["volume"].rolling(5).mean().diff() > 0)
+        average = bars["volume"].rolling(50).mean()
+        short_average = bars["volume"].rolling(5).mean()
+        expected = []
+        previous_evaluated = float("nan")
+        for position in range(len(bars)):
+            qualifies = bars["volume"].iloc[position] > average.iloc[position]
+            change = short_average.iloc[position] - previous_evaluated if qualifies else float("nan")
+            expected.append(bool(qualifies and pd.notna(change) and change > 0))
+            if qualifies:
+                previous_evaluated = short_average.iloc[position]
+        expected = pd.Series(expected, index=bars.index)
         self.assertEqual(bool(result["volume_condition"].iloc[-1]), bool(expected.iloc[-1]))
-        self.assertTrue(bool(expected.iloc[-1]))
+        immediate_previous_change = short_average.diff().iloc[-1]
+        self.assertGreater(immediate_previous_change, 0)
+        self.assertFalse(bool(expected.iloc[-1]))
 
     def test_smc_buy_requires_pine_default_filters(self):
-        volume = [1000.0] * 69 + [1500.0]
+        volume = [1000.0 + position * 10.0 for position in range(70)]
         bars = self._bars(volume)
         result = PineV95EntryEngine._smc_events(bars, _pine_base_series(bars))
         self.assertTrue(bool(result["buy"].iloc[-1]))
