@@ -92,8 +92,10 @@ TIER_LIQUIDITY_THRESHOLDS = {
 }
 DEFAULT_SYMBOLS = "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,TSLA,AMD,PLTR,GOOGL,AVGO,ADBE,HOOD,ORCL"
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
-V15_SIGNAL_ALERT_ONLY = os.getenv("V15_SIGNAL_ALERT_ONLY", "1") == "1"
-if V15_SIGNAL_ALERT_ONLY:
+V15_PAPER_EARLIEST_CONTRACT_MODE = os.getenv("V15_PAPER_EARLIEST_CONTRACT_MODE", "0") == "1"
+V15_PAPER_CONTRACT_QTY = max(1, int(os.getenv("V15_PAPER_CONTRACT_QTY", "5")))
+V15_SIGNAL_ALERT_ONLY = os.getenv("V15_SIGNAL_ALERT_ONLY", "0" if V15_PAPER_EARLIEST_CONTRACT_MODE else "1") == "1"
+if V15_SIGNAL_ALERT_ONLY or V15_PAPER_EARLIEST_CONTRACT_MODE:
     # SPX is an index, not a stock on the Alpaca IEX stock-bars/trades feed.
     alert_symbols = [s.strip().upper() for s in os.getenv("V15_ALERT_SYMBOLS", "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,TSLA,AMD,PLTR,GOOGL,MU").split(",") if s.strip()]
     SYMBOLS = list(dict.fromkeys(s for s in alert_symbols if s != "SPX"))
@@ -217,7 +219,7 @@ PLAYBOOK_EXTREME_PROXIMITY_PCT = float(os.getenv("PLAYBOOK_EXTREME_PROXIMITY_PCT
 BREAKOUT_PUT_ENTRIES_ENABLED = os.getenv("BREAKOUT_PUT_ENTRIES_ENABLED", "1") == "1"
 MAX_NEW_ENTRIES_PER_CYCLE = max(1, int(os.getenv("MAX_NEW_ENTRIES_PER_CYCLE", "10")))
 # Global bypass for all entry gating layers (tier/stock strict/opening/cooldown/ignition/RSI/macro/anti-chase/candle).
-NO_GATING_MODE = os.getenv("NO_GATING_MODE", "0") == "1"
+NO_GATING_MODE = os.getenv("NO_GATING_MODE", "0") == "1" or V15_PAPER_EARLIEST_CONTRACT_MODE
 ENFORCE_OPENING_WINDOW_IN_NO_GATING = os.getenv("ENFORCE_OPENING_WINDOW_IN_NO_GATING", "1") == "1"
 # Recall-first mode: bias the bot toward taking strong setups rather than filtering them away.
 RECALL_FIRST_MODE = os.getenv("RECALL_FIRST_MODE", "1") == "1"
@@ -346,6 +348,8 @@ ENABLE_PRIORITY_SCANNING = os.getenv("ENABLE_PRIORITY_SCANNING", "1") == "1"
 # V15_SIGNAL_ALERT_ONLY sends raw scanner signals without new contract lookup or orders.
 # Existing paper positions can still be managed until closed.
 ENABLE_ALPACA_PAPER_TRADING = os.getenv("ENABLE_ALPACA_PAPER_TRADING", "1") == "1"
+if V15_PAPER_EARLIEST_CONTRACT_MODE and (V15_SIGNAL_ALERT_ONLY or not ENABLE_ALPACA_PAPER_TRADING):
+    raise RuntimeError("V15 earliest-contract mode requires V15_SIGNAL_ALERT_ONLY=0 and ENABLE_ALPACA_PAPER_TRADING=1")
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0.20"))  # take-profit at +20%
 FINAL_PROFIT_TARGET_PCT = float(os.getenv("FINAL_PROFIT_TARGET_PCT", "0.30"))  # close remaining contracts at +30%
 STOP_LOSS_PCT     = 0.20  # fixed option-premium stop for every active trade
@@ -3028,7 +3032,8 @@ def execute_ranked_candidates(candidates):
         return
 
     ranked = sorted(candidates, key=entry_candidate_rank, reverse=True)
-    for candidate in ranked[:MAX_NEW_ENTRIES_PER_CYCLE]:
+    executable = ranked if V15_PAPER_EARLIEST_CONTRACT_MODE else ranked[:MAX_NEW_ENTRIES_PER_CYCLE]
+    for candidate in executable:
         symbol = candidate["symbol"]
         side = candidate["side"]
         rank = entry_candidate_rank(candidate)
@@ -3036,7 +3041,7 @@ def execute_ranked_candidates(candidates):
             _alerted_today["keys"].add(candidate["alert_key"])
         log(
             f"[{symbol}] Seven-indicator candidate selected: {side} "
-            f"rank={rank:.1f} ({len(ranked)} eligible, top {MAX_NEW_ENTRIES_PER_CYCLE} executable)."
+            f"rank={rank:.1f} ({len(ranked)} eligible, {len(executable)} executable)."
         )
         try:
             opened = try_open_paper_trade(symbol, side, candidate["option"], candidate["data"])
@@ -4367,10 +4372,11 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
             "underlying_symbols": [symbol],
             "expiration_date_gte": min_exp,
             "type": option_type,
-            "strike_price_gte": str(round(underlying_price * 0.95, 2)),
-            "strike_price_lte": str(round(underlying_price * 1.05, 2)),
-            "limit": 50,
+            "limit": 1000 if V15_PAPER_EARLIEST_CONTRACT_MODE else 50,
         }
+        if not V15_PAPER_EARLIEST_CONTRACT_MODE:
+            req_kwargs["strike_price_gte"] = str(round(underlying_price * 0.95, 2))
+            req_kwargs["strike_price_lte"] = str(round(underlying_price * 1.05, 2))
         req_kwargs["expiration_date_lte"] = max_exp
 
         req = GetOptionContractsRequest(**req_kwargs)
@@ -4525,6 +4531,46 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
             if bid <= 0.0 and ask <= 0.0:
                 _reject(f"[{symbol}] Contract {contract_sym} rejected — NO_QUOTE (no live bid/ask returned).")
                 continue
+
+            if V15_PAPER_EARLIEST_CONTRACT_MODE:
+                if bid <= 0.0 or ask <= 0.0:
+                    _reject(f"[{symbol}] Contract {contract_sym} rejected — paper execution needs a two-sided quote.")
+                    continue
+                mid = (bid + ask) / 2
+                spread_pct = (ask - bid) / mid if mid > 0 else float("inf")
+                option_candidate = {
+                    "contract": contract_sym,
+                    "expiry": exp_date.strftime("%Y-%m-%d"),
+                    "dte": dte,
+                    "strike": float(candidate.strike_price),
+                    "bid": bid,
+                    "ask": ask,
+                    "bid_size": bid_size,
+                    "ask_size": ask_size,
+                    "last": last,
+                    "volume": vol,
+                    "last_trade_size": last_trade_size,
+                    "open_interest": oi,
+                    "open_interest_date": oi_date,
+                    "quote_timestamp": quote_ts,
+                    "trade_timestamp": trade_ts,
+                    "delta": delta_val,
+                    "spread_pct": spread_pct,
+                    "slippage_est": max(0.0, ask - bid),
+                    "side": signal,
+                    "strike_distance_pct": (
+                        abs(float(candidate.strike_price) - float(underlying_price)) / float(underlying_price)
+                        if float(underlying_price) > 0 else 1.0
+                    ),
+                }
+                print(
+                    f"[{symbol}] Earliest-contract paper mode selected {contract_sym} "
+                    f"expiry={option_candidate['expiry']} strike={option_candidate['strike']} "
+                    f"bid={bid:.2f} ask={ask:.2f} (quality filters bypassed).",
+                    flush=True,
+                )
+                _log_contract_data_quality(symbol, option_candidate)
+                return option_candidate
 
             if bid < min_bid:
                 _reject(f"[{symbol}] Contract {contract_sym} rejected — bid ${bid:.2f} < ${min_bid:.2f} minimum.")
@@ -8143,7 +8189,9 @@ def _refresh_option_quote_before_execution(symbol, option):
         mid = (bid + ask) / 2.0 if (bid + ask) > 0 else 0.01
         spread_pct = (ask - bid) / mid
         max_spread_pct = ETF_MAX_OPTION_SPREAD_PCT if symbol in ETF_SYMBOLS else STOCK_MAX_OPTION_SPREAD_PCT
-        if spread_pct > max_spread_pct:
+        if V15_PAPER_EARLIEST_CONTRACT_MODE and (bid <= 0.0 or ask <= 0.0):
+            return False, "two-sided live quote unavailable on execution refresh"
+        if spread_pct > max_spread_pct and not V15_PAPER_EARLIEST_CONTRACT_MODE:
             return False, f"spread widened to {spread_pct*100:.1f}% > {max_spread_pct*100:.0f}% max on execution refresh"
         daily = getattr(snap, "daily_bar", None)
         if daily is not None:
@@ -8170,7 +8218,7 @@ def try_open_paper_trade(symbol, side, option, data):
     if len(_open_trades) >= MAX_OPEN_TRADES:
         log(f"[{symbol}] Paper-trade capacity full ({len(_open_trades)}/{MAX_OPEN_TRADES}) — skipping.")
         return False
-    if SINGLE_POSITION_PER_SYMBOL:
+    if SINGLE_POSITION_PER_SYMBOL and not V15_PAPER_EARLIEST_CONTRACT_MODE:
         already_open, detail = has_open_underlying_position(symbol, side)
         if already_open:
             log(f"[{symbol}] Existing {side} position detected ({detail}) — not opening another strike.")
@@ -8178,11 +8226,12 @@ def try_open_paper_trade(symbol, side, option, data):
     if option["contract"] in _open_trades:
         log(f"[{symbol}] Already long {option['contract']} — not stacking.")
         return False
-    direction_capacity_ok, direction_capacity_reason = same_direction_position_capacity_ok(symbol, side)
-    if not direction_capacity_ok:
-        log(f"[{symbol}] Correlated-entry guard: {direction_capacity_reason} — skipping.")
-        _record_entry_block("exposure_cap")
-        return False
+    if not V15_PAPER_EARLIEST_CONTRACT_MODE:
+        direction_capacity_ok, direction_capacity_reason = same_direction_position_capacity_ok(symbol, side)
+        if not direction_capacity_ok:
+            log(f"[{symbol}] Correlated-entry guard: {direction_capacity_reason} — skipping.")
+            _record_entry_block("exposure_cap")
+            return False
     if _trading_client is None:
         return False
 
@@ -8199,7 +8248,7 @@ def try_open_paper_trade(symbol, side, option, data):
     raw_score = int(data.get("raw_entry_score", score))
     macro_penalty = int(data.get("macro_penalty", 0))
     dominance = abs(int(data.get("bull_score", 0)) - int(data.get("bear_score", 0)))
-    qty = position_qty_from_score(score, dominance)
+    qty = V15_PAPER_CONTRACT_QTY if V15_PAPER_EARLIEST_CONTRACT_MODE else position_qty_from_score(score, dominance)
     signal_label = f"STRONG {side}"
 
     # Broker-side buying power guard to reduce avoidable rejected option orders.
@@ -8421,7 +8470,7 @@ def run_symbol_swing(client, symbol):
 
 def maybe_run_swing_scan(client, now_ct=None):
     """Run the swing scan at most once per trading day, near market open."""
-    if not SWING_MODE or V15_SIGNAL_ALERT_ONLY:
+    if not SWING_MODE or V15_SIGNAL_ALERT_ONLY or V15_PAPER_EARLIEST_CONTRACT_MODE:
         return
     now_ct = now_ct or datetime.now(central)
     today = now_ct.date()
@@ -8466,7 +8515,7 @@ def run_cycle(client):
     # Entry scan first (symbol loop), then exit management in the same cycle.
     # This keeps the flow aligned with: entry -> check exit -> exit.
     symbols_to_scan = list(SYMBOLS)
-    if not V15_SIGNAL_ALERT_ONLY:
+    if not V15_SIGNAL_ALERT_ONLY and not V15_PAPER_EARLIEST_CONTRACT_MODE:
         trending_symbols, _ = get_trending_symbols(client, SYMBOLS)
         for sym in trending_symbols:
             if sym not in symbols_to_scan:
@@ -8621,7 +8670,7 @@ def run_websocket_cycle(client):
         # Include trending symbols here so websocket mode keeps parity with polling mode.
         if now_ct >= next_full_scan_at:
             full_scan_symbols = list(SYMBOLS)
-            if not V15_SIGNAL_ALERT_ONLY:
+            if not V15_SIGNAL_ALERT_ONLY and not V15_PAPER_EARLIEST_CONTRACT_MODE:
                 try:
                     trending_symbols, _ = get_trending_symbols(client, SYMBOLS)
                     for tsym in trending_symbols:
@@ -8809,7 +8858,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
         return
 
     closing_block_minutes = closing_no_trade_minutes_remaining()
-    if closing_block_minutes > 0:
+    if closing_block_minutes > 0 and not V15_PAPER_EARLIEST_CONTRACT_MODE:
         log(
             f"[{symbol}] Closing window filter: skipping {data['signal']} during final "
             f"{CLOSING_NO_TRADE_MINUTES}m before close ({closing_block_minutes}m remaining)."
@@ -8843,7 +8892,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
     else:
         data["promoted_quality_ok"] = False
 
-    enforce_opening_window = (not NO_GATING_MODE) or ENFORCE_OPENING_WINDOW_IN_NO_GATING
+    enforce_opening_window = not V15_PAPER_EARLIEST_CONTRACT_MODE and ((not NO_GATING_MODE) or ENFORCE_OPENING_WINDOW_IN_NO_GATING)
     if enforce_opening_window:
         opening_block_minutes = opening_no_trade_minutes_remaining()
         if opening_block_minutes > 0:
@@ -9223,10 +9272,10 @@ def run_symbol(client, symbol, prefetched_bars=None):
     if not NO_GATING_MODE and not TWO_PLAYBOOK_ENTRY_MODE:
         _alerted_today["keys"].add(alert_key)
 
-    if FORCE_0DTE_ALL:
+    if V15_PAPER_EARLIEST_CONTRACT_MODE or FORCE_0DTE_ALL:
         contract_min_dte = 0
         contract_max_dte = 0
-        contract_fallback_max_dte = ZERO_DTE_FALLBACK_MAX_DTE
+        contract_fallback_max_dte = max(1, FALLBACK_MAX_DTE)
         data["entry_max_dte"] = contract_fallback_max_dte
         log(
             f"[{symbol}] Intraday contract policy: searching 0DTE first, then the earliest "
@@ -9262,7 +9311,7 @@ def run_symbol(client, symbol, prefetched_bars=None):
         min_dte=contract_min_dte,
         max_dte=contract_max_dte,
         fallback_max_dte=contract_fallback_max_dte,
-        earliest_expiry_fallback=FORCE_0DTE_ALL,
+        earliest_expiry_fallback=FORCE_0DTE_ALL or V15_PAPER_EARLIEST_CONTRACT_MODE,
     )
     if not option:
         if (not NO_GATING_MODE) and ALERT_ONLY_COOLDOWN_MINUTES > 0:
@@ -9281,7 +9330,11 @@ def run_symbol(client, symbol, prefetched_bars=None):
         )
         return
 
-    entry_ok, entry_reason = entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap)
+    entry_ok, entry_reason = (
+        (True, "V15 earliest-contract paper mode")
+        if V15_PAPER_EARLIEST_CONTRACT_MODE
+        else entry_contract_quality_ok(symbol, side, data, option, max_ext_from_vwap)
+    )
     if not entry_ok:
         if (not NO_GATING_MODE) and ALERT_ONLY_COOLDOWN_MINUTES > 0:
             _alert_cooldowns[alert_key] = now_ct + timedelta(minutes=ALERT_ONLY_COOLDOWN_MINUTES)
@@ -9399,6 +9452,8 @@ def main():
         log("V15 ALERT ONLY — scan signals go to Discord; no new contracts or paper entries. Existing positions remain managed.")
         if "SPX" in alert_symbols:
             log("[SPX] Scan unavailable: Alpaca IEX stock bars/trades do not provide a verified SPX index feed; no SPX signal will be emitted.")
+    elif V15_PAPER_EARLIEST_CONTRACT_MODE:
+        log("V15 EARLIEST-CONTRACT PAPER MODE — V15 alerts use the earliest quoted expiry/nearest strike; one paper contract per signal; discretionary entry/contract filters bypassed.")
     elif ENABLE_ALPACA_PAPER_TRADING:
         log("Paper trading ENABLED — Alpaca paper TradingClient initialized.")
     else:
