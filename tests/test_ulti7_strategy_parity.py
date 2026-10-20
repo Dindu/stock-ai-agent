@@ -9,6 +9,7 @@ import pytz
 from engine.ulti7_strategy import PineV95EntryEngine, _pine_base_series
 from engine.ulti7_trade_manager import Ulti7Strategy, Ulti7UnderlyingTradeManager
 from execution.freshness import signal_execution_freshness
+from execution.shadow_tracker import HEADERS as SHADOW_HEADERS, Ulti7ShadowTracker
 
 
 class SmcPineParityTests(unittest.TestCase):
@@ -137,6 +138,78 @@ class SignalExecutionFreshnessTests(unittest.TestCase):
         )
         self.assertEqual(price_reason, "EXECUTION_SKIPPED_PRICE_MOVE")
         self.assertEqual(quote_reason, "EXECUTION_SKIPPED_STALE_QUOTE")
+
+
+class _MemoryWorksheet:
+    def __init__(self):
+        self.rows = [list(SHADOW_HEADERS)]
+
+    def get_all_records(self):
+        return [dict(zip(self.rows[0], row)) for row in self.rows[1:]]
+
+    def append_row(self, values, value_input_option=None):
+        self.rows.append(list(values))
+        row = len(self.rows)
+        return {"updates": {"updatedRange": f"ULTI7 Shadow!A{row}:Y{row}"}}
+
+    def col_values(self, column):
+        return [row[column - 1] for row in self.rows if len(row) >= column]
+
+    def update(self, range_name, values, value_input_option=None):
+        row_number = int(range_name.split("!", 1)[-1].split(":", 1)[0][1:])
+        self.rows[row_number - 1] = list(values[0])
+
+
+class GoogleSheetsShadowTrackerTests(unittest.TestCase):
+    def setUp(self):
+        self.worksheet = _MemoryWorksheet()
+        self.tracker = Ulti7ShadowTracker(self.worksheet)
+        self.index = pd.date_range("2026-10-20 15:00", periods=40, freq="5min", tz="UTC")
+        close = pd.Series([100.0] * len(self.index), index=self.index)
+        self.bars = pd.DataFrame(
+            {"open": close, "high": close + 0.2, "low": close - 0.2, "close": close, "volume": 1000.0},
+            index=self.index,
+        )
+        self.decision = {
+            "side": "CALL",
+            "setup": "STRUCTURE",
+            "entry_bar": str(self.index[-1]),
+            "entry_underlying": 100.0,
+            "atr": 1.0,
+            "exit_plan": {
+                "entry_bar": str(self.index[-1]), "entry_price": 100.0, "atr": 1.0,
+                "stop": 98.0, "initial_stop": 98.0, "initial_risk": 2.0,
+                "tp1": 100.75, "tp2": 101.5, "tp3": 102.25,
+            },
+        }
+
+    def test_signal_is_idempotent_and_restores_from_sheet(self):
+        self.assertEqual(self.tracker.add_signal("AMD", self.decision), "TRACKING")
+        self.assertEqual(self.tracker.add_signal("AMD", self.decision), "DUPLICATE")
+        restored = Ulti7ShadowTracker(self.worksheet)
+        active = restored.active_trades("AMD")
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["pine_exit_plan"]["tp1"], 100.75)
+
+    def test_completed_bars_update_tp1_and_tp2_in_sheet(self):
+        self.tracker.add_signal("AMD", self.decision)
+        tp1_bar = pd.DataFrame(
+            [{"open": 100.0, "high": 100.9, "low": 100.2, "close": 100.8, "volume": 1000.0}],
+            index=[self.index[-1] + pd.Timedelta(minutes=5)],
+        )
+        self.assertEqual([event["kind"] for event in self.tracker.advance("AMD", pd.concat([self.bars, tp1_bar]))], ["TP1"])
+        restored = Ulti7ShadowTracker(self.worksheet)
+        tp2_bar = pd.DataFrame(
+            [{"open": 100.8, "high": 101.6, "low": 100.2, "close": 101.5, "volume": 1000.0}],
+            index=[tp1_bar.index[-1] + pd.Timedelta(minutes=5)],
+        )
+        self.assertEqual([event["kind"] for event in restored.advance("AMD", pd.concat([self.bars, tp1_bar, tp2_bar]))], ["TP2"])
+        record = self.worksheet.get_all_records()[0]
+        self.assertEqual(record["Status"], "CLOSED")
+        self.assertEqual(record["Stage"], "TP2")
+        self.assertEqual(float(record["TP1 Spot Fill"]), 100.75)
+        self.assertEqual(float(record["TP2 Spot Fill"]), 101.5)
+        self.assertTrue(record["Realized Underlying R"])
 
 
 class UnderlyingTradeManagerTests(unittest.TestCase):

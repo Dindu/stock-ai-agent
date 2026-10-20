@@ -20,6 +20,7 @@ import threading
 import traceback
 from engine.ulti7_strategy import pine_exit_event, ulti7_entry_engine
 from execution.freshness import signal_execution_freshness
+from execution.shadow_tracker import HEADERS as _ULTI7_SHADOW_HEADERS, Ulti7ShadowTracker
 import uuid
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -606,6 +607,7 @@ _entry_timing_v1_state: "dict[tuple, dict]" = {}
 _post_loss_setup: "dict[tuple, dict]" = {}
 # Authorized gspread Spreadsheet object (None if not configured / failed).
 _gsheet: "gspread.Spreadsheet | None" = None
+_ulti7_shadow_tracker = None
 _last_gsheet_init_attempt: "datetime | None" = None
 # Last known SPY VWAP side: 'bull', 'bear', or None (populated by run_symbol each cycle).
 _spy_vwap_cache: "dict" = {"side": None, "updated_at": None}
@@ -708,7 +710,7 @@ _EXIT_REVIEWS_HEADERS = [
 # ---------------------------------------------------------------------------
 def init_google_sheets():
     """Create (or re-open) the bot's spreadsheet by name, then ensure Alerts + Trades tabs exist."""
-    global _gsheet, _last_gsheet_init_attempt
+    global _gsheet, _last_gsheet_init_attempt, _ulti7_shadow_tracker
     _last_gsheet_init_attempt = datetime.now(central)
     if not GOOGLE_SERVICE_ACCOUNT_EMAIL or not GOOGLE_PRIVATE_KEY:
         log("Google Sheets credentials not configured — sheet logging disabled.")
@@ -822,6 +824,26 @@ def init_google_sheets():
                 log("Ensured 'Exit Reviews' header row in Google Sheets.")
         except Exception as header_err:
             log(f"Warning: Could not verify/set Exit Reviews headers: {header_err}")
+
+        try:
+            shadow_ws = _gsheet.worksheet("ULTI7 Shadow")
+        except gspread.exceptions.WorksheetNotFound:
+            shadow_ws = _gsheet.add_worksheet(title="ULTI7 Shadow", rows=3000, cols=len(_ULTI7_SHADOW_HEADERS))
+            log("Created 'ULTI7 Shadow' tab in Google Sheets.")
+        try:
+            existing_shadow_headers = shadow_ws.row_values(1)
+            if existing_shadow_headers != _ULTI7_SHADOW_HEADERS:
+                shadow_ws.update(
+                    range_name="A1",
+                    values=[_ULTI7_SHADOW_HEADERS],
+                    value_input_option="USER_ENTERED",
+                )
+                log("Ensured 'ULTI7 Shadow' header row in Google Sheets.")
+            _ulti7_shadow_tracker = Ulti7ShadowTracker(shadow_ws, logger=log)
+            log(f"Restored {len(_ulti7_shadow_tracker.active_trades())} open ULTI-7 shadow trade(s) from Google Sheets.")
+        except Exception as shadow_err:
+            _ulti7_shadow_tracker = None
+            log(f"Warning: ULTI-7 shadow tracking unavailable: {shadow_err}")
         
         # Protect header row (row 1) so it cannot be edited.
         try:
@@ -843,6 +865,7 @@ def init_google_sheets():
                 f"sheet_id={GOOGLE_SPREADSHEET_ID}"
             )
         _gsheet = None
+        _ulti7_shadow_tracker = None
 
 
 def ensure_google_sheets_ready():
@@ -8840,6 +8863,16 @@ def format_v15_scan_alert(symbol, decision, data, detected_at):
     )
 
 
+def _completed_5m_bars(bars, now=None):
+    if bars is None or bars.empty or not isinstance(bars.index, pd.DatetimeIndex):
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    now_utc = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
+    now_utc = now_utc.tz_localize("UTC") if now_utc.tzinfo is None else now_utc.tz_convert("UTC")
+    index = bars.index
+    index = index.tz_localize("UTC") if index.tz is None else index.tz_convert("UTC")
+    return bars.loc[index + pd.Timedelta(minutes=BAR_MINUTES) <= now_utc]
+
+
 def run_symbol(client, symbol, prefetched_bars=None):
     bars = prefetched_bars if prefetched_bars is not None else fetch_bars(client, symbol)
     log(f"[{symbol}] Fetched {len(bars)} bars.")
@@ -8892,6 +8925,12 @@ def run_symbol(client, symbol, prefetched_bars=None):
                 f"[{symbol}] ULTI-7 state={skip_reason}; skipping repeated/stale completed candle "
                 f"latest_completed={_candle_ct(latest_completed)} last_processed={_candle_ct(processed_stamp)}."
             )
+            if _ulti7_shadow_tracker is not None:
+                shadow_events = _ulti7_shadow_tracker.advance(
+                    symbol, _completed_5m_bars(bars, evaluation_utc), now=evaluation_utc
+                )
+                for shadow_event in shadow_events:
+                    log(f"[{symbol}] ULTI7_SHADOW_EVENT {shadow_event.get('kind')} {shadow_event.get('reason', '')}.")
             return
 
     profile = symbol_profile(symbol)
@@ -8928,6 +8967,20 @@ def run_symbol(client, symbol, prefetched_bars=None):
         symbol, bars, data, now=signal_eval_at
     )
     _save_pine_trade_state()
+    if _ulti7_shadow_tracker is not None:
+        shadow_events = _ulti7_shadow_tracker.advance(
+            symbol, _completed_5m_bars(bars, signal_eval_at), now=signal_eval_at
+        )
+        for shadow_event in shadow_events:
+            log(f"[{symbol}] ULTI7_SHADOW_EVENT {shadow_event.get('kind')} {shadow_event.get('reason', '')}.")
+    if V15_SIGNAL_ALERT_ONLY and _ulti7_shadow_tracker is not None:
+        shadow_events = _ulti7_shadow_tracker.advance(
+            symbol,
+            _completed_5m_bars(bars, signal_eval_at),
+            now=signal_eval_at,
+        )
+        for shadow_event in shadow_events:
+            log(f"[{symbol}] ULTI7_SHADOW_EVENT {shadow_event.get('kind')} {shadow_event.get('reason', '')}.")
     pine_diagnostics = ulti7_entry_engine.diagnostics_for(symbol)
     diag_side = pine_diagnostics.get("candidate_side") or (pine_decision or {}).get("side", "")
     position_open = bool(diag_side) and any(
@@ -8971,6 +9024,12 @@ def run_symbol(client, symbol, prefetched_bars=None):
     )
 
     if V15_SIGNAL_ALERT_ONLY:
+        if _ulti7_shadow_tracker is not None:
+            shadow_status = _ulti7_shadow_tracker.add_signal(symbol, pine_decision)
+            log(
+                f"[{symbol}] ULTI7 shadow tracking {shadow_status} "
+                f"signal_id={_ulti7_shadow_tracker.signal_key(symbol, pine_decision)}."
+            )
         now_ct = datetime.now(central)
         if _v15_signal_alerts["date"] != now_ct.date():
             _v15_signal_alerts.update(date=now_ct.date(), keys=set())
@@ -9000,6 +9059,9 @@ def run_symbol(client, symbol, prefetched_bars=None):
                     f"alert_attempt={alert_attempt_at.isoformat()} alert_result={alert_result_at.isoformat()} "
                     f"delivery_ms={delivery_ms:.1f}."
                 )
+                if _ulti7_shadow_tracker is not None:
+                    shadow_status = _ulti7_shadow_tracker.add_signal(symbol, pine_decision)
+                    log(f"[{symbol}] ULTI7 shadow signal {shadow_status} id={_ulti7_shadow_tracker.signal_key(symbol, pine_decision)}.")
         return
 
     if ENABLE_ALPACA_PAPER_TRADING and data.get("pine_entry_decision"):
