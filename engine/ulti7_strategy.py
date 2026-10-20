@@ -350,6 +350,45 @@ class Ulti7EntryEngine:
         with self._state_lock:
             return dict(self._diagnostics.get(str(symbol).upper(), {}))
 
+    def last_processed_bar_for(self, symbol):
+        with self._state_lock:
+            state = self._states.get(str(symbol).upper())
+            return state.last_bar if state is not None else None
+
+    def _record_candle_skip(self, symbol, reason, latest_available, completed_bar, last_processed, now):
+        def as_ct(value):
+            stamp = pd.Timestamp(value)
+            stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp
+            return stamp.tz_convert("America/Chicago")
+
+        completed_ct = as_ct(completed_bar)
+        available_ct = as_ct(latest_available if latest_available is not None else completed_bar)
+        processed_ct = as_ct(last_processed) if last_processed is not None else None
+        evaluation_stamp = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
+        evaluation_stamp = evaluation_stamp.tz_localize("America/Chicago") if evaluation_stamp.tzinfo is None else evaluation_stamp.tz_convert("America/Chicago")
+        state = self._states.get(str(symbol).upper(), _SymbolState())
+        cooldown = max(0, 5 - (state.age - state.last_entry_age))
+        self._diagnostics[str(symbol).upper()] = {
+            "signal_state_reason": reason,
+            "candidate_side": "",
+            "setup": "",
+            "latest_available_candle_time": available_ct.isoformat(),
+            "latest_completed_candle_time": completed_ct.isoformat(),
+            "last_processed_candle_time": processed_ct.isoformat() if processed_ct is not None else "",
+            "candle_time": completed_ct.isoformat(),
+            "candle_close_time": (completed_ct + pd.Timedelta(minutes=5)).isoformat(),
+            "evaluation_time": evaluation_stamp.isoformat(),
+            "same_bar_replay": reason == "ALREADY_PROCESSED_BAR",
+            "cooldown_before": cooldown,
+            "cooldown_after": cooldown,
+            "loss_lock_before": state.loss_block_side,
+            "loss_lock_after": state.loss_block_side,
+            "runner_lock_before": state.runner_block_side,
+            "runner_lock_after": state.runner_block_side,
+            "state_transitions": {},
+        }
+        return None, f"state={reason}, no state transition"
+
     def record_exit(self, symbol, side, is_loss=False, runner=False):
         with self._state_lock:
             state = self._states.setdefault(str(symbol).upper(), _SymbolState())
@@ -740,6 +779,7 @@ class PineV95EntryEngine(Ulti7EntryEngine):
         frame = bars.copy()
         if frame is None or frame.empty:
             return None, "no bars"
+        latest_available_bar = frame.index[-1] if isinstance(frame.index, pd.DatetimeIndex) and len(frame) else None
         if isinstance(frame.index, pd.DatetimeIndex):
             now_ts = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
             if now_ts.tzinfo is None:
@@ -765,7 +805,19 @@ class PineV95EntryEngine(Ulti7EntryEngine):
                 replay_now = pd.Timestamp(replay_frame.index[-1]) + pd.Timedelta(minutes=5)
                 self.evaluate(symbol, replay_frame, now=replay_now)
         bar_time = frame.index[-1]
+        if state.last_bar is not None:
+            processed_bar = pd.Timestamp(state.last_bar)
+            incoming_bar = pd.Timestamp(bar_time)
+            if processed_bar == incoming_bar:
+                return self._record_candle_skip(
+                    symbol, "ALREADY_PROCESSED_BAR", latest_available_bar, bar_time, state.last_bar, now
+                )
+            if processed_bar > incoming_bar:
+                return self._record_candle_skip(
+                    symbol, "STALE_CANDLE_DATA", latest_available_bar, bar_time, state.last_bar, now
+                )
         state_before = {
+            "last_bar": str(state.last_bar) if state.last_bar is not None else "",
             "cooldown_bars_remaining": max(0, 5 - (state.age - state.last_entry_age)),
             "loss_block_side": state.loss_block_side,
             "loss_block_bar": str(state.loss_block_bar) if state.loss_block_bar is not None else "",
@@ -773,7 +825,7 @@ class PineV95EntryEngine(Ulti7EntryEngine):
             "runner_block_bar": str(state.runner_block_bar) if state.runner_block_bar is not None else "",
             "last_signal_bar": str(state.last_signal_bar) if state.last_signal_bar is not None else "",
         }
-        same_bar_replay = state.last_bar == bar_time
+        same_bar_replay = False
         new_bar = state.last_bar != bar_time
         if new_bar:
             state.age += 1
@@ -1070,6 +1122,7 @@ class PineV95EntryEngine(Ulti7EntryEngine):
                 state.continuation_side, state.continuation_age = "", 0
 
         state_after = {
+            "last_bar": str(state.last_bar) if state.last_bar is not None else "",
             "cooldown_bars_remaining": max(0, 5 - (state.age - state.last_entry_age)),
             "loss_block_side": state.loss_block_side,
             "loss_block_bar": str(state.loss_block_bar) if state.loss_block_bar is not None else "",
@@ -1080,6 +1133,8 @@ class PineV95EntryEngine(Ulti7EntryEngine):
         bar_stamp = pd.Timestamp(bar_time)
         bar_ct = bar_stamp.tz_localize("UTC") if bar_stamp.tzinfo is None else bar_stamp
         bar_ct = bar_ct.tz_convert("America/Chicago")
+        available_stamp = pd.Timestamp(latest_available_bar) if latest_available_bar is not None else bar_stamp
+        available_stamp = available_stamp.tz_localize("UTC") if available_stamp.tzinfo is None else available_stamp
         evaluation_stamp = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
         evaluation_stamp = evaluation_stamp.tz_localize("America/Chicago") if evaluation_stamp.tzinfo is None else evaluation_stamp.tz_convert("America/Chicago")
         transitions = {
@@ -1091,6 +1146,9 @@ class PineV95EntryEngine(Ulti7EntryEngine):
             "signal_state_reason": signal_state_reason,
             "candidate_side": selected_side or ("CALL" if raw_call_candidate else "PUT" if raw_put_candidate else ""),
             "setup": selected_setup,
+            "latest_available_candle_time": available_stamp.tz_convert("America/Chicago").isoformat(),
+            "latest_completed_candle_time": bar_ct.isoformat(),
+            "last_processed_candle_time": bar_ct.isoformat(),
             "candle_time": bar_ct.isoformat(),
             "candle_close_time": (bar_ct + pd.Timedelta(minutes=5)).isoformat(),
             "evaluation_time": evaluation_stamp.isoformat(),

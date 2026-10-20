@@ -8,6 +8,7 @@ import pytz
 
 from engine.ulti7_strategy import PineV95EntryEngine, _pine_base_series
 from engine.ulti7_trade_manager import Ulti7Strategy, Ulti7UnderlyingTradeManager
+from execution.freshness import signal_execution_freshness
 
 
 class SmcPineParityTests(unittest.TestCase):
@@ -55,13 +56,17 @@ class SmcPineParityTests(unittest.TestCase):
 
     def test_same_accepted_candle_is_diagnosed_as_already_processed(self):
         bars = self._bars([1000.0 + position * 10.0 for position in range(70)])
+        forming_bar = bars.iloc[[-1]].copy()
+        forming_bar.index = [bars.index[-1] + pd.Timedelta(minutes=5)]
+        bars_with_forming = pd.concat([bars, forming_bar])
         engine = PineV95EntryEngine()
-        now = bars.index[-1] + pd.Timedelta(minutes=5)
-        engine.evaluate("AMD", bars, now=now)
+        now = forming_bar.index[-1] + pd.Timedelta(minutes=2)
+        engine.evaluate("AMD", bars_with_forming, now=now)
         state = engine._states["AMD"]
         state.last_signal_bar = bars.index[-1]
+        state_before = vars(state).copy()
 
-        engine.evaluate("AMD", bars, now=now)
+        engine.evaluate("AMD", bars_with_forming, now=now)
 
         diagnostics = engine.diagnostics_for("AMD")
         self.assertEqual(diagnostics["signal_state_reason"], "ALREADY_PROCESSED_BAR")
@@ -69,7 +74,69 @@ class SmcPineParityTests(unittest.TestCase):
         self.assertIn("candle_time", diagnostics)
         self.assertIn("candle_close_time", diagnostics)
         self.assertIn("evaluation_time", diagnostics)
-        self.assertEqual(diagnostics["candle_close_time"], now.tz_convert("America/Chicago").isoformat())
+        self.assertEqual(diagnostics["latest_available_candle_time"], forming_bar.index[-1].tz_convert("America/Chicago").isoformat())
+        self.assertEqual(diagnostics["latest_completed_candle_time"], bars.index[-1].tz_convert("America/Chicago").isoformat())
+        self.assertEqual(diagnostics["last_processed_candle_time"], bars.index[-1].tz_convert("America/Chicago").isoformat())
+        self.assertEqual(diagnostics["candle_close_time"], forming_bar.index[-1].tz_convert("America/Chicago").isoformat())
+        self.assertEqual(vars(state), state_before)
+
+    def test_older_completed_candle_does_not_rewind_engine_state(self):
+        bars = self._bars([1000.0 + position * 10.0 for position in range(70)])
+        engine = PineV95EntryEngine()
+        engine.evaluate("AMD", bars, now=bars.index[-1] + pd.Timedelta(minutes=5))
+        state = engine._states["AMD"]
+        state_before = vars(state).copy()
+
+        engine.evaluate("AMD", bars.iloc[:-1], now=bars.index[-1] + pd.Timedelta(minutes=5))
+
+        diagnostics = engine.diagnostics_for("AMD")
+        self.assertEqual(diagnostics["signal_state_reason"], "STALE_CANDLE_DATA")
+        self.assertEqual(vars(state), state_before)
+        self.assertGreater(
+            pd.Timestamp(diagnostics["last_processed_candle_time"]),
+            pd.Timestamp(diagnostics["latest_completed_candle_time"]),
+        )
+
+
+class SignalExecutionFreshnessTests(unittest.TestCase):
+    def setUp(self):
+        self.decision = {
+            "entry_bar": "2026-10-20T15:40:00Z",
+            "entry_underlying": 100.0,
+            "atr": 2.0,
+        }
+        self.now = datetime(2026, 10, 20, 15, 45, 30, tzinfo=timezone.utc)
+        self.quote_time = datetime(2026, 10, 20, 15, 45, 25, tzinfo=timezone.utc)
+
+    def test_fresh_completed_signal_with_small_move_is_executable(self):
+        reason, metrics = signal_execution_freshness(
+            self.decision, 100.2, self.quote_time, now=self.now
+        )
+        self.assertEqual(reason, "")
+        self.assertEqual(metrics["signal_age_seconds"], 30.0)
+        self.assertAlmostEqual(metrics["move_atr"], 0.1)
+
+    def test_stale_signal_is_skipped_after_candle_close(self):
+        reason, _ = signal_execution_freshness(
+            self.decision,
+            100.0,
+            datetime(2026, 10, 20, 15, 46, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 10, 20, 15, 46, 1, tzinfo=timezone.utc),
+        )
+        self.assertEqual(reason, "EXECUTION_SKIPPED_STALE")
+
+    def test_excessive_spot_move_and_stale_quote_are_skipped(self):
+        price_reason, _ = signal_execution_freshness(
+            self.decision, 100.6, self.quote_time, now=self.now
+        )
+        quote_reason, _ = signal_execution_freshness(
+            self.decision,
+            100.0,
+            datetime(2026, 10, 20, 15, 44, 0, tzinfo=timezone.utc),
+            now=self.now,
+        )
+        self.assertEqual(price_reason, "EXECUTION_SKIPPED_PRICE_MOVE")
+        self.assertEqual(quote_reason, "EXECUTION_SKIPPED_STALE_QUOTE")
 
 
 class UnderlyingTradeManagerTests(unittest.TestCase):

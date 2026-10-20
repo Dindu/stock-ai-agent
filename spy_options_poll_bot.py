@@ -19,6 +19,7 @@ import subprocess
 import threading
 import traceback
 from engine.ulti7_strategy import pine_exit_event, ulti7_entry_engine
+from execution.freshness import signal_execution_freshness
 import uuid
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -95,6 +96,9 @@ SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).spli
 V15_PAPER_EARLIEST_CONTRACT_MODE = os.getenv("V15_PAPER_EARLIEST_CONTRACT_MODE", "0") == "1"
 V15_PAPER_CONTRACT_QTY = max(1, int(os.getenv("V15_PAPER_CONTRACT_QTY", "5")))
 V15_SIGNAL_ALERT_ONLY = os.getenv("V15_SIGNAL_ALERT_ONLY", "0" if V15_PAPER_EARLIEST_CONTRACT_MODE else "1") == "1"
+V15_EXECUTION_MAX_SIGNAL_AGE_SECONDS = max(1, int(os.getenv("V15_EXECUTION_MAX_SIGNAL_AGE_SECONDS", "60")))
+V15_EXECUTION_MAX_MOVE_ATR = max(0.0, float(os.getenv("V15_EXECUTION_MAX_MOVE_ATR", "0.25")))
+V15_EXECUTION_MAX_QUOTE_AGE_SECONDS = max(1, int(os.getenv("V15_EXECUTION_MAX_QUOTE_AGE_SECONDS", "30")))
 if V15_SIGNAL_ALERT_ONLY or V15_PAPER_EARLIEST_CONTRACT_MODE:
     # SPX is an index, not a stock on the Alpaca IEX stock-bars/trades feed.
     alert_symbols = [s.strip().upper() for s in os.getenv("V15_ALERT_SYMBOLS", "SPY,QQQ,IWM,AAPL,NVDA,MSFT,AMZN,TSLA,AMD,PLTR,GOOGL,MU").split(",") if s.strip()]
@@ -639,6 +643,8 @@ _symbol_opportunity_cache: "dict[str, dict]" = {}
 _ws_pending_symbols: "set[str]" = set()
 _ws_last_eval_at: "dict[str, datetime]" = {}
 _ws_pending_lock = threading.Lock()
+_bar_fetch_metadata: "dict[str, dict]" = {}
+_bar_fetch_metadata_lock = threading.Lock()
 # Daily performance tracker for hourly Discord summaries (resets by CT date).
 _perf_stats: "dict" = {
     "date": None,
@@ -4792,6 +4798,7 @@ def _get_option_contract_uncached(symbol, signal, underlying_price, data=None, m
 # ---------------------------------------------------------------------------
 def fetch_bars(client, symbol):
     """Pull the most recent ~LOOKBACK_BARS 5-minute bars for ``symbol`` from Alpaca."""
+    fetch_started_at = datetime.now(timezone.utc)
     end = datetime.now(timezone.utc)
     # Include ample session history so 200-period Pine ATR and stateful source
     # indicators have enough warmup, including across weekends and holidays.
@@ -4807,7 +4814,14 @@ def fetch_bars(client, symbol):
     )
 
     bars = client.get_stock_bars(req).df
+    fetch_completed_at = datetime.now(timezone.utc)
     if bars is None or bars.empty:
+        with _bar_fetch_metadata_lock:
+            _bar_fetch_metadata[symbol] = {
+                "fetch_started_at": fetch_started_at,
+                "fetch_completed_at": fetch_completed_at,
+                "latest_available_candle": None,
+            }
         return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
 
     # When a single symbol is requested the result has a MultiIndex (symbol, ts).
@@ -4815,6 +4829,12 @@ def fetch_bars(client, symbol):
         bars = bars.xs(symbol, level=0)
 
     bars = bars[["open", "high", "low", "close", "volume"]].tail(LOOKBACK_BARS)
+    with _bar_fetch_metadata_lock:
+        _bar_fetch_metadata[symbol] = {
+            "fetch_started_at": fetch_started_at,
+            "fetch_completed_at": fetch_completed_at,
+            "latest_available_candle": bars.index[-1],
+        }
     return bars
 
 
@@ -5061,6 +5081,39 @@ def _alpaca_data_get_json(path, params=None, timeout=8):
         return r.json()
     except Exception:
         return None
+
+
+def _latest_underlying_trade(symbol):
+    payload = _alpaca_data_get_json(
+        f"/v2/stocks/{symbol}/trades/latest",
+        params={"feed": FEED},
+        timeout=5,
+    )
+    trade = payload.get("trade") if isinstance(payload, dict) else None
+    if not isinstance(trade, dict) or trade.get("p") is None or not trade.get("t"):
+        return None, None
+    try:
+        return float(trade["p"]), pd.Timestamp(trade["t"])
+    except (TypeError, ValueError):
+        return None, None
+
+
+def _v15_execution_freshness_ok(symbol, decision, stage):
+    current_price, quote_time = _latest_underlying_trade(symbol)
+    reason, metrics = signal_execution_freshness(
+        decision,
+        current_price,
+        quote_time,
+        now=datetime.now(timezone.utc),
+        max_age_seconds=V15_EXECUTION_MAX_SIGNAL_AGE_SECONDS,
+        max_move_atr=V15_EXECUTION_MAX_MOVE_ATR,
+        max_quote_age_seconds=V15_EXECUTION_MAX_QUOTE_AGE_SECONDS,
+    )
+    if reason:
+        log(f"[{symbol}] {reason} stage={stage} metrics={metrics}; strategy signal retained, no option order.")
+        return False
+    log(f"[{symbol}] EXECUTION_FRESH stage={stage} metrics={metrics}.")
+    return True
 
 
 def _alpaca_trading_get_json(path, params=None, timeout=10):
@@ -8288,6 +8341,10 @@ def try_open_paper_trade(symbol, side, option, data):
             )
             return False
 
+    pine_decision = data.get("pine_entry_decision") or {}
+    if pine_decision and not _v15_execution_freshness_ok(symbol, pine_decision, "PRE_ORDER"):
+        return False
+
     try:
         _, fill_price = place_paper_entry(option, qty)
     except Exception as e:
@@ -8790,6 +8847,53 @@ def run_symbol(client, symbol, prefetched_bars=None):
         log(f"[{symbol}] Bars: {len(bars)}/55 — warming up.")
         return
 
+    evaluation_utc = datetime.now(timezone.utc)
+    fetch_end = None
+    fetch_start = None
+    with _bar_fetch_metadata_lock:
+        fetch_metadata = dict(_bar_fetch_metadata.get(symbol, {}))
+    fetch_start = fetch_metadata.get("fetch_started_at")
+    fetch_end = fetch_metadata.get("fetch_completed_at")
+    latest_available = None
+    latest_completed = None
+    if isinstance(bars.index, pd.DatetimeIndex) and len(bars):
+        bar_index = bars.index
+        bar_index = bar_index.tz_localize("UTC") if bar_index.tz is None else bar_index.tz_convert("UTC")
+        latest_available = bar_index[-1]
+        completed = bar_index[bar_index + pd.Timedelta(minutes=BAR_MINUTES) <= pd.Timestamp(evaluation_utc)]
+        if len(completed):
+            latest_completed = completed[-1]
+    last_processed = ulti7_entry_engine.last_processed_bar_for(symbol)
+
+    def _candle_ct(value):
+        if value is None:
+            return "none"
+        stamp = pd.Timestamp(value)
+        stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+        return stamp.tz_convert(central).isoformat()
+
+    fetch_ms = (fetch_end - fetch_start).total_seconds() * 1000.0 if fetch_start and fetch_end else None
+    fetch_ms_text = f"{fetch_ms:.1f}" if fetch_ms is not None else "unknown"
+    log(
+        f"[{symbol}] CANDLE_TIMING fetch_started={fetch_start.isoformat() if fetch_start else 'unknown'} "
+        f"fetch_completed={fetch_end.isoformat() if fetch_end else 'unknown'} "
+        f"fetch_ms={fetch_ms_text} "
+        f"latest_available={_candle_ct(latest_available)} "
+        f"latest_completed={_candle_ct(latest_completed)} "
+        f"last_processed={_candle_ct(last_processed)} "
+        f"evaluated={evaluation_utc.isoformat()}."
+    )
+    if latest_completed is not None and last_processed is not None:
+        processed_stamp = pd.Timestamp(last_processed)
+        processed_stamp = processed_stamp.tz_localize("UTC") if processed_stamp.tzinfo is None else processed_stamp.tz_convert("UTC")
+        if latest_completed <= processed_stamp:
+            skip_reason = "ALREADY_PROCESSED_BAR" if latest_completed == processed_stamp else "STALE_CANDLE_DATA"
+            log(
+                f"[{symbol}] ULTI-7 state={skip_reason}; skipping repeated/stale completed candle "
+                f"latest_completed={_candle_ct(latest_completed)} last_processed={_candle_ct(processed_stamp)}."
+            )
+            return
+
     profile = symbol_profile(symbol)
     ignition_min_delta = int(profile["ignition_min_delta"])
     rsi_overbought = int(profile["rsi_overbought"])
@@ -8833,6 +8937,9 @@ def run_symbol(client, symbol, prefetched_bars=None):
     )
     diagnostic_log = (
         f"signal_state={pine_diagnostics.get('signal_state_reason', 'UNAVAILABLE')} "
+        f"latest_available={pine_diagnostics.get('latest_available_candle_time', 'unknown')} "
+        f"latest_completed={pine_diagnostics.get('latest_completed_candle_time', 'unknown')} "
+        f"last_processed={pine_diagnostics.get('last_processed_candle_time', 'unknown')} "
         f"candle={pine_diagnostics.get('candle_time', 'unknown')} "
         f"candle_close={pine_diagnostics.get('candle_close_time', 'unknown')} "
         f"evaluated={pine_diagnostics.get('evaluation_time', signal_eval_at.isoformat())} "
@@ -8894,6 +9001,10 @@ def run_symbol(client, symbol, prefetched_bars=None):
                     f"delivery_ms={delivery_ms:.1f}."
                 )
         return
+
+    if ENABLE_ALPACA_PAPER_TRADING and data.get("pine_entry_decision"):
+        if not _v15_execution_freshness_ok(symbol, data["pine_entry_decision"], "PRE_CONTRACT"):
+            return
 
     closing_block_minutes = closing_no_trade_minutes_remaining()
     if closing_block_minutes > 0 and not V15_PAPER_EARLIEST_CONTRACT_MODE:
