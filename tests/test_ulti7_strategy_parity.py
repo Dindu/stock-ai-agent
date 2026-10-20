@@ -53,6 +53,24 @@ class SmcPineParityTests(unittest.TestCase):
         self.assertTrue(bool(result["buy"].iloc[-1]))
         self.assertFalse(bool(result["sell"].iloc[-1]))
 
+    def test_same_accepted_candle_is_diagnosed_as_already_processed(self):
+        bars = self._bars([1000.0 + position * 10.0 for position in range(70)])
+        engine = PineV95EntryEngine()
+        now = bars.index[-1] + pd.Timedelta(minutes=5)
+        engine.evaluate("AMD", bars, now=now)
+        state = engine._states["AMD"]
+        state.last_signal_bar = bars.index[-1]
+
+        engine.evaluate("AMD", bars, now=now)
+
+        diagnostics = engine.diagnostics_for("AMD")
+        self.assertEqual(diagnostics["signal_state_reason"], "ALREADY_PROCESSED_BAR")
+        self.assertTrue(diagnostics["same_bar_replay"])
+        self.assertIn("candle_time", diagnostics)
+        self.assertIn("candle_close_time", diagnostics)
+        self.assertIn("evaluation_time", diagnostics)
+        self.assertEqual(diagnostics["candle_close_time"], now.tz_convert("America/Chicago").isoformat())
+
 
 class UnderlyingTradeManagerTests(unittest.TestCase):
     def setUp(self):

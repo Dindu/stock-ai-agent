@@ -8221,7 +8221,10 @@ def try_open_paper_trade(symbol, side, option, data):
     if SINGLE_POSITION_PER_SYMBOL and not V15_PAPER_EARLIEST_CONTRACT_MODE:
         already_open, detail = has_open_underlying_position(symbol, side)
         if already_open:
-            log(f"[{symbol}] Existing {side} position detected ({detail}) — not opening another strike.")
+            log(
+                f"[{symbol}] Existing {side} position detected ({detail}) — not opening another strike; "
+                "signal_state=NEW_SIGNAL execution_state=POSITION_OPEN."
+            )
             return False
     if option["contract"] in _open_trades:
         log(f"[{symbol}] Already long {option['contract']} — not stacking.")
@@ -8816,12 +8819,31 @@ def run_symbol(client, symbol, prefetched_bars=None):
         return
 
     _restore_pine_entry_state()
+    signal_eval_at = datetime.now(central)
     pine_decision, pine_reason = ulti7_entry_engine.evaluate(
-        symbol, bars, data, now=datetime.now(central)
+        symbol, bars, data, now=signal_eval_at
     )
     _save_pine_trade_state()
+    pine_diagnostics = ulti7_entry_engine.diagnostics_for(symbol)
+    diag_side = pine_diagnostics.get("candidate_side") or (pine_decision or {}).get("side", "")
+    position_open = bool(diag_side) and any(
+        str(trade.get("underlying", "")).upper() == symbol.upper()
+        and str(trade.get("side", "")).upper() == str(diag_side).upper()
+        for trade in _open_trades.values()
+    )
+    diagnostic_log = (
+        f"signal_state={pine_diagnostics.get('signal_state_reason', 'UNAVAILABLE')} "
+        f"candle={pine_diagnostics.get('candle_time', 'unknown')} "
+        f"candle_close={pine_diagnostics.get('candle_close_time', 'unknown')} "
+        f"evaluated={pine_diagnostics.get('evaluation_time', signal_eval_at.isoformat())} "
+        f"cooldown={pine_diagnostics.get('cooldown_before', '?')}->{pine_diagnostics.get('cooldown_after', '?')} bars "
+        f"loss_lock={pine_diagnostics.get('loss_lock_before', '-')}>{pine_diagnostics.get('loss_lock_after', '-')} "
+        f"runner_lock={pine_diagnostics.get('runner_lock_before', '-')}>{pine_diagnostics.get('runner_lock_after', '-')} "
+        f"position={'POSITION_OPEN' if position_open else 'FLAT'} "
+        f"transitions={json.dumps(pine_diagnostics.get('state_transitions', {}), sort_keys=True)}"
+    )
     if not pine_decision:
-        log(f"[{symbol}] ULTI-7 V15 entry: no candidate — {pine_reason}.")
+        log(f"[{symbol}] ULTI-7 V15 entry: no candidate — {pine_reason}; {diagnostic_log}.")
         _record_entry_block("ulti7_entry_engine")
         return
 
@@ -8836,7 +8858,8 @@ def run_symbol(client, symbol, prefetched_bars=None):
     data["strategy_authority"] = "ULTI7_V95"
     log(
         f"[{symbol}] ULTI-7 V15 selected {pine_decision['setup']} {side} — "
-        f"{pine_reason}; source_votes={pine_decision['long_votes']}/{pine_decision['short_votes']} "
+        f"{pine_reason}; {diagnostic_log}; "
+        f"source_votes={pine_decision['long_votes']}/{pine_decision['short_votes']} "
         f"MTF={pine_decision['call_mtf']}/{pine_decision['put_mtf']}."
     )
 
@@ -8848,13 +8871,28 @@ def run_symbol(client, symbol, prefetched_bars=None):
         alert_key = (symbol, bar_time, pine_decision["setup"], side)
         if alert_key not in _v15_signal_alerts["keys"]:
             message = format_v15_scan_alert(symbol, pine_decision, data, now_ct)
+            alert_attempt_at = datetime.now(central)
             sent = send_discord(message, color=DISCORD_COLOR_CALL if side == "CALL" else DISCORD_COLOR_PUT,
                                 wait_for_response=True, webhook_url=DISCORD_WEBHOOK_LIVE_TRADES_URL)
+            alert_result_at = datetime.now(central)
+            delivery_ms = (alert_result_at - alert_attempt_at).total_seconds() * 1000.0
             if isinstance(sent, dict) and sent.get("id"):
                 _v15_signal_alerts["keys"].add(alert_key)
-                log(f"[{symbol}] V15 scan alert: {pine_decision['setup']} {side} bar={bar_time} (no contract/order).")
+                log(
+                    f"[{symbol}] V15 scan alert: {pine_decision['setup']} {side} bar={bar_time} "
+                    f"candle_close={pine_diagnostics.get('candle_close_time', 'unknown')} "
+                    f"evaluated={pine_diagnostics.get('evaluation_time', signal_eval_at.isoformat())} "
+                    f"alert_attempt={alert_attempt_at.isoformat()} alert_result={alert_result_at.isoformat()} "
+                    f"delivery_ms={delivery_ms:.1f} (no contract/order)."
+                )
             else:
-                log(f"[{symbol}] V15 scan alert delivery unconfirmed; will retry on next scan.")
+                log(
+                    f"[{symbol}] V15 scan alert delivery unconfirmed; will retry on next scan. "
+                    f"candle_close={pine_diagnostics.get('candle_close_time', 'unknown')} "
+                    f"evaluated={pine_diagnostics.get('evaluation_time', signal_eval_at.isoformat())} "
+                    f"alert_attempt={alert_attempt_at.isoformat()} alert_result={alert_result_at.isoformat()} "
+                    f"delivery_ms={delivery_ms:.1f}."
+                )
         return
 
     closing_block_minutes = closing_no_trade_minutes_remaining()

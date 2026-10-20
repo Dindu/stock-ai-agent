@@ -321,6 +321,7 @@ class _SymbolState:
     ready_side: str = ""
     ready_age: int = 0
     last_entry_age: int = -100000
+    last_signal_bar: object = None
     age: int = 0
     last_reversal_side: str = ""
     loss_block_side: str = ""
@@ -342,7 +343,12 @@ class Ulti7EntryEngine:
 
     def __init__(self):
         self._states = {}
+        self._diagnostics = {}
         self._state_lock = RLock()
+
+    def diagnostics_for(self, symbol):
+        with self._state_lock:
+            return dict(self._diagnostics.get(str(symbol).upper(), {}))
 
     def record_exit(self, symbol, side, is_loss=False, runner=False):
         with self._state_lock:
@@ -359,7 +365,7 @@ class Ulti7EntryEngine:
             exported = {}
             for symbol, state in self._states.items():
                 values = vars(state).copy()
-                for key in ("last_bar", "loss_block_bar", "runner_block_bar"):
+                for key in ("last_bar", "last_signal_bar", "loss_block_bar", "runner_block_bar"):
                     value = values.get(key)
                     if value is not None and hasattr(value, "isoformat"):
                         values[key] = value.isoformat()
@@ -759,6 +765,15 @@ class PineV95EntryEngine(Ulti7EntryEngine):
                 replay_now = pd.Timestamp(replay_frame.index[-1]) + pd.Timedelta(minutes=5)
                 self.evaluate(symbol, replay_frame, now=replay_now)
         bar_time = frame.index[-1]
+        state_before = {
+            "cooldown_bars_remaining": max(0, 5 - (state.age - state.last_entry_age)),
+            "loss_block_side": state.loss_block_side,
+            "loss_block_bar": str(state.loss_block_bar) if state.loss_block_bar is not None else "",
+            "runner_block_side": state.runner_block_side,
+            "runner_block_bar": str(state.runner_block_bar) if state.runner_block_bar is not None else "",
+            "last_signal_bar": str(state.last_signal_bar) if state.last_signal_bar is not None else "",
+        }
+        same_bar_replay = state.last_bar == bar_time
         new_bar = state.last_bar != bar_time
         if new_bar:
             state.age += 1
@@ -966,10 +981,16 @@ class PineV95EntryEngine(Ulti7EntryEngine):
         context_call = long_votes >= 1 and five_bull and not chop
         context_put = short_votes >= 1 and five_bear and not chop
 
+        raw_call_candidate = reversal_call or call_ok and (structure_call or continuation_call or consensus_call or context_call)
+        raw_put_candidate = reversal_put or put_ok and (structure_put or continuation_put or consensus_put or context_put)
+        loss_blocked_call = raw_call_candidate and state.loss_block_side == "CALL"
+        loss_blocked_put = raw_put_candidate and state.loss_block_side == "PUT"
+        runner_blocked_call = raw_call_candidate and state.runner_block_side == "CALL"
+        runner_blocked_put = raw_put_candidate and state.runner_block_side == "PUT"
         call_allowed = state.loss_block_side != "CALL" and state.runner_block_side != "CALL"
         put_allowed = state.loss_block_side != "PUT" and state.runner_block_side != "PUT"
-        call_candidate = call_allowed and (reversal_call or call_ok and (structure_call or continuation_call or consensus_call or context_call))
-        put_candidate = put_allowed and (reversal_put or put_ok and (structure_put or continuation_put or consensus_put or context_put))
+        call_candidate = call_allowed and raw_call_candidate
+        put_candidate = put_allowed and raw_put_candidate
         selected_side = ""
         if call_candidate and not put_candidate:
             selected_side = "CALL"
@@ -997,10 +1018,29 @@ class PineV95EntryEngine(Ulti7EntryEngine):
         selected_setup = ""
         if selected_side:
             selected_setup = next((priorities[index] for index, enabled in enumerate(setup_flags[selected_side]) if enabled), "")
-        if state.age - state.last_entry_age < 5:
+        cooldown_age = state.age - state.last_entry_age
+        cooldown_active = cooldown_age < 5
+        candidate_before_cooldown = bool(selected_side)
+        if cooldown_active:
             selected_side, selected_setup = "", ""
+        signal_state_reason = "NO_CANDIDATE"
+        if state.last_signal_bar is not None and pd.Timestamp(state.last_signal_bar) == pd.Timestamp(bar_time):
+            signal_state_reason = "ALREADY_PROCESSED_BAR"
+        elif selected_side:
+            signal_state_reason = "NEW_SIGNAL"
+        elif candidate_before_cooldown and cooldown_active:
+            signal_state_reason = "COOLDOWN_ACTIVE"
+        else:
+            lock_reasons = []
+            if loss_blocked_call or loss_blocked_put:
+                lock_reasons.append("LOSS_REENTRY_LOCK")
+            if runner_blocked_call or runner_blocked_put:
+                lock_reasons.append("RUNNER_REENTRY_LOCK")
+            if lock_reasons:
+                signal_state_reason = "+".join(lock_reasons)
         if selected_setup == "REV" and state.last_reversal_side == selected_side:
             selected_side, selected_setup = "", ""
+            signal_state_reason = "REV_ONE_SHOT_LOCK"
 
         result = None
         if selected_side:
@@ -1022,12 +1062,47 @@ class PineV95EntryEngine(Ulti7EntryEngine):
                 "exit_plan": exit_plan,
             }
             state.last_entry_age = state.age
+            state.last_signal_bar = bar_time
             state.ready_side, state.ready_age = "", 0
             if selected_setup == "REV":
                 state.last_reversal_side = selected_side
             if selected_setup == "CONT":
                 state.continuation_side, state.continuation_age = "", 0
 
+        state_after = {
+            "cooldown_bars_remaining": max(0, 5 - (state.age - state.last_entry_age)),
+            "loss_block_side": state.loss_block_side,
+            "loss_block_bar": str(state.loss_block_bar) if state.loss_block_bar is not None else "",
+            "runner_block_side": state.runner_block_side,
+            "runner_block_bar": str(state.runner_block_bar) if state.runner_block_bar is not None else "",
+            "last_signal_bar": str(state.last_signal_bar) if state.last_signal_bar is not None else "",
+        }
+        bar_stamp = pd.Timestamp(bar_time)
+        bar_ct = bar_stamp.tz_localize("UTC") if bar_stamp.tzinfo is None else bar_stamp
+        bar_ct = bar_ct.tz_convert("America/Chicago")
+        evaluation_stamp = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
+        evaluation_stamp = evaluation_stamp.tz_localize("America/Chicago") if evaluation_stamp.tzinfo is None else evaluation_stamp.tz_convert("America/Chicago")
+        transitions = {
+            key: {"before": state_before[key], "after": state_after[key]}
+            for key in state_before
+            if state_before[key] != state_after[key]
+        }
+        self._diagnostics[str(symbol).upper()] = {
+            "signal_state_reason": signal_state_reason,
+            "candidate_side": selected_side or ("CALL" if raw_call_candidate else "PUT" if raw_put_candidate else ""),
+            "setup": selected_setup,
+            "candle_time": bar_ct.isoformat(),
+            "candle_close_time": (bar_ct + pd.Timedelta(minutes=5)).isoformat(),
+            "evaluation_time": evaluation_stamp.isoformat(),
+            "same_bar_replay": bool(same_bar_replay),
+            "cooldown_before": state_before["cooldown_bars_remaining"],
+            "cooldown_after": state_after["cooldown_bars_remaining"],
+            "loss_lock_before": state_before["loss_block_side"],
+            "loss_lock_after": state_after["loss_block_side"],
+            "runner_lock_before": state_before["runner_block_side"],
+            "runner_lock_after": state_after["runner_block_side"],
+            "state_transitions": transitions,
+        }
         call_setup_flags = "/".join(name for name, enabled in zip(priorities, setup_flags["CALL"]) if enabled) or "-"
         put_setup_flags = "/".join(name for name, enabled in zip(priorities, setup_flags["PUT"]) if enabled) or "-"
         event_summary = (
@@ -1036,7 +1111,7 @@ class PineV95EntryEngine(Ulti7EntryEngine):
             f"VIDYA={int(source_event_flags['vidya_call'])}/{int(source_event_flags['vidya_put'])}"
         )
         return result, (
-            f"setup={selected_setup or 'NONE'}, raw_votes={raw_long_votes}/{raw_short_votes}, "
+            f"state={signal_state_reason}, setup={selected_setup or 'NONE'}, raw_votes={raw_long_votes}/{raw_short_votes}, "
             f"eligible_votes={long_votes}/{short_votes}, events[{event_summary}], "
             f"V2(call={call_ok},put={put_ok},quality={long_quality}/{short_quality},chop={chop},"
             f"exhaust={call_exhausted}/{put_exhausted}), MTF={call_mtf}/{put_mtf}, "
